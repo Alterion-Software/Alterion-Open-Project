@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <rect width="256" height="256" rx="52" fill="#0d1a1a"/>
+  <rect x="26" y="26" width="204" height="204" rx="34" fill="none" stroke="#1d2b2b" stroke-width="2"/>
+  <!-- A small plan: a summary span, two tasks, and a milestone. -->
+  <rect x="56" y="72" width="144" height="9" rx="4" fill="#cfe3e3"/>
+  <path d="M56 81h13l-13 15zM200 81h-13l13 15z" fill="#cfe3e3"/>
+  <rect x="56" y="108" width="80" height="18" rx="6" fill="#3f7d7d"/>
+  <rect x="56" y="112" width="34" height="10" rx="5" fill="#a5d3d3"/>
+  <rect x="104" y="142" width="96" height="18" rx="6" fill="#3f7d7d"/>
+  <path d="M96 118h10v30h-10z" fill="none"/>
+  <path d="M96 126v18h4" fill="none" stroke="#7e9a9a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <polygon points="164,178 178,192 164,206 150,192" fill="#a5d3d3"/>
+  <rect x="56" y="60" width="144" height="2" rx="1" fill="#27302f"/>
+</svg>

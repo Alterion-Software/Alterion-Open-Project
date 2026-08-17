@@ -1,0 +1,27 @@
+[package]
+name = "aop-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aop-core = { version = "0.1.0", path = "../aop-core" }
+chrono.workspace = true
+dioxus = { version = "0.7.10" }
+serde_json.workspace = true
+tokio = { version = "1.53.1", features = ["time", "rt"] }
+dioxus-native = { version = "0.7.10", optional = true }
+
+# Refusing a close has to be done at the toolkit layer: the portable event loop
+# carries out a close request before any handler can object to it. Pinned to the
+# version tao already resolves, so this adds no new tree.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
+
+[features]
+default = ["desktop"]
+# The webview build: wry and webkit2gtk.
+desktop = ["dioxus/desktop"]
+# The webview-free build: Blitz, which paints with wgpu and lays out with Stylo.
+native = ["dep:dioxus-native", "dioxus/native"]

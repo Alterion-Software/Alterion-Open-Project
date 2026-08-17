@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Alterion Open Project
+GenericName=Project Scheduler
+Comment=Plan projects with a critical path engine and a Gantt chart
+Exec=alterion-open-project %f
+Icon=alterion-open-project
+Terminal=false
+Categories=Office;ProjectManagement;
+MimeType=application/x-alterion-project;
+Keywords=project;gantt;schedule;plan;critical path;
+StartupNotify=true
+StartupWMClass=aop-app

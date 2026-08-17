@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-alterion-project">
+    <comment>Alterion Project</comment>
+    <glob pattern="*.aprj"/>
+    <!-- Every .aprj begins with the four byte APRJ container magic. -->
+    <magic priority="60">
+      <match type="string" value="APRJ" offset="0"/>
+    </magic>
+    <icon name="alterion-open-project"/>
+  </mime-type>
+</mime-info>

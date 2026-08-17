@@ -1,0 +1,750 @@
+//! Alterion Open Project: a project scheduler with a critical path engine,
+//! a Gantt chart, and a ribbon that follows Microsoft Project's layout.
+
+mod backstage;
+mod brand;
+mod contextmenu;
+mod controls;
+mod dialogs;
+mod gantt;
+mod grid;
+mod keymap;
+mod icons;
+mod popups;
+mod preview;
+mod settings;
+mod ribbon;
+mod recovery;
+mod state;
+mod theme;
+mod views;
+mod viewport;
+
+#[cfg(feature = "desktop")]
+use dioxus::desktop::tao::dpi::LogicalSize;
+#[cfg(feature = "desktop")]
+use dioxus::desktop::{Config, WindowBuilder, WindowCloseBehaviour};
+use dioxus::prelude::*;
+
+use aop_core::{format_duration, format_work, TaskMode};
+#[cfg(feature = "desktop")]
+use aop_core::APP_NAME;
+
+use crate::icons::icon;
+use crate::state::{AppState, BackstagePage, Column, PaneFocus, ViewKind, Zoom};
+
+/// Work around a WebKitGTK renderer that blanks the window on some machines.
+///
+/// Under Wayland on hybrid graphics, WebKitGTK's DMABUF renderer intermittently
+/// hands back an empty frame: the whole interface disappears for a few seconds
+/// and then returns by itself. Nothing in the application causes it and nothing
+/// in the application can detect it, so the only fix is to ask WebKit not to
+/// use that path.
+///
+/// It is only a default. An explicit setting in the environment is left alone,
+/// so anyone whose machine is fine with the fast path can have it back.
+#[cfg(all(feature = "desktop", target_os = "linux"))]
+fn steady_rendering() {
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
+    {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
+#[cfg(all(feature = "desktop", not(target_os = "linux")))]
+fn steady_rendering() {}
+
+/// How a close asked for from outside the application is handled.
+///
+/// The portable event loop cannot be made to refuse one: every handler that
+/// sees the request runs before the close is carried out. Hiding the window
+/// instead of destroying it is the only portable way to get a word in, and the
+/// application then decides whether to bring it back or close for real.
+///
+/// Where the toolkit can refuse the close outright, that is much better and is
+/// used instead, because hiding and re-showing makes a tiling window manager
+/// treat the window as having closed and reopened, so it moves.
+#[cfg(feature = "desktop")]
+fn close_behaviour() -> WindowCloseBehaviour {
+    WindowCloseBehaviour::WindowHides
+}
+
+/// The webview build, using wry and the platform's web engine.
+#[cfg(feature = "desktop")]
+fn main() {
+    steady_rendering();
+
+    let window = WindowBuilder::new()
+        .with_title(APP_NAME)
+        // The title bar, window controls and dragging are all drawn in-app.
+        .with_decorations(false)
+        .with_resizable(true)
+        .with_inner_size(LogicalSize::new(1560.0, 980.0))
+        .with_min_inner_size(LogicalSize::new(1024.0, 640.0));
+
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(
+            Config::new()
+                .with_menu(None)
+                .with_window(window)
+                .with_close_behaviour(close_behaviour()),
+        )
+        .launch(App);
+}
+
+/// The webview-free build. Blitz paints with wgpu and lays out with Stylo, so
+/// there is no wry and no webkit2gtk. It has no window-chrome API of its own,
+/// so this build keeps the operating system's decorations.
+#[cfg(all(feature = "native", not(feature = "desktop")))]
+fn main() {
+    dioxus_native::launch(App);
+}
+
+/// The start-up screen: the mark on the left, a little chart art on the right.
+/// It clears itself after a moment, or on the first click.
+#[component]
+fn Splash() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let (logo_w, logo_h) = crate::brand::LOGO_VIEWBOX;
+
+    use_future(move || async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1700)).await;
+        state.write().splash = false;
+    });
+
+    rsx! {
+        div {
+            class: "splash",
+            onclick: move |_| state.write().splash = false,
+
+            div { class: "splash-left",
+                div {
+                    class: "splash-logo",
+                    style: "width: 300px; height: {300.0 * logo_h / logo_w}px;",
+                    dangerous_inner_html: crate::brand::LOGO_SVG,
+                }
+                div { class: "splash-product", "Open Project" }
+                div { class: "splash-version", "Version {env!(\"CARGO_PKG_VERSION\")}" }
+                div { class: "splash-bar", div { class: "splash-fill" } }
+                div { class: "splash-note", "A better free project scheduler" }
+            }
+
+            div { class: "splash-art",
+                svg { view_box: "0 0 320 260", width: "320", height: "260",
+                    // A small plan, drawn as art.
+                    for (index, (x, w, kind)) in [
+                        (10.0, 210.0, 2u8), (26.0, 96.0, 0), (56.0, 128.0, 0),
+                        (128.0, 74.0, 1), (150.0, 0.0, 3), (40.0, 176.0, 2),
+                        (58.0, 88.0, 0), (110.0, 132.0, 0), (176.0, 66.0, 1),
+                        (208.0, 0.0, 3),
+                    ].iter().enumerate() {
+                        {
+                            let y = 20.0 + index as f64 * 23.0;
+                            let (fill, height, radius) = match kind {
+                                2 => ("#cfe3e3", 5.0, 1.0),
+                                1 => ("#9d474d", 10.0, 2.0),
+                                _ => ("#3f7d7d", 10.0, 2.0),
+                            };
+                            rsx! {
+                                g { key: "art{index}",
+                                    line {
+                                        x1: "0", y1: "{y + 5.0}", x2: "320", y2: "{y + 5.0}",
+                                        stroke: "rgba(216,231,232,0.05)", stroke_width: "1",
+                                    }
+                                    if *kind == 3 {
+                                        polygon {
+                                            points: "{x},{y} {x + 7.0},{y + 7.0} {x},{y + 14.0} {x - 7.0},{y + 7.0}",
+                                            fill: "#a5d3d3",
+                                        }
+                                    } else {
+                                        rect {
+                                            x: "{x}", y: "{y}", width: "{w}", height: "{height}",
+                                            rx: "{radius}", fill: "{fill}",
+                                            opacity: "{0.35 + 0.07 * index as f64}",
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn App() -> Element {
+    use_context_provider(|| Signal::new(crate::state::from_command_line()));
+    let mut state = use_context::<Signal<AppState>>();
+
+    // Snapshot the plan on a timer so that a crash, a kill, or a power cut
+    // costs at most one interval of work rather than everything since the last
+    // save. Nothing is written while the plan matches its file.
+    use_future(move || async move {
+        let interval = std::time::Duration::from_secs(recovery::INTERVAL_SECONDS);
+        loop {
+            tokio::time::sleep(interval).await;
+            state.read().snapshot();
+        }
+    });
+
+    // Preferences are written whenever they actually differ from what is on
+    // disk, rather than by each control that changes one remembering to ask.
+    // Scattering the call is how a new setting silently fails to persist.
+    let mut written = use_signal(|| state.read().settings());
+    use_effect(move || {
+        let current = state.read().settings();
+        if written() != current {
+            current.save();
+            written.set(current);
+        }
+    });
+
+    // Work left behind by a session that never finished is offered back once,
+    // at the start, rather than silently loaded over whatever was opened.
+    use_hook(|| {
+        if let Some(found) = recovery::find_abandoned().into_iter().next() {
+            state.write().dialog = Some(crate::state::Dialog::Recover(found));
+        }
+    });
+
+    let splash = state.read().splash;
+    let (backstage, dialog, show_timeline, view, error, menu, editing) = {
+        let s = state.read();
+        (
+            s.backstage,
+            s.dialog.clone(),
+            s.show_timeline,
+            s.view,
+            s.schedule_error(),
+            s.context_menu,
+            s.editing,
+        )
+    };
+
+    // The palette overlay restates the tokens and nothing else, so it takes
+    // effect purely by coming after the main sheet. Following the desktop is a
+    // media query inside it rather than a separate code path.
+    let palette = state.read().theme.overlay();
+
+    rsx! {
+        style { dangerous_inner_html: theme::CSS }
+        if !palette.is_empty() {
+            style { dangerous_inner_html: "{palette}" }
+        }
+
+        div {
+            class: "app",
+            tabindex: "0",
+            onkeydown: move |event| handle_shortcut(&mut state, event),
+            onresize: move |event| {
+                if let Ok(size) = event.get_content_box_size() {
+                    let seen = (size.width, size.height);
+                    if state.read().viewport != seen {
+                        state.write().viewport = seen;
+                    }
+                }
+            },
+            // Anywhere without its own menu simply swallows the right-click,
+            // rather than letting the webview show its native one.
+            oncontextmenu: move |event| event.prevent_default(),
+
+            ribbon::TitleBar {}
+            ribbon::TabStrip {}
+            ribbon::Ribbon {}
+
+            if let Some(message) = error {
+                div { class: "error-banner",
+                    {icon("warning", 15)}
+                    span { class: "grow", "{message}" }
+                    button {
+                        class: "btn danger",
+                        style: "padding: 3px 12px; font-size: 11px;",
+                        onclick: move |_| state.write().dialog = Some(crate::state::Dialog::FixIssue),
+                        "Fix this..."
+                    }
+                }
+            }
+
+            if show_timeline && view.has_chart() {
+                gantt::TimelineBand {}
+            }
+
+            div {
+                class: "workspace",
+                oncontextmenu: move |event| event.prevent_default(),
+                div { class: "viewbar", span { "{view.label()}" } }
+                Workspace { view }
+            }
+
+            StatusBar {}
+        }
+
+        if let Some(page) = backstage {
+            backstage::Backstage { page }
+        }
+
+        // Popup cell editors float above the grid so the table cannot clip them.
+        if let Some((row, column)) = editing {
+            match column {
+                Column::Predecessors => rsx! { popups::PredecessorPopup { row } },
+                Column::Resources => rsx! { popups::ResourcePopup { row } },
+                _ => rsx! {},
+            }
+        }
+
+        if let Some(menu) = menu {
+            contextmenu::ContextMenuHost { menu }
+        }
+
+        if let Some(dialog) = dialog {
+            dialogs::DialogHost { dialog }
+        }
+
+        if splash {
+            Splash {}
+        }
+    }
+}
+
+/// Keeps the table and the chart scrolled to the same row.
+///
+/// Each pane owns its horizontal scrollbar, which means each is its own scroll
+/// container, so the vertical positions have to be linked explicitly.
+#[component]
+fn SyncPaneScroll() -> Element {
+    use_effect(move || {
+        document::eval(
+            r#"
+            (function () {
+              const grid = document.querySelector('.grid-pane');
+              const chart = document.querySelector('.chart-pane');
+              if (!grid || !chart) return;
+              if (grid.dataset.aopSynced === '1') return;
+              grid.dataset.aopSynced = '1';
+
+              let echo = false;
+              const link = (from, to) => from.addEventListener('scroll', () => {
+                if (echo) return;
+                echo = true;
+                to.scrollTop = from.scrollTop;
+                echo = false;
+              }, { passive: true });
+
+              link(grid, chart);
+              link(chart, grid);
+            })();
+            "#,
+        );
+    });
+
+    rsx! {}
+}
+
+/// One internal window: a title tab plus whatever it frames.
+#[component]
+fn PaneTab(
+    name: String,
+    subtitle: String,
+    active: bool,
+    grow: bool,
+    maximised: bool,
+    /// Which half this pane fills when it takes over, so the button can show it.
+    fills: String,
+    splittable: bool,
+    on_toggle: EventHandler<()>,
+) -> Element {
+    let mut class = String::from("pane-tab");
+    if grow {
+        class.push_str(" grow");
+    }
+    if active {
+        class.push_str(" active");
+    }
+    // The glyph shows the layout the click produces: this pane filling the
+    // frame, or the split coming back.
+    let glyph = if maximised { "layout-split" } else { fills.as_str() };
+    let hint = if maximised {
+        "Restore the split"
+    } else {
+        "Fill the frame with this pane"
+    };
+
+    rsx! {
+        div { class: "{class}",
+            span { class: "pane-dot" }
+            span { class: "pane-name", "{name}" }
+            if !subtitle.is_empty() {
+                span { class: "pane-sub", "{subtitle}" }
+            }
+            if splittable {
+                button {
+                    class: "iconbtn",
+                    title: "{hint}",
+                    onclick: move |_| on_toggle.call(()),
+                    {icon(glyph, 13)}
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn Workspace(view: ViewKind) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    // Where the splitter drag started, and how wide the table was then, so the
+    // grip stays exactly under the pointer however the panes are scrolled.
+    let mut resize_from = use_signal(|| None::<(f64, f64)>);
+
+    let (grid_width, focus, rows, filter) = {
+        let s = state.read();
+        (s.table_view_width(), s.pane_focus, s.visible_rows().len(), s.filter)
+    };
+    let filter_note = if filter == crate::state::TaskFilter::All {
+        format!("{rows} rows")
+    } else {
+        format!("{rows} rows \u{00b7} {}", filter.label())
+    };
+
+    match view {
+        // The table and the chart are two internal windows sharing one scroll,
+        // so their rows stay aligned however far down you go.
+        ViewKind::GanttChart | ViewKind::TrackingGantt => {
+            let mut split_class = String::from("split");
+            match focus {
+                PaneFocus::TableOnly => split_class.push_str(" hide-chart"),
+                PaneFocus::ChartOnly => split_class.push_str(" hide-table"),
+                PaneFocus::Both => {}
+            }
+            if resize_from().is_some() {
+                split_class.push_str(" resizing");
+            }
+
+            rsx! {
+                // The splitter drag listens on the whole window, so a fast
+                // pointer cannot outrun the 5 pixel grip and drop the drag.
+                if resize_from().is_some() {
+                    div {
+                        class: "drag-shield col-resize",
+                        onmousemove: move |event| {
+                            if let Some((from_x, from_width)) = resize_from() {
+                                let moved = event.client_coordinates().x - from_x;
+                                state.write().set_table_width(from_width + moved);
+                            }
+                        },
+                        onmouseup: move |_| resize_from.set(None),
+                    }
+                }
+
+                div { class: "panes",
+                    // The table and the chart scroll sideways on their own, but
+                    // their rows have to stay level, so their vertical scroll is
+                    // tied together.
+                    SyncPaneScroll {}
+                    div { class: "pane-bar",
+                        if focus != PaneFocus::ChartOnly {
+                            // flex: none, or the bar would shrink this tab and
+                            // it would stop lining up with the table below it.
+                            div { style: "width: {grid_width}px; flex: none; display: flex;",
+                                PaneTab {
+                                    name: "Entry Table".to_string(),
+                                    subtitle: filter_note.clone(),
+                                    active: true,
+                                    grow: true,
+                                    maximised: focus == PaneFocus::TableOnly,
+                                    fills: "layout-left".to_string(),
+                                    splittable: true,
+                                    on_toggle: move |_| state.write().toggle_pane(PaneFocus::TableOnly),
+                                }
+                            }
+                        }
+                        // The chart's own tab goes with the chart. Leaving it
+                        // behind is a header for a pane that is not there.
+                        if focus != PaneFocus::TableOnly {
+                            PaneTab {
+                                name: view.label().to_string(),
+                                subtitle: String::new(),
+                                active: true,
+                                grow: true,
+                                maximised: focus == PaneFocus::ChartOnly,
+                                fills: "layout-right".to_string(),
+                                splittable: true,
+                                on_toggle: move |_| state.write().toggle_pane(PaneFocus::ChartOnly),
+                            }
+                        }
+                    }
+
+                    div { class: "pane-frame",
+                        div {
+                            class: "{split_class}",
+                            onmouseup: move |_| {
+                                // A row drag can end anywhere in the pane.
+                                if state.read().drag_row.is_some() {
+                                    state.write().finish_drag();
+                                }
+                            },
+
+                            div { class: "pane-left",
+                                grid::TaskGrid {}
+                                div {
+                                    class: "splitter",
+                                    onmousedown: move |event| {
+                                        event.prevent_default();
+                                        event.stop_propagation();
+                                        let width = state.read().table_view_width();
+                                        resize_from.set(Some((event.client_coordinates().x, width)));
+                                    },
+                                }
+                            }
+                            gantt::GanttChart {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // Every other view is a single internal window.
+        _ => rsx! {
+            div { class: "panes",
+                div { class: "pane-bar",
+                    PaneTab {
+                        name: view.label().to_string(),
+                        subtitle: match view {
+                            ViewKind::ResourceSheet | ViewKind::ResourceUsage | ViewKind::TeamPlanner => {
+                                let count = state.read().project.resources.len();
+                                format!("{count} resources")
+                            }
+                            _ => filter_note.clone(),
+                        },
+                        active: true,
+                        grow: true,
+                        maximised: false,
+                        fills: "layout-split".to_string(),
+                        // A single-pane view has nothing to maximise into.
+                        splittable: false,
+                        on_toggle: move |_| state.write().view = ViewKind::GanttChart,
+                    }
+                }
+                div { class: "pane-frame",
+                    match view {
+                        ViewKind::TaskSheet => rsx! {
+                            div { class: "split",
+                                div { class: "pane-left", grid::TaskGrid {} }
+                            }
+                        },
+                        ViewKind::TaskUsage => rsx! { views::TaskUsage {} },
+                        ViewKind::NetworkDiagram => rsx! { views::NetworkDiagram {} },
+                        ViewKind::CalendarView => rsx! { views::CalendarView {} },
+                        ViewKind::TeamPlanner => rsx! {
+                            div { class: "split", views::TeamPlanner {} }
+                        },
+                        _ => rsx! { views::ResourceSheet {} },
+                    }
+                }
+            }
+        },
+    }
+}
+
+#[component]
+fn StatusBar() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let s = state.read();
+
+    let tasks = s.project.tasks.len();
+    let percent = s.project.percent_complete();
+    let currency = s.project.currency_symbol.clone();
+    let zoom = s.zoom;
+    let status = s.status.clone();
+
+    let (finish, cost, work, critical, overallocated) = match &s.report {
+        Ok(report) => (
+            crate::state::format_date(report.finish),
+            format!("{currency}{:.2}", report.total_cost),
+            format_work(report.total_work_minutes),
+            report.critical_task_count,
+            report.overallocations.len(),
+        ),
+        Err(_) => (
+            "\u{2014}".into(),
+            "\u{2014}".into(),
+            "\u{2014}".into(),
+            0,
+            0,
+        ),
+    };
+    let duration = s
+        .report
+        .as_ref()
+        .map(|r| format_duration(r.duration_minutes))
+        .unwrap_or_else(|_| "\u{2014}".into());
+
+    rsx! {
+        div { class: "statusbar",
+            span { class: "chip", "{status}" }
+            span { class: "chip", "New Tasks: Auto Scheduled" }
+            div { class: "grow" }
+            span { class: "chip", "{tasks} tasks" }
+            span { class: "chip", "{critical} critical" }
+            span { class: "chip", "Duration {duration}" }
+            span { class: "chip", "Finish {finish}" }
+            span { class: "chip", "Work {work}" }
+            span { class: "chip", "Cost {cost}" }
+            span { class: "chip", "{percent}% complete" }
+            if overallocated > 0 {
+                span { class: "chip warn", "\u{26a0} {overallocated} overallocated" }
+            }
+            div { class: "zoom-slider",
+                button { class: "zoom-btn", title: "Zoom Out",
+                    onclick: move |_| { let z = state.read().zoom.zoom_out(); state.write().zoom = z; },
+                    "\u{2212}"
+                }
+                span { class: "zoom-label", "{zoom.label()}" }
+                button { class: "zoom-btn", title: "Zoom In",
+                    onclick: move |_| { let z = state.read().zoom.zoom_in(); state.write().zoom = z; },
+                    "+"
+                }
+            }
+        }
+    }
+}
+
+/// Run whatever the keyboard is pointed at.
+///
+/// The key press is rendered in the same form a binding is written in and
+/// looked up in the map, rather than matched against a fixed list here. That is
+/// what lets the same table be listed in the settings, rebound, and saved.
+fn handle_shortcut(state: &mut Signal<AppState>, event: Event<KeyboardData>) {
+    // Never steal keys while a cell editor, a dialog or a menu has focus.
+    {
+        let s = state.read();
+        if s.editing.is_some()
+            || s.dialog.is_some()
+            || s.backstage.is_some()
+            || s.context_menu.is_some()
+        {
+            return;
+        }
+    }
+
+    let Some(pressed) = keymap::shortcut_for(&event.key(), event.modifiers()) else {
+        return;
+    };
+    let Some(action) = state.read().keys.action_for(&pressed) else {
+        return;
+    };
+
+    run_action(state, action);
+    event.prevent_default();
+}
+
+/// Carry out one action, however it was asked for.
+fn run_action(state: &mut Signal<AppState>, action: keymap::Action) {
+    use keymap::Action;
+
+    match action {
+        Action::New => state.write().backstage = Some(BackstagePage::New),
+        Action::Open => state.write().backstage = Some(BackstagePage::Open),
+        Action::Save => {
+            let saved = state.write().save();
+            if !saved {
+                state.write().backstage = Some(BackstagePage::SaveAs);
+            }
+        }
+        Action::SaveAs => state.write().backstage = Some(BackstagePage::SaveAs),
+        Action::Print => state.write().backstage = Some(BackstagePage::Print),
+        Action::Export => state.write().backstage = Some(BackstagePage::Export),
+        Action::CloseProject => state
+            .write()
+            .guard(crate::state::PendingAction::CloseProject),
+
+        Action::Undo => state.write().undo(),
+        Action::Redo => state.write().redo(),
+        Action::Cut => state.write().cut_selected(),
+        Action::Copy => state.write().copy_selected(),
+        Action::Paste => state.write().paste(),
+        Action::Delete => state.write().delete_selected(),
+        Action::EditCell => {
+            let row = state.read().primary();
+            if let Some(row) = row {
+                state.write().editing = Some((row, crate::state::Column::Name));
+            }
+        }
+
+        Action::InsertTask => state.write().insert_task(),
+        Action::InsertMilestone => state.write().insert_milestone(),
+        Action::InsertSummary => state.write().insert_summary(),
+        Action::Indent => state.write().indent_selected(),
+        Action::Outdent => state.write().outdent_selected(),
+        Action::MoveUp => state.write().move_selected(-1),
+        Action::MoveDown => state.write().move_selected(1),
+        Action::Link => state.write().link_selected(),
+        Action::Unlink => state.write().unlink_selected(),
+        Action::TaskInformation => {
+            let row = state.read().primary();
+            if let Some(row) = row {
+                state.write().dialog = Some(crate::state::Dialog::TaskInformation(row));
+            }
+        }
+        Action::ToggleActive => state.write().toggle_active(),
+        Action::ManuallySchedule => state.write().set_task_mode(TaskMode::Manual),
+        Action::AutoSchedule => state.write().set_task_mode(TaskMode::Auto),
+        Action::RespectLinks => state.write().respect_links(),
+
+        Action::ProjectInformation => {
+            state.write().dialog = Some(crate::state::Dialog::ProjectInformation)
+        }
+        Action::AssignResources => {
+            state.write().dialog = Some(crate::state::Dialog::AssignResources)
+        }
+        Action::SetBaseline => state.write().set_baseline(),
+        Action::ScrollToTask => state.write().scroll_to_task(),
+
+        Action::ZoomIn => {
+            let zoom = state.read().zoom.zoom_in();
+            state.write().zoom = zoom;
+        }
+        Action::ZoomOut => {
+            let zoom = state.read().zoom.zoom_out();
+            state.write().zoom = zoom;
+        }
+        Action::ToggleTimeline => {
+            let on = state.read().show_timeline;
+            state.write().show_timeline = !on;
+        }
+        Action::ToggleCriticalPath => {
+            let on = state.read().show_critical;
+            state.write().show_critical = !on;
+        }
+        Action::ToggleOutlineNumber => {
+            let on = state.read().show_outline_number;
+            state.write().show_outline_number = !on;
+        }
+        Action::ExpandAll => state.write().expand_all(false),
+        Action::CollapseAll => state.write().expand_all(true),
+        Action::MaximiseTable => state.write().toggle_pane(PaneFocus::TableOnly),
+        Action::MaximiseChart => state.write().toggle_pane(PaneFocus::ChartOnly),
+
+        Action::SelectDown => {
+            let next = state.read().primary().map(|row| row + 1);
+            let limit = state.read().project.tasks.len();
+            if let Some(row) = next {
+                if row < limit {
+                    state.write().select(row);
+                }
+            }
+        }
+        Action::SelectUp => {
+            let previous = state.read().primary().and_then(|row| row.checked_sub(1));
+            if let Some(row) = previous {
+                state.write().select(row);
+            }
+        }
+    }
+}
+
+/// Zoom levels are exposed here so the status bar and ribbon agree on order.
+#[allow(dead_code)]
+const ZOOM_ORDER: [Zoom; 4] = Zoom::ORDER;

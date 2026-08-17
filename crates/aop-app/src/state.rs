@@ -1,0 +1,2639 @@
+//! Application state and every command the ribbon can fire.
+//!
+//! One `Signal<AppState>` is provided at the root and read by every component.
+//! Mutations go through methods here rather than being written inline in the
+//! views, so undo snapshots and rescheduling can never be forgotten.
+
+use std::path::PathBuf;
+
+use aop_core::{
+    persist, schedule, templates, ConstraintType, Field, Link, LinkType, Project, ResourceId,
+    ScheduleReport, Task, TaskId, TaskMode, WorkCalendar,
+};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
+
+const UNDO_LIMIT: usize = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RibbonTab {
+    Task,
+    Resource,
+    Report,
+    Project,
+    View,
+    Format,
+    Help,
+}
+
+impl RibbonTab {
+    pub const ORDER: [RibbonTab; 6] = [
+        RibbonTab::Task,
+        RibbonTab::Resource,
+        RibbonTab::Report,
+        RibbonTab::Project,
+        RibbonTab::View,
+        RibbonTab::Help,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RibbonTab::Task => "Task",
+            RibbonTab::Resource => "Resource",
+            RibbonTab::Report => "Report",
+            RibbonTab::Project => "Project",
+            RibbonTab::View => "View",
+            RibbonTab::Format => "Format",
+            RibbonTab::Help => "Help",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewKind {
+    GanttChart,
+    TrackingGantt,
+    TaskSheet,
+    TaskUsage,
+    NetworkDiagram,
+    CalendarView,
+    ResourceSheet,
+    ResourceUsage,
+    TeamPlanner,
+}
+
+impl ViewKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewKind::GanttChart => "Gantt Chart",
+            ViewKind::TrackingGantt => "Tracking Gantt",
+            ViewKind::TaskSheet => "Task Sheet",
+            ViewKind::TaskUsage => "Task Usage",
+            ViewKind::NetworkDiagram => "Network Diagram",
+            ViewKind::CalendarView => "Calendar",
+            ViewKind::ResourceSheet => "Resource Sheet",
+            ViewKind::ResourceUsage => "Resource Usage",
+            ViewKind::TeamPlanner => "Team Planner",
+        }
+    }
+
+    /// The contextual ribbon tab that appears above Format for this view.
+    pub fn tools_label(self) -> &'static str {
+        match self {
+            ViewKind::GanttChart => "Gantt Chart Tools",
+            ViewKind::TrackingGantt => "Tracking Gantt Tools",
+            ViewKind::TaskSheet => "Task Sheet Tools",
+            ViewKind::TaskUsage => "Task Usage Tools",
+            ViewKind::NetworkDiagram => "Network Diagram Tools",
+            ViewKind::CalendarView => "Calendar Tools",
+            ViewKind::ResourceSheet => "Resource Sheet Tools",
+            ViewKind::ResourceUsage => "Resource Usage Tools",
+            ViewKind::TeamPlanner => "Team Planner Tools",
+        }
+    }
+
+    /// Whether the view draws a timescale down the right-hand side.
+    pub fn has_chart(self) -> bool {
+        matches!(self, ViewKind::GanttChart | ViewKind::TrackingGantt)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackstagePage {
+    Home,
+    Info,
+    New,
+    Open,
+    Save,
+    SaveAs,
+    Print,
+    Export,
+    About,
+    Options,
+}
+
+impl BackstagePage {
+    pub fn label(self) -> &'static str {
+        match self {
+            BackstagePage::Home => "Home",
+            BackstagePage::Info => "Info",
+            BackstagePage::New => "New",
+            BackstagePage::Open => "Open",
+            BackstagePage::Save => "Save",
+            BackstagePage::SaveAs => "Save As",
+            BackstagePage::Print => "Print",
+            BackstagePage::Export => "Export",
+            BackstagePage::About => "About",
+            BackstagePage::Options => "Options",
+        }
+    }
+
+    /// The glyph shown beside the entry in the File menu.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            BackstagePage::Home => "home",
+            BackstagePage::Info => "info-circle",
+            BackstagePage::New => "file-new",
+            BackstagePage::Open => "folder-open",
+            BackstagePage::Save => "save-mono",
+            BackstagePage::SaveAs => "save-as",
+            BackstagePage::Print => "printer",
+            BackstagePage::Export => "file-output",
+            BackstagePage::About => "badge-info",
+            BackstagePage::Options => "settings",
+        }
+    }
+}
+
+/// Where a dragged row will land relative to the row under the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropWhere {
+    Above,
+    Below,
+    /// Nest the dragged block under the target as a child.
+    Into,
+}
+
+/// Categories down the left of the Options page, as Project groups them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionsPage {
+    General,
+    Display,
+    Schedule,
+    Save,
+    Advanced,
+    Keyboard,
+    CustomizeRibbon,
+    QuickAccess,
+}
+
+impl OptionsPage {
+    pub const ORDER: [OptionsPage; 8] = [
+        OptionsPage::General,
+        OptionsPage::Display,
+        OptionsPage::Schedule,
+        OptionsPage::Save,
+        OptionsPage::Advanced,
+        OptionsPage::Keyboard,
+        OptionsPage::CustomizeRibbon,
+        OptionsPage::QuickAccess,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OptionsPage::General => "General",
+            OptionsPage::Display => "Display",
+            OptionsPage::Schedule => "Schedule",
+            OptionsPage::Save => "Save",
+            OptionsPage::Advanced => "Advanced",
+            OptionsPage::Keyboard => "Keyboard",
+            OptionsPage::CustomizeRibbon => "Customize Ribbon",
+            OptionsPage::QuickAccess => "Quick Access Toolbar",
+        }
+    }
+}
+
+/// A column in the task table: which field it shows and how wide it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnSpec {
+    pub field: Field,
+    pub width: f64,
+}
+
+impl ColumnSpec {
+    pub fn new(field: Field) -> Self {
+        Self {
+            width: field.default_width(),
+            field,
+        }
+    }
+}
+
+/// The columns a plan opens with, matching Project's Entry table.
+pub fn default_columns() -> Vec<ColumnSpec> {
+    Field::ENTRY_TABLE.iter().copied().map(ColumnSpec::new).collect()
+}
+
+/// Width of the default table, which is where the splitter starts.
+pub const DEFAULT_COLUMNS_WIDTH: f64 = 660.0;
+
+/// Which internal pane is showing, for the split views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneFocus {
+    Both,
+    TableOnly,
+    ChartOnly,
+}
+
+/// A command that can sit on the Quick Access Toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QatCommand {
+    New,
+    Open,
+    Save,
+    Print,
+    Export,
+    Undo,
+    Redo,
+    Link,
+    Unlink,
+    TaskInformation,
+    AssignResources,
+    ProjectInformation,
+    SetBaseline,
+    ScrollToTask,
+    ZoomIn,
+    ZoomOut,
+}
+
+impl QatCommand {
+    pub const ALL: [QatCommand; 16] = [
+        QatCommand::New,
+        QatCommand::Open,
+        QatCommand::Save,
+        QatCommand::Print,
+        QatCommand::Export,
+        QatCommand::Undo,
+        QatCommand::Redo,
+        QatCommand::Link,
+        QatCommand::Unlink,
+        QatCommand::TaskInformation,
+        QatCommand::AssignResources,
+        QatCommand::ProjectInformation,
+        QatCommand::SetBaseline,
+        QatCommand::ScrollToTask,
+        QatCommand::ZoomIn,
+        QatCommand::ZoomOut,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            QatCommand::New => "New",
+            QatCommand::Open => "Open",
+            QatCommand::Save => "Save",
+            QatCommand::Print => "Print",
+            QatCommand::Export => "Export",
+            QatCommand::Undo => "Undo",
+            QatCommand::Redo => "Redo",
+            QatCommand::Link => "Link the Selected Tasks",
+            QatCommand::Unlink => "Unlink Tasks",
+            QatCommand::TaskInformation => "Task Information",
+            QatCommand::AssignResources => "Assign Resources",
+            QatCommand::ProjectInformation => "Project Information",
+            QatCommand::SetBaseline => "Set Baseline",
+            QatCommand::ScrollToTask => "Scroll to Task",
+            QatCommand::ZoomIn => "Zoom In",
+            QatCommand::ZoomOut => "Zoom Out",
+        }
+    }
+
+    pub fn glyph(self) -> &'static str {
+        match self {
+            QatCommand::New => "new",
+            QatCommand::Open => "open",
+            QatCommand::Save => "save",
+            QatCommand::Print => "print",
+            QatCommand::Export => "export",
+            QatCommand::Undo => "undo",
+            QatCommand::Redo => "redo",
+            QatCommand::Link => "link",
+            QatCommand::Unlink => "unlink",
+            QatCommand::TaskInformation => "information",
+            QatCommand::AssignResources => "assign-resources",
+            QatCommand::ProjectInformation => "project-info",
+            QatCommand::SetBaseline => "baseline",
+            QatCommand::ScrollToTask => "scroll-to-task",
+            QatCommand::ZoomIn => "zoom-in",
+            QatCommand::ZoomOut => "zoom-out",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            QatCommand::New => "new",
+            QatCommand::Open => "open",
+            QatCommand::Save => "save",
+            QatCommand::Print => "print",
+            QatCommand::Export => "export",
+            QatCommand::Undo => "undo",
+            QatCommand::Redo => "redo",
+            QatCommand::Link => "link",
+            QatCommand::Unlink => "unlink",
+            QatCommand::TaskInformation => "task-info",
+            QatCommand::AssignResources => "assign",
+            QatCommand::ProjectInformation => "project-info",
+            QatCommand::SetBaseline => "baseline",
+            QatCommand::ScrollToTask => "scroll",
+            QatCommand::ZoomIn => "zoom-in",
+            QatCommand::ZoomOut => "zoom-out",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<QatCommand> {
+        QatCommand::ALL.into_iter().find(|c| c.key() == key)
+    }
+}
+
+/// The buttons a fresh install starts with.
+const DEFAULT_QAT: [QatCommand; 7] = [
+    QatCommand::Save,
+    QatCommand::Undo,
+    QatCommand::Redo,
+    QatCommand::Link,
+    QatCommand::Unlink,
+    QatCommand::TaskInformation,
+    QatCommand::AssignResources,
+];
+
+/// Which rows the views show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskFilter {
+    All,
+    Critical,
+    Milestones,
+    Incomplete,
+}
+
+impl TaskFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            TaskFilter::All => "All Tasks",
+            TaskFilter::Critical => "Critical",
+            TaskFilter::Milestones => "Milestones",
+            TaskFilter::Incomplete => "Incomplete",
+        }
+    }
+}
+
+/// What dragging a Gantt bar is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarDragKind {
+    /// Slide the whole bar, which pins the task with a start constraint.
+    Move,
+    /// Pull the right edge to change the duration.
+    Resize,
+    /// Pull from the left edge to set percent complete.
+    Progress,
+    /// Shift-drag onto another bar to link them.
+    Link,
+}
+
+/// An in-progress Gantt bar drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BarDrag {
+    pub row: usize,
+    pub kind: BarDragKind,
+    pub origin_x: f64,
+    pub delta_x: f64,
+    pub base_start: NaiveDateTime,
+    pub base_duration: i64,
+    pub base_percent: u8,
+    pub bar_width: f64,
+    /// The bar the pointer is currently over, used when linking.
+    pub hover_row: Option<usize>,
+}
+
+impl BarDrag {
+    /// Whole days the pointer has travelled at this zoom level.
+    pub fn days(&self, px_per_day: f64) -> i64 {
+        if px_per_day <= 0.0 {
+            return 0;
+        }
+        (self.delta_x / px_per_day).round() as i64
+    }
+
+    pub fn preview_percent(&self) -> u8 {
+        if self.bar_width <= 0.0 {
+            return self.base_percent;
+        }
+        let shift = self.delta_x / self.bar_width * 100.0;
+        (self.base_percent as f64 + shift).clamp(0.0, 100.0) as u8
+    }
+}
+
+/// An open right-click menu and the screen position it was opened at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ContextMenu {
+    Task { row: usize, x: f64, y: f64 },
+    Chart { x: f64, y: f64 },
+    Resource { index: usize, x: f64, y: f64 },
+    Column { index: usize, x: f64, y: f64 },
+}
+
+impl ContextMenu {
+    pub fn position(self) -> (f64, f64) {
+        match self {
+            ContextMenu::Task { x, y, .. } => (x, y),
+            ContextMenu::Chart { x, y } => (x, y),
+            ContextMenu::Resource { x, y, .. } => (x, y),
+            ContextMenu::Column { x, y, .. } => (x, y),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Dialog {
+    TaskInformation(usize),
+    /// Preview of a starter template before creating it.
+    TemplatePreview(String),
+    ProjectInformation,
+    AssignResources,
+    ChangeWorkingTime,
+    CustomizeQat,
+    BarStyles,
+    /// Offers a repair for a plan that will not schedule.
+    FixIssue,
+    /// Asks what to do about unsaved work before something discards it.
+    UnsavedChanges(PendingAction),
+    /// Offers back work left behind by a session that never finished.
+    Recover(crate::recovery::Recovered),
+    /// Pick a field to insert as a column, at the given position.
+    InsertColumn(usize),
+    Message { title: String, body: String },
+}
+
+/// What the user was doing when unsaved work got in the way.
+///
+/// Held so the answer to "save first?" can be acted on and then the original
+/// action carried out, rather than the user having to ask for it twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingAction {
+    /// Quit the application.
+    Quit,
+    /// Close the plan and start an empty one.
+    CloseProject,
+    /// Start a new plan from a template.
+    NewFromTemplate(String),
+    /// Open a file from disk.
+    Open(PathBuf),
+}
+
+impl PendingAction {
+    /// What the buttons should say this will discard.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            PendingAction::Quit => "closing",
+            PendingAction::CloseProject => "closing this plan",
+            PendingAction::NewFromTemplate(_) => "starting a new plan",
+            PendingAction::Open(_) => "opening another plan",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zoom {
+    Days,
+    Weeks,
+    Months,
+    Quarters,
+}
+
+impl Zoom {
+    pub const ORDER: [Zoom; 4] = [Zoom::Days, Zoom::Weeks, Zoom::Months, Zoom::Quarters];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Zoom::Days => "Days",
+            Zoom::Weeks => "Weeks",
+            Zoom::Months => "Months",
+            Zoom::Quarters => "Quarters",
+        }
+    }
+
+    /// Horizontal pixels per calendar day at this zoom level.
+    pub fn px_per_day(self) -> f64 {
+        match self {
+            Zoom::Days => 26.0,
+            Zoom::Weeks => 9.0,
+            Zoom::Months => 3.4,
+            Zoom::Quarters => 1.3,
+        }
+    }
+
+    pub fn zoom_in(self) -> Zoom {
+        match self {
+            Zoom::Quarters => Zoom::Months,
+            Zoom::Months => Zoom::Weeks,
+            _ => Zoom::Days,
+        }
+    }
+
+    pub fn zoom_out(self) -> Zoom {
+        match self {
+            Zoom::Days => Zoom::Weeks,
+            Zoom::Weeks => Zoom::Months,
+            _ => Zoom::Quarters,
+        }
+    }
+}
+
+/// The grid column a cell edit is targeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Column {
+    Name,
+    Duration,
+    Start,
+    Finish,
+    Predecessors,
+    Resources,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentEntry {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+pub struct AppState {
+    pub project: Project,
+    /// The last scheduling result, or the error explaining why it failed.
+    pub report: Result<ScheduleReport, String>,
+    pub file_path: Option<PathBuf>,
+    pub dirty: bool,
+
+    pub selection: Vec<usize>,
+    pub selected_resource: Option<usize>,
+    pub editing: Option<(usize, Column)>,
+    /// What to carry out once a Save As has finished, when the save was asked
+    /// for in order to get past unsaved work.
+    pub after_save: Option<PendingAction>,
+    /// Set when the plan is safe to abandon and the window should now close.
+    pub quit_requested: bool,
+    /// Screen position to anchor a cell popup at.
+    pub popup_at: (f64, f64),
+    /// The window's inner size, so a floating panel can tell how much room it
+    /// has before an edge. Without it a menu opened near the bottom simply runs
+    /// off the screen, since nothing in a click event says where the edges are.
+    pub viewport: (f64, f64),
+    /// Which cell of the selected resource row is being edited, if any.
+    pub editing_resource_field: Option<String>,
+
+    pub tab: RibbonTab,
+    pub view: ViewKind,
+    pub backstage: Option<BackstagePage>,
+    pub dialog: Option<Dialog>,
+    pub context_menu: Option<ContextMenu>,
+    /// A Gantt bar being dragged.
+    pub bar_drag: Option<BarDrag>,
+    /// The row currently being dragged, and where it would land.
+    pub drag_row: Option<usize>,
+    pub drop_target: Option<(usize, DropWhere)>,
+    /// A confirmation shown on the current Backstage page.
+    pub backstage_message: Option<String>,
+    pub zoom: Zoom,
+    pub filter: TaskFilter,
+    pub status: String,
+
+    /// The start-up splash, dismissed on a timer or by any click.
+    pub splash: bool,
+    pub ribbon_collapsed: bool,
+    pub show_timeline: bool,
+    pub show_outline_number: bool,
+    pub show_critical: bool,
+    /// Which palette to paint, or to follow the desktop.
+    pub theme: crate::theme::ThemeChoice,
+    /// Which key press runs which command.
+    pub keys: crate::keymap::Keymap,
+    pub show_slack: bool,
+    pub show_baseline: bool,
+    pub gantt_style: usize,
+    /// The table's columns, in the order they are drawn.
+    pub columns: Vec<ColumnSpec>,
+    /// How much of the table is on show. Narrower than the columns need simply
+    /// scrolls; it never squashes them.
+    pub table_pane_width: f64,
+    pub pane_focus: PaneFocus,
+
+    pub recent: Vec<RecentEntry>,
+    /// Quick Access Toolbar buttons, in order.
+    pub qat: Vec<QatCommand>,
+
+    // ---- options -------------------------------------------------------
+    pub user_name: String,
+    pub user_initials: String,
+    pub default_view: ViewKind,
+    pub date_format: usize,
+    /// Mode given to newly inserted tasks.
+    pub new_tasks_mode: TaskMode,
+    pub default_folder: String,
+    pub options_page: OptionsPage,
+    clipboard: Vec<Task>,
+    undo: Vec<Project>,
+    redo: Vec<Project>,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        let start = default_start();
+
+        let mut state = Self {
+            project: Project::blank(start),
+            report: Ok(empty_report(start)),
+            file_path: None,
+            dirty: false,
+            selection: Vec::new(),
+            selected_resource: None,
+            editing: None,
+            after_save: None,
+            quit_requested: false,
+            popup_at: (0.0, 0.0),
+            viewport: (1560.0, 980.0),
+            editing_resource_field: None,
+            tab: RibbonTab::Task,
+            view: ViewKind::GanttChart,
+            backstage: Some(BackstagePage::Home),
+            dialog: None,
+            context_menu: None,
+            bar_drag: None,
+            drag_row: None,
+            drop_target: None,
+            backstage_message: None,
+            zoom: Zoom::Days,
+            filter: TaskFilter::All,
+            status: "Ready".into(),
+            splash: true,
+            ribbon_collapsed: false,
+            show_timeline: true,
+            show_outline_number: false,
+            show_critical: false,
+            theme: crate::theme::ThemeChoice::default(),
+            keys: crate::keymap::Keymap::default(),
+            show_slack: false,
+            show_baseline: false,
+            gantt_style: 0,
+            columns: default_columns(),
+            table_pane_width: DEFAULT_COLUMNS_WIDTH,
+            pane_focus: PaneFocus::Both,
+            recent: load_recent(),
+            qat: load_qat(),
+            user_name: String::new(),
+            user_initials: String::new(),
+            default_view: ViewKind::GanttChart,
+            date_format: 0,
+            new_tasks_mode: TaskMode::Auto,
+            default_folder: documents_dir().display().to_string(),
+            options_page: OptionsPage::General,
+            clipboard: Vec::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+        };
+        state.reschedule();
+        state
+    }
+
+    // ---- scheduling -----------------------------------------------------
+
+    /// Recalculate the plan. Called after every mutation.
+    pub fn reschedule(&mut self) {
+        self.report = schedule(&mut self.project).map_err(|e| e.to_string());
+        if let Err(message) = &self.report {
+            self.status = message.clone();
+        }
+    }
+
+    pub fn schedule_error(&self) -> Option<String> {
+        self.report.as_ref().err().cloned()
+    }
+
+    /// Work out how to repair a plan that will not schedule.
+    pub fn remedy(&self) -> Option<aop_core::Remedy> {
+        if self.report.is_ok() {
+            return None;
+        }
+        aop_core::diagnose(&self.project)
+    }
+
+    /// Apply a repair the user has agreed to.
+    pub fn apply_remedy(&mut self, remedy: &aop_core::Remedy) {
+        self.checkpoint();
+        let removed = aop_core::apply_remedy(&mut self.project, remedy);
+        self.reschedule();
+        self.dialog = None;
+        self.status = match self.report {
+            Ok(_) => format!("Fixed: {removed} link(s) removed, the plan schedules again"),
+            Err(_) => format!("{removed} link(s) removed, but the plan still will not schedule"),
+        };
+    }
+
+    // ---- undo -----------------------------------------------------------
+
+    /// Snapshot the plan before changing it. Every mutating command calls this.
+    pub fn checkpoint(&mut self) {
+        self.undo.push(self.project.clone());
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.dirty = true;
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(previous) = self.undo.pop() {
+            self.redo.push(std::mem::replace(&mut self.project, previous));
+            self.dirty = true;
+            self.clamp_selection();
+            self.reschedule();
+            self.status = "Undo".into();
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(std::mem::replace(&mut self.project, next));
+            self.dirty = true;
+            self.clamp_selection();
+            self.reschedule();
+            self.status = "Redo".into();
+        }
+    }
+
+    // ---- selection ------------------------------------------------------
+
+    pub fn select(&mut self, index: usize) {
+        // Selecting a different row abandons any edit in progress; staying on
+        // the same row does not, so clicking about inside a cell is safe.
+        if self.editing.map(|(row, _)| row) != Some(index) {
+            self.editing = None;
+        }
+        self.selection = vec![index];
+    }
+
+    pub fn extend_selection(&mut self, index: usize) {
+        if let Some(&anchor) = self.selection.first() {
+            let (lo, hi) = if anchor <= index {
+                (anchor, index)
+            } else {
+                (index, anchor)
+            };
+            let mut range: Vec<usize> = (lo..=hi).collect();
+            if anchor > index {
+                range.reverse();
+            }
+            self.selection = range;
+        } else {
+            self.select(index);
+        }
+    }
+
+    pub fn toggle_selection(&mut self, index: usize) {
+        if let Some(position) = self.selection.iter().position(|&i| i == index) {
+            self.selection.remove(position);
+        } else {
+            self.selection.push(index);
+        }
+    }
+
+    pub fn primary(&self) -> Option<usize> {
+        self.selection.first().copied()
+    }
+
+    pub fn is_selected(&self, index: usize) -> bool {
+        self.selection.contains(&index)
+    }
+
+    fn clamp_selection(&mut self) {
+        let limit = self.project.tasks.len();
+        self.selection.retain(|&i| i < limit);
+        self.editing = None;
+    }
+
+    /// Selected rows in ascending order, which is what structural edits want.
+    fn ordered_selection(&self) -> Vec<usize> {
+        let mut rows = self.selection.clone();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    // ---- file -----------------------------------------------------------
+
+    pub fn document_title(&self) -> String {
+        let name = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.project.name.clone());
+        format!("{name}{}", if self.dirty { "*" } else { "" })
+    }
+
+    pub fn new_from_template(&mut self, template_id: &str) {
+        let start = default_start();
+        self.project = match templates::by_id(template_id) {
+            Some(spec) => templates::build(spec, start),
+            None => Project::blank(start),
+        };
+        self.file_path = None;
+        self.dirty = false;
+        self.undo.clear();
+        self.redo.clear();
+        self.selection = if self.project.tasks.is_empty() {
+            Vec::new()
+        } else {
+            vec![0]
+        };
+        self.backstage = None;
+        self.view = ViewKind::GanttChart;
+        self.tab = RibbonTab::Task;
+        self.zoom = if self.project.tasks.len() > 20 {
+            Zoom::Weeks
+        } else {
+            Zoom::Days
+        };
+        self.reschedule();
+        self.status = format!("Created {}", self.project.name);
+    }
+
+    pub fn open_path(&mut self, path: PathBuf) {
+        match persist::open(&path) {
+            Ok(project) => {
+                self.project = project;
+                self.dirty = false;
+                self.undo.clear();
+                self.redo.clear();
+                self.selection = if self.project.tasks.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![0]
+                };
+                self.status = format!("Opened {}", path.display());
+                self.push_recent(&path);
+                self.file_path = Some(path);
+                self.backstage = None;
+                self.reschedule();
+            }
+            Err(error) => {
+                self.dialog = Some(Dialog::Message {
+                    title: "Could not open file".into(),
+                    body: error.to_string(),
+                });
+                self.backstage = None;
+            }
+        }
+    }
+
+    /// Import a Microsoft Project XML (MSPDI) plan.
+    pub fn import_path(&mut self, path: PathBuf) {
+        match aop_core::mspdi::open(&path) {
+            Ok(project) => {
+                self.project = project;
+                // An import is a new document: it has no .aprj file behind it.
+                self.file_path = None;
+                self.dirty = true;
+                self.undo.clear();
+                self.redo.clear();
+                self.selection = if self.project.tasks.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![0]
+                };
+                // An import is a file the user opened, so it belongs in Recent
+                // like any other. It has no .aprj behind it yet, which is why
+                // `file_path` stays empty while the recent entry does not.
+                self.push_recent(&path);
+                self.backstage = None;
+                self.reschedule();
+                let tasks = self.project.tasks.len();
+                self.status = format!(
+                    "Imported {tasks} tasks from {}. Save As to keep it as a .{} file.",
+                    path.display(),
+                    persist::FILE_EXTENSION
+                );
+            }
+            Err(error) => {
+                self.dialog = Some(Dialog::Message {
+                    title: "Could not import".into(),
+                    body: error.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Take the remembered preferences on, at start up.
+    fn apply_settings(&mut self, settings: crate::settings::Settings) {
+        self.user_name = settings.user_name.clone();
+        self.user_initials = settings.user_initials.clone();
+        if !settings.company.is_empty() {
+            self.project.company = settings.company.clone();
+        }
+        if !settings.user_name.is_empty() {
+            self.project.author = settings.user_name.clone();
+        }
+        self.theme = settings.theme;
+        self.date_format = settings.date_format;
+        set_date_format(settings.date_format);
+        self.show_timeline = settings.show_timeline;
+        self.show_outline_number = settings.show_outline_number;
+        self.show_critical = settings.show_critical;
+        self.keys = settings.keys;
+    }
+
+    /// What to remember for next time.
+    pub fn settings(&self) -> crate::settings::Settings {
+        crate::settings::Settings {
+            user_name: self.user_name.clone(),
+            user_initials: self.user_initials.clone(),
+            company: self.project.company.clone(),
+            theme: self.theme,
+            date_format: self.date_format,
+            show_timeline: self.show_timeline,
+            show_outline_number: self.show_outline_number,
+            show_critical: self.show_critical,
+            keys: self.keys.clone(),
+        }
+    }
+
+    /// Write a snapshot of the plan, so a crash cannot lose it.
+    ///
+    /// Only unsaved work is worth snapshotting: once the plan matches its file
+    /// there is nothing a snapshot could give back that the file does not.
+    pub fn snapshot(&self) {
+        if self.dirty {
+            crate::recovery::write(&self.project, self.file_path.as_deref());
+        }
+    }
+
+    /// Take back work from a session that never finished.
+    ///
+    /// The plan comes back unsaved and pointed at wherever it came from, so the
+    /// user still decides where it lands. Writing it out for them would be
+    /// deciding on their behalf, using a file they may not have chosen.
+    pub fn recover(&mut self, found: crate::recovery::Recovered) {
+        match persist::open(&found.snapshot) {
+            Ok(project) => {
+                self.project = project;
+                self.file_path = found.origin.clone();
+                self.dirty = true;
+                self.undo.clear();
+                self.redo.clear();
+                self.selection = if self.project.tasks.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![0]
+                };
+                self.dialog = None;
+                self.backstage = None;
+                self.reschedule();
+                self.status = match &found.origin {
+                    Some(path) => format!(
+                        "Recovered unsaved changes to {}. Save to keep them.",
+                        path.display()
+                    ),
+                    None => "Recovered an unsaved plan. Save to keep it.".into(),
+                };
+            }
+            Err(error) => {
+                self.dialog = Some(Dialog::Message {
+                    title: "Could not recover".into(),
+                    body: error.to_string(),
+                });
+            }
+        }
+        crate::recovery::clear(&found.snapshot);
+    }
+
+    /// Do something that discards the plan, asking about unsaved work first.
+    ///
+    /// Everything that throws away the open plan goes through here, so there is
+    /// one place that decides whether the question needs asking rather than
+    /// each command remembering to ask.
+    pub fn guard(&mut self, action: PendingAction) {
+        if self.dirty {
+            self.dialog = Some(Dialog::UnsavedChanges(action));
+        } else {
+            self.carry_out(action);
+        }
+    }
+
+    /// Carry out a guarded action, once unsaved work is no longer in the way.
+    ///
+    /// Quitting only raises a flag: closing the window needs the window, which
+    /// belongs to the title bar, so that one is left for it to notice.
+    pub fn carry_out(&mut self, action: PendingAction) {
+        self.dialog = None;
+        match action {
+            PendingAction::Quit => {
+                // Leaving on purpose, having been asked about the work: there
+                // is nothing here that was lost, so nothing to offer back.
+                crate::recovery::discard();
+                self.quit_requested = true;
+            }
+            PendingAction::CloseProject => {
+                self.new_from_template("blank");
+                self.note("Closed the project");
+            }
+            PendingAction::NewFromTemplate(id) => self.new_from_template(&id),
+            PendingAction::Open(path) => self.open_any(path),
+        }
+    }
+
+    /// Save, so a guarded action can go ahead.
+    ///
+    /// A plan that has never been saved has nowhere to go yet, so this opens
+    /// Save As and remembers what to do once a name has been chosen.
+    pub fn save_then(&mut self, action: PendingAction) {
+        if self.save() {
+            self.carry_out(action);
+            return;
+        }
+        self.after_save = Some(action);
+        self.dialog = None;
+        self.backstage = Some(BackstagePage::SaveAs);
+    }
+
+    /// Open whatever the path points at, picking the reader from its extension.
+    pub fn open_any(&mut self, path: PathBuf) {
+        let extension = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if persist::IMPORTED_EXTENSIONS.contains(&extension.as_str()) {
+            self.import_path(path);
+        } else {
+            self.open_path(path);
+        }
+    }
+
+    pub fn save_to(&mut self, path: PathBuf) {
+        match persist::save(&path, &self.project) {
+            Ok(written) => {
+                self.status = format!("Saved to {}", written.display());
+                self.backstage_message = Some(format!("Saved {}", written.display()));
+                self.dirty = false;
+                self.push_recent(&written);
+                self.file_path = Some(written);
+                self.backstage = None;
+
+                // The plan is on disk now, so the snapshot has nothing left to
+                // give back and would only turn up as a false alarm later.
+                crate::recovery::discard();
+
+                // If this save was only asked for so that something else could
+                // go ahead, that something else happens now.
+                if let Some(action) = self.after_save.take() {
+                    self.carry_out(action);
+                }
+            }
+            Err(error) => {
+                // The plan is still unsaved, so whatever was waiting on the
+                // save must not go ahead.
+                self.after_save = None;
+                self.dialog = Some(Dialog::Message {
+                    title: "Could not save file".into(),
+                    body: error.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Save over the current file, or fall through to Save As when there is none.
+    pub fn save(&mut self) -> bool {
+        match self.file_path.clone() {
+            Some(path) => {
+                self.save_to(path);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn push_recent(&mut self, path: &PathBuf) {
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Project".into());
+        self.recent.retain(|entry| &entry.path != path);
+        self.recent.insert(
+            0,
+            RecentEntry {
+                name,
+                path: path.clone(),
+            },
+        );
+        self.recent.truncate(12);
+        save_recent(&self.recent);
+    }
+
+    pub fn export_csv_to(&mut self, path: PathBuf) {
+        let path = path.with_extension("csv");
+        self.write_export(path, persist::to_csv(&self.project));
+    }
+
+    /// Write the print-ready page, used by both Print and Export.
+    pub fn export_html_to(&mut self, path: PathBuf) {
+        let path = path.with_extension("html");
+        self.write_export(path, persist::to_print_html(&self.project));
+    }
+
+    /// Shared file write that reports back on the page rather than closing it.
+    fn write_export(&mut self, path: PathBuf, contents: String) {
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                self.backstage_message = None;
+                self.dialog = Some(Dialog::Message {
+                    title: "Could not export".into(),
+                    body: format!("{}: {error}", parent.display()),
+                });
+                return;
+            }
+        }
+        match std::fs::write(&path, contents) {
+            Ok(()) => {
+                let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                self.status = format!("Exported {}", path.display());
+                self.backstage_message =
+                    Some(format!("Saved {} ({bytes} bytes)", path.display()));
+            }
+            Err(error) => {
+                self.backstage_message = None;
+                self.dialog = Some(Dialog::Message {
+                    title: "Could not export".into(),
+                    body: format!("{}: {error}", path.display()),
+                });
+            }
+        }
+    }
+
+    // ---- task commands --------------------------------------------------
+
+    /// Insert a blank task above the selection, the behaviour of the Task button.
+    pub fn insert_task(&mut self) {
+        self.checkpoint();
+        let at = self.primary().unwrap_or(self.project.tasks.len());
+        let id = self.project.insert_task(at, "");
+        let mode = self.new_tasks_mode;
+        if let Some(task) = self.project.task_mut(id) {
+            task.mode = mode;
+        }
+        self.select(at);
+        self.editing = Some((at, Column::Name));
+        self.reschedule();
+        self.status = "New task inserted".into();
+    }
+
+    /// Append a row at the bottom, used when typing into the blank last row.
+    pub fn append_task(&mut self, name: &str) -> usize {
+        self.checkpoint();
+        let at = self.project.tasks.len();
+        let id = self.project.insert_task(at, name);
+        if let Some(task) = self.project.task_mut(id) {
+            task.estimated = false;
+        }
+        self.reschedule();
+        at
+    }
+
+    pub fn insert_milestone(&mut self) {
+        self.checkpoint();
+        let at = self.primary().unwrap_or(self.project.tasks.len());
+        let id = self.project.insert_task(at, "New milestone");
+        if let Some(task) = self.project.task_mut(id) {
+            task.duration_minutes = 0;
+            task.estimated = false;
+        }
+        self.select(at);
+        self.editing = Some((at, Column::Name));
+        self.reschedule();
+        self.status = "Milestone inserted".into();
+    }
+
+    /// Insert a summary row and nest the selection underneath it.
+    pub fn insert_summary(&mut self) {
+        self.checkpoint();
+        let at = self.primary().unwrap_or(self.project.tasks.len());
+        let rows = self.ordered_selection();
+        let id = self.project.insert_task(at, "New summary task");
+        if let Some(task) = self.project.task_mut(id) {
+            task.estimated = false;
+        }
+        // Everything that was selected shifts down one and indents under the new row.
+        let shifted: Vec<usize> = if rows.is_empty() {
+            vec![at + 1]
+        } else {
+            rows.iter().map(|&r| r + 1).collect()
+        };
+        if shifted.iter().all(|&r| r < self.project.tasks.len()) {
+            for &row in &shifted {
+                self.project.indent(row);
+            }
+        }
+        self.select(at);
+        self.editing = Some((at, Column::Name));
+        self.reschedule();
+        self.status = "Summary task inserted".into();
+    }
+
+    pub fn delete_selected(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let mut rows = self.ordered_selection();
+        rows.reverse();
+        for row in rows {
+            self.project.delete_task(row);
+        }
+        self.clamp_selection();
+        self.reschedule();
+        self.status = "Task deleted".into();
+    }
+
+    pub fn indent_selected(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for row in self.ordered_selection() {
+            self.project.indent(row);
+        }
+        self.reschedule();
+    }
+
+    pub fn outdent_selected(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for row in self.ordered_selection() {
+            self.project.outdent(row);
+        }
+        self.reschedule();
+    }
+
+    pub fn move_selected(&mut self, delta: isize) {
+        let Some(row) = self.primary() else { return };
+        let span = self.project.descendants(row).end - row;
+        let target = if delta < 0 {
+            row.checked_sub(1)
+        } else {
+            let after = row + span;
+            if after < self.project.tasks.len() {
+                Some(self.project.descendants(after).end)
+            } else {
+                None
+            }
+        };
+        let Some(target) = target else { return };
+        self.checkpoint();
+        self.project.move_task(row, target);
+        let landed = if delta < 0 { target } else { target - span };
+        self.select(landed);
+        self.reschedule();
+    }
+
+    /// Link the selection into a finish-to-start chain, in selection order.
+    pub fn link_selected(&mut self) {
+        if self.selection.len() < 2 {
+            self.status = "Select two or more tasks to link them".into();
+            return;
+        }
+        self.checkpoint();
+        let ids: Vec<_> = self
+            .selection
+            .iter()
+            .filter_map(|&i| self.project.tasks.get(i).map(|t| t.id))
+            .collect();
+        for pair in ids.windows(2) {
+            self.project.add_link(Link::finish_to_start(pair[0], pair[1]));
+        }
+        self.reschedule();
+        if let Some(error) = self.schedule_error() {
+            self.undo();
+            self.dialog = Some(Dialog::Message {
+                title: "Cannot create this link".into(),
+                body: error,
+            });
+        } else {
+            self.status = format!("Linked {} tasks", ids.len());
+        }
+    }
+
+    pub fn unlink_selected(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let ids: Vec<_> = self
+            .ordered_selection()
+            .iter()
+            .filter_map(|&i| self.project.tasks.get(i).map(|t| t.id))
+            .collect();
+        for id in ids {
+            self.project.unlink_all(id);
+        }
+        self.reschedule();
+        self.status = "Links removed".into();
+    }
+
+    pub fn set_percent_complete(&mut self, percent: u8) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for row in self.ordered_selection() {
+            if self.project.is_summary(row) {
+                continue;
+            }
+            if let Some(task) = self.project.tasks.get_mut(row) {
+                task.percent_complete = percent.min(100);
+            }
+        }
+        self.reschedule();
+        self.status = format!("Marked {percent}% complete");
+    }
+
+    pub fn set_task_mode(&mut self, mode: TaskMode) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for row in self.ordered_selection() {
+            let start = self.project.tasks.get(row).map(|t| t.scheduled.start);
+            if let Some(task) = self.project.tasks.get_mut(row) {
+                task.mode = mode;
+                match mode {
+                    // Pin a manual task where it currently sits.
+                    TaskMode::Manual => task.manual_start = start,
+                    // Going back to auto must drop the pin, or the task would
+                    // still be anchored to a stale date the next time round.
+                    TaskMode::Auto => task.manual_start = None,
+                }
+            }
+        }
+        self.reschedule();
+        self.status = mode.label().into();
+    }
+
+    /// Recolour the chart from one of the named palettes.
+    pub fn apply_bar_preset(&mut self, index: usize) {
+        self.checkpoint();
+        self.project.bar_styles = aop_core::BarStyles::preset(index);
+        self.gantt_style = index;
+        self.dirty = true;
+        let name = aop_core::BarStyles::PRESETS[index.min(aop_core::BarStyles::PRESETS.len() - 1)].0;
+        self.status = format!("Gantt chart style: {name}");
+    }
+
+    /// Change one bar colour.
+    pub fn set_bar_colour(&mut self, key: &str, value: &str) {
+        self.checkpoint();
+        self.project.bar_styles.set(key, value);
+        self.dirty = true;
+    }
+
+    /// Put the selection back under the scheduler's control: auto scheduled,
+    /// As Soon As Possible, with any pinned date removed.
+    pub fn respect_links(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let mut released = 0;
+        for row in self.ordered_selection() {
+            if let Some(task) = self.project.tasks.get_mut(row) {
+                if task.constraint != ConstraintType::AsSoonAsPossible
+                    || task.constraint_date.is_some()
+                    || task.manual_start.is_some()
+                    || task.mode == TaskMode::Manual
+                {
+                    released += 1;
+                }
+                task.mode = TaskMode::Auto;
+                task.constraint = ConstraintType::AsSoonAsPossible;
+                task.constraint_date = None;
+                task.manual_start = None;
+            }
+        }
+        self.reschedule();
+        self.status = if released == 0 {
+            "Selection was already following its links".into()
+        } else {
+            format!("{released} task(s) released back to auto scheduling")
+        };
+    }
+
+    /// Whether any selected task is pinned by a constraint or a manual date.
+    pub fn selection_is_pinned(&self) -> bool {
+        self.selection.iter().any(|&row| {
+            self.project.tasks.get(row).is_some_and(|t| {
+                t.mode == TaskMode::Manual
+                    || t.constraint != ConstraintType::AsSoonAsPossible
+                    || t.manual_start.is_some()
+            })
+        })
+    }
+
+    pub fn toggle_active(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for row in self.ordered_selection() {
+            if let Some(task) = self.project.tasks.get_mut(row) {
+                task.active = !task.active;
+            }
+        }
+        self.reschedule();
+    }
+
+    pub fn toggle_collapse(&mut self, row: usize) {
+        if let Some(task) = self.project.tasks.get_mut(row) {
+            task.collapsed = !task.collapsed;
+        }
+    }
+
+    pub fn expand_all(&mut self, collapsed: bool) {
+        for task in &mut self.project.tasks {
+            task.collapsed = collapsed;
+        }
+    }
+
+    pub fn copy_selected(&mut self) {
+        self.clipboard = self
+            .ordered_selection()
+            .iter()
+            .filter_map(|&i| self.project.tasks.get(i).cloned())
+            .collect();
+        self.status = format!("{} task(s) copied", self.clipboard.len());
+    }
+
+    pub fn cut_selected(&mut self) {
+        self.copy_selected();
+        self.delete_selected();
+    }
+
+    pub fn paste(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        let at = self.primary().unwrap_or(self.project.tasks.len());
+        let rows: Vec<Task> = self.clipboard.clone();
+        for (offset, source) in rows.into_iter().enumerate() {
+            let mut copy = source;
+            copy.id = self.project.allocate_task_id();
+            copy.baseline = None;
+            self.project.tasks.insert(at + offset, copy);
+        }
+        self.reschedule();
+        self.status = "Pasted".into();
+    }
+
+    // ---- cell edits -----------------------------------------------------
+
+    /// Exactly the text a cell editor is seeded with, so a commit can tell
+    /// whether the user actually changed anything.
+    pub fn current_cell_text(&self, row: usize, column: Column) -> String {
+        let Some(task) = self.project.tasks.get(row) else {
+            return String::new();
+        };
+        match column {
+            Column::Name => task.name.clone(),
+            Column::Duration => aop_core::format_duration_flagged(
+                task.scheduled.duration_minutes,
+                task.estimated,
+            ),
+            Column::Start => task.scheduled.start.format("%Y-%m-%d").to_string(),
+            Column::Finish => task.scheduled.finish.format("%Y-%m-%d").to_string(),
+            Column::Predecessors => self.project.predecessor_text(task.id),
+            Column::Resources => self.project.resource_text(task),
+        }
+    }
+
+    pub fn commit_cell(&mut self, row: usize, column: Column, value: &str) {
+        if row >= self.project.tasks.len() {
+            return;
+        }
+        let value = value.trim().to_string();
+
+        // Opening a cell and clicking away must not change anything. Without
+        // this, blurring a Start cell would pin the task with a constraint and
+        // quietly take it out of auto scheduling.
+        if value == self.current_cell_text(row, column).trim() {
+            self.editing = None;
+            return;
+        }
+
+        self.checkpoint();
+
+        match column {
+            Column::Name => {
+                if let Some(task) = self.project.tasks.get_mut(row) {
+                    task.name = value;
+                }
+            }
+            Column::Duration => {
+                if let Some((minutes, estimated)) = aop_core::parse_duration(&value) {
+                    if let Some(task) = self.project.tasks.get_mut(row) {
+                        task.duration_minutes = minutes;
+                        task.estimated = estimated;
+                    }
+                }
+            }
+            Column::Start => {
+                if let Some(date) = parse_date(&value) {
+                    let task_mode = self.project.tasks[row].mode;
+                    if let Some(task) = self.project.tasks.get_mut(row) {
+                        // Typing a start date pins the task, exactly as Project does.
+                        task.constraint = ConstraintType::StartNoEarlierThan;
+                        task.constraint_date = Some(date);
+                        if task_mode == TaskMode::Manual {
+                            task.manual_start = Some(date);
+                        }
+                    }
+                }
+            }
+            Column::Finish => {
+                if let Some(date) = parse_date(&value) {
+                    let milestone = self
+                        .project
+                        .tasks
+                        .get(row)
+                        .is_some_and(|t| t.is_milestone());
+                    // A task finishes at the end of its last day, but a
+                    // milestone simply happens on its date, so pin it to the
+                    // start of that day rather than to knocking-off time.
+                    let pinned = if milestone {
+                        self.project
+                            .calendar
+                            .next_working_instant(date.date().and_hms_opt(0, 0, 0).unwrap_or(date))
+                    } else {
+                        date.date().and_hms_opt(17, 0, 0).unwrap_or(date)
+                    };
+                    if let Some(task) = self.project.tasks.get_mut(row) {
+                        task.constraint = ConstraintType::FinishNoEarlierThan;
+                        task.constraint_date = Some(pinned);
+                    }
+                }
+            }
+            Column::Predecessors => {
+                let id = self.project.tasks[row].id;
+                self.project.set_predecessor_text(id, &value);
+            }
+            Column::Resources => {
+                self.project.set_resource_text(row, &value);
+            }
+        }
+
+        self.editing = None;
+        self.reschedule();
+
+        // A link edit is the one cell that can create a loop; roll it back.
+        if column == Column::Predecessors {
+            if let Some(error) = self.schedule_error() {
+                self.undo();
+                self.dialog = Some(Dialog::Message {
+                    title: "Cannot create this link".into(),
+                    body: error,
+                });
+            }
+        }
+    }
+
+    /// Add or replace the link from `predecessor` into the task on `row`.
+    pub fn set_link(&mut self, row: usize, predecessor: TaskId, kind: LinkType, lag_minutes: i64) {
+        let Some(successor) = self.project.tasks.get(row).map(|t| t.id) else {
+            return;
+        };
+        if predecessor == successor {
+            return;
+        }
+        self.checkpoint();
+        self.project.unlink(predecessor, successor);
+        self.project.links.push(Link {
+            predecessor,
+            successor,
+            kind,
+            lag_minutes,
+        });
+        self.reschedule();
+        if let Some(error) = self.schedule_error() {
+            self.undo();
+            self.dialog = Some(Dialog::Message {
+                title: "Cannot create this link".into(),
+                body: error,
+            });
+        }
+    }
+
+    pub fn remove_link(&mut self, row: usize, predecessor: TaskId) {
+        let Some(successor) = self.project.tasks.get(row).map(|t| t.id) else {
+            return;
+        };
+        self.checkpoint();
+        self.project.unlink(predecessor, successor);
+        self.reschedule();
+    }
+
+    /// Book or unbook a resource against an explicit row, with units.
+    pub fn set_assignment(&mut self, row: usize, resource: ResourceId, units: Option<f64>) {
+        self.checkpoint();
+        if let Some(task) = self.project.tasks.get_mut(row) {
+            match units {
+                Some(units) => {
+                    if let Some(existing) = task.assignments.iter_mut().find(|a| a.resource == resource) {
+                        existing.units = units;
+                    } else {
+                        task.assignments.push(aop_core::Assignment { resource, units });
+                    }
+                }
+                None => task.assignments.retain(|a| a.resource != resource),
+            }
+        }
+        self.reschedule();
+    }
+
+    // ---- resources ------------------------------------------------------
+
+    pub fn add_resource(&mut self, name: &str) {
+        self.checkpoint();
+        self.project.add_resource(name);
+        self.reschedule();
+    }
+
+    pub fn delete_resource(&mut self, index: usize) {
+        let Some(id) = self.project.resources.get(index).map(|r| r.id) else {
+            return;
+        };
+        self.checkpoint();
+        self.project.delete_resource(id);
+        self.selected_resource = None;
+        self.reschedule();
+    }
+
+    pub fn commit_resource_cell(&mut self, index: usize, field: &str, value: &str) {
+        if index >= self.project.resources.len() {
+            return;
+        }
+        self.checkpoint();
+        let value = value.trim().to_string();
+        let resource = &mut self.project.resources[index];
+        match field {
+            "name" => resource.name = value,
+            "initials" => resource.initials = value,
+            "group" => resource.group = value,
+            "max" => {
+                let cleaned = value.trim_end_matches('%').trim().to_string();
+                if let Ok(units) = cleaned.parse::<f64>() {
+                    resource.max_units = (units / 100.0).max(0.0);
+                }
+            }
+            "rate" => {
+                let cleaned: String = value
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(rate) = cleaned.parse::<f64>() {
+                    resource.standard_rate = rate;
+                }
+            }
+            "kind" => {
+                resource.kind = match value.as_str() {
+                    "Material" => aop_core::ResourceKind::Material,
+                    "Cost" => aop_core::ResourceKind::Cost,
+                    _ => aop_core::ResourceKind::Work,
+                };
+            }
+            _ => {}
+        }
+        self.reschedule();
+    }
+
+    /// Book or unbook a resource against the selected task.
+    pub fn toggle_assignment(&mut self, resource_index: usize) {
+        let Some(row) = self.primary() else { return };
+        let Some(resource_id) = self.project.resources.get(resource_index).map(|r| r.id) else {
+            return;
+        };
+        self.checkpoint();
+        if let Some(task) = self.project.tasks.get_mut(row) {
+            if let Some(position) = task.assignments.iter().position(|a| a.resource == resource_id)
+            {
+                task.assignments.remove(position);
+            } else {
+                task.assignments.push(aop_core::Assignment {
+                    resource: resource_id,
+                    units: 1.0,
+                });
+            }
+        }
+        self.reschedule();
+    }
+
+    // ---- project commands -----------------------------------------------
+
+    pub fn set_baseline(&mut self) {
+        self.checkpoint();
+        self.project.set_baseline();
+        self.show_baseline = true;
+        self.status = "Baseline saved".into();
+    }
+
+    pub fn clear_baseline(&mut self) {
+        self.checkpoint();
+        self.project.clear_baseline();
+        self.show_baseline = false;
+        self.status = "Baseline cleared".into();
+    }
+
+    pub fn set_project_start(&mut self, date: NaiveDateTime) {
+        self.checkpoint();
+        self.project.start_date = date;
+        self.reschedule();
+    }
+
+    /// Jump the timescale so the given row is in view. The chart scrolls itself,
+    /// so this only needs to move the selection.
+    pub fn scroll_to_task(&mut self) {
+        if let Some(row) = self.primary() {
+            self.select(row);
+            self.status = format!("Scrolled to row {}", row + 1);
+        }
+    }
+
+    // ---- drag reorder ---------------------------------------------------
+
+    pub fn begin_drag(&mut self, row: usize) {
+        self.drag_row = Some(row);
+        self.drop_target = None;
+        self.editing = None;
+    }
+
+    pub fn hover_drop(&mut self, row: usize, mode: DropWhere) {
+        // dragover fires continuously, so only write when the target moves.
+        if self.drag_row.is_some() && self.drop_target != Some((row, mode)) {
+            self.drop_target = Some((row, mode));
+        }
+    }
+
+    pub fn cancel_drag(&mut self) {
+        self.drag_row = None;
+        self.drop_target = None;
+    }
+
+    /// Finish a drag: move the dragged row and everything nested under it to
+    /// the drop position, re-levelling the block to match where it landed.
+    pub fn finish_drag(&mut self) {
+        let (Some(from), Some((target, mode))) = (self.drag_row, self.drop_target) else {
+            self.cancel_drag();
+            return;
+        };
+        self.cancel_drag();
+        self.drop_row(from, target, mode);
+    }
+
+    pub fn drop_row(&mut self, from: usize, target: usize, mode: DropWhere) {
+        let count = self.project.tasks.len();
+        if from >= count || target >= count || from == target {
+            return;
+        }
+        let span = self.project.descendants(from).end - from;
+        // A block can never be dropped inside itself.
+        if target >= from && target < from + span {
+            return;
+        }
+
+        let target_level = self.project.tasks[target].outline_level;
+        let desired = match mode {
+            DropWhere::Into => target_level + 1,
+            _ => target_level,
+        };
+        let delta = desired as i32 - self.project.tasks[from].outline_level as i32;
+
+        let insert_at = match mode {
+            DropWhere::Above => target,
+            DropWhere::Below | DropWhere::Into => self.project.descendants(target).end,
+        };
+        // Landing on the same index still counts when the nesting level changes,
+        // which is what dropping onto the last child of a summary does.
+        if insert_at == from && delta == 0 {
+            return;
+        }
+
+        self.checkpoint();
+        self.project.move_task(from, insert_at);
+
+        let landed = if insert_at > from { insert_at - span } else { insert_at };
+        for index in landed..(landed + span).min(self.project.tasks.len()) {
+            let level = self.project.tasks[index].outline_level as i32 + delta;
+            self.project.tasks[index].outline_level = level.max(0) as u16;
+        }
+
+        self.select(landed);
+        self.reschedule();
+        self.status = "Task moved".into();
+    }
+
+    // ---- grid columns ----------------------------------------------------
+
+    /// Total width of the table, which is also the width of its pane.
+    pub fn grid_width(&self) -> f64 {
+        self.columns.iter().map(|c| c.width).sum()
+    }
+
+    pub fn set_column_width(&mut self, column: usize, width: f64) {
+        if let Some(slot) = self.columns.get_mut(column) {
+            slot.width = width.clamp(24.0, 640.0);
+        }
+    }
+
+    /// Dragging the splitter changes how much of the table is visible.
+    ///
+    /// It deliberately does not resize any column: narrowing the pane scrolls
+    /// the table instead, so the columns stay the width they were set to.
+    pub fn set_table_width(&mut self, width: f64) {
+        self.table_pane_width = width.clamp(120.0, 2000.0);
+    }
+
+    /// The visible width of the table pane, never wider than the columns need.
+    pub fn table_view_width(&self) -> f64 {
+        self.table_pane_width.min(self.grid_width())
+    }
+
+    /// Add a column before `at`, the way Insert Column works.
+    pub fn insert_column(&mut self, at: usize, field: Field) {
+        if self.columns.iter().any(|c| c.field == field) {
+            self.status = format!("{} is already shown", field.label());
+            return;
+        }
+        let at = at.min(self.columns.len());
+        self.columns.insert(at, ColumnSpec::new(field));
+        self.status = format!("Inserted the {} column", field.label());
+    }
+
+    pub fn remove_column(&mut self, index: usize) {
+        if self.columns.len() <= 1 || index >= self.columns.len() {
+            return;
+        }
+        let removed = self.columns.remove(index);
+        self.status = format!("Hid the {} column", removed.field.label());
+    }
+
+    pub fn move_column(&mut self, index: usize, delta: isize) {
+        let target = index as isize + delta;
+        if target < 0 || target as usize >= self.columns.len() {
+            return;
+        }
+        self.columns.swap(index, target as usize);
+    }
+
+    pub fn reset_columns(&mut self) {
+        self.columns = default_columns();
+        self.table_pane_width = self.grid_width();
+        self.status = "Columns reset to the Entry table".into();
+    }
+
+    /// The chrono pattern the Display options picked.
+    pub fn date_pattern(&self) -> &'static str {
+        DATE_FORMATS
+            .get(self.date_format)
+            .map(|f| f.1)
+            .unwrap_or(DATE_FORMATS[0].1)
+    }
+
+    // ---- internal panes -------------------------------------------------
+
+    /// Maximise one pane of a split view, or restore both.
+    pub fn toggle_pane(&mut self, pane: PaneFocus) {
+        self.pane_focus = if self.pane_focus == pane {
+            PaneFocus::Both
+        } else {
+            pane
+        };
+
+        // Format is the chart's contextual tab and goes away with the chart, so
+        // leaving it selected would show its commands under no tab at all.
+        if self.pane_focus == PaneFocus::TableOnly && self.tab == RibbonTab::Format {
+            self.tab = RibbonTab::Task;
+        }
+    }
+
+    // ---- quick access toolbar -------------------------------------------
+
+    pub fn toggle_qat(&mut self, command: QatCommand) {
+        match self.qat.iter().position(|c| *c == command) {
+            Some(index) => {
+                self.qat.remove(index);
+            }
+            None => self.qat.push(command),
+        }
+        save_qat(&self.qat);
+    }
+
+    pub fn move_qat(&mut self, command: QatCommand, delta: isize) {
+        let Some(index) = self.qat.iter().position(|c| *c == command) else {
+            return;
+        };
+        let target = index as isize + delta;
+        if target < 0 || target as usize >= self.qat.len() {
+            return;
+        }
+        self.qat.swap(index, target as usize);
+        save_qat(&self.qat);
+    }
+
+    pub fn reset_qat(&mut self) {
+        self.qat = DEFAULT_QAT.to_vec();
+        save_qat(&self.qat);
+        self.status = "Quick Access Toolbar reset".into();
+    }
+
+    // ---- what the views show --------------------------------------------
+
+    /// Visible rows, honouring collapsed summaries and the active filter.
+    /// A summary stays visible when any of its children pass the filter.
+    pub fn visible_rows(&self) -> Vec<usize> {
+        let outlined = self.project.visible_indices();
+        if self.filter == TaskFilter::All {
+            return outlined;
+        }
+
+        let passes = |index: usize| -> bool {
+            let task = &self.project.tasks[index];
+            match self.filter {
+                TaskFilter::All => true,
+                TaskFilter::Critical => task.scheduled.critical,
+                TaskFilter::Milestones => task.is_milestone(),
+                TaskFilter::Incomplete => task.percent_complete < 100,
+            }
+        };
+
+        outlined
+            .into_iter()
+            .filter(|&index| {
+                if self.project.is_summary(index) {
+                    self.project
+                        .descendants(index)
+                        .any(|child| !self.project.is_summary(child) && passes(child))
+                } else {
+                    passes(index)
+                }
+            })
+            .collect()
+    }
+
+    pub fn set_filter(&mut self, key: &str) {
+        self.filter = match key {
+            "critical" => TaskFilter::Critical,
+            "milestones" => TaskFilter::Milestones,
+            "incomplete" => TaskFilter::Incomplete,
+            _ => TaskFilter::All,
+        };
+        self.selection.clear();
+        self.status = format!("Filter: {}", self.filter.label());
+    }
+
+    /// Fit the whole plan on screen by picking a timescale for its span.
+    pub fn zoom_to_fit(&mut self) {
+        let span = (self.project.finish_date - self.project.start_date).num_days();
+        self.zoom = if span > 720 {
+            Zoom::Quarters
+        } else if span > 200 {
+            Zoom::Months
+        } else if span > 60 {
+            Zoom::Weeks
+        } else {
+            Zoom::Days
+        };
+        self.status = format!("Zoomed to {}", self.zoom.label());
+    }
+
+    /// Sort sibling blocks by a field, keeping the outline intact: children
+    /// move with their summary and never change parent.
+    pub fn sort_tasks(&mut self, key: &str) {
+        if self.project.tasks.len() < 2 {
+            return;
+        }
+        self.checkpoint();
+        let sorted = sort_range(&self.project, 0, self.project.tasks.len(), 0, key);
+        self.project.tasks = sorted;
+        self.clamp_selection();
+        self.reschedule();
+        self.status = format!("Sorted by {key}");
+    }
+
+    // ---- gantt bar dragging ---------------------------------------------
+
+    pub fn begin_bar_drag(
+        &mut self,
+        row: usize,
+        kind: BarDragKind,
+        origin_x: f64,
+        bar_width: f64,
+    ) {
+        let Some(task) = self.project.tasks.get(row) else {
+            return;
+        };
+        // Summary rows are derived from their children, so they do not drag.
+        if self.project.is_summary(row) {
+            self.status = "Summary bars follow their subtasks".into();
+            return;
+        }
+        self.bar_drag = Some(BarDrag {
+            row,
+            kind,
+            origin_x,
+            delta_x: 0.0,
+            base_start: task.scheduled.start,
+            base_duration: task.duration_minutes,
+            base_percent: task.percent_complete,
+            bar_width,
+            hover_row: None,
+        });
+        self.select(row);
+    }
+
+    pub fn update_bar_drag(&mut self, x: f64) {
+        if let Some(drag) = &mut self.bar_drag {
+            drag.delta_x = x - drag.origin_x;
+        }
+    }
+
+    pub fn set_bar_hover(&mut self, row: usize) {
+        if let Some(drag) = &mut self.bar_drag {
+            if drag.kind == BarDragKind::Link {
+                drag.hover_row = Some(row);
+            }
+        }
+    }
+
+    pub fn cancel_bar_drag(&mut self) {
+        self.bar_drag = None;
+    }
+
+    /// Apply whatever the drag was doing.
+    pub fn finish_bar_drag(&mut self, px_per_day: f64) {
+        let Some(drag) = self.bar_drag.take() else {
+            return;
+        };
+        if drag.row >= self.project.tasks.len() {
+            return;
+        }
+
+        match drag.kind {
+            BarDragKind::Move => {
+                let days = drag.days(px_per_day);
+                if days == 0 {
+                    return;
+                }
+                let moved = drag.base_start + chrono::Duration::days(days);
+                let snapped = self.project.calendar.next_working_instant(moved);
+                self.checkpoint();
+                if let Some(task) = self.project.tasks.get_mut(drag.row) {
+                    // Project pins a dragged bar with a start constraint.
+                    task.constraint = ConstraintType::StartNoEarlierThan;
+                    task.constraint_date = Some(snapped);
+                    if task.mode == TaskMode::Manual {
+                        task.manual_start = Some(snapped);
+                    }
+                }
+                self.reschedule();
+                self.status = format!("Moved to {}", format_date(snapped));
+            }
+            BarDragKind::Resize => {
+                let days = drag.days(px_per_day);
+                if days == 0 {
+                    return;
+                }
+                let minutes = (drag.base_duration + days * aop_core::MINUTES_PER_DAY).max(0);
+                self.checkpoint();
+                if let Some(task) = self.project.tasks.get_mut(drag.row) {
+                    task.duration_minutes = minutes;
+                    task.estimated = false;
+                }
+                self.reschedule();
+                self.status = format!("Duration {}", aop_core::format_duration(minutes));
+            }
+            BarDragKind::Progress => {
+                let percent = drag.preview_percent();
+                if percent == drag.base_percent {
+                    return;
+                }
+                self.checkpoint();
+                if let Some(task) = self.project.tasks.get_mut(drag.row) {
+                    task.percent_complete = percent;
+                }
+                self.reschedule();
+                self.status = format!("{percent}% complete");
+            }
+            BarDragKind::Link => {
+                let Some(target) = drag.hover_row else { return };
+                if target == drag.row {
+                    return;
+                }
+                let (Some(from), Some(to)) = (
+                    self.project.tasks.get(drag.row).map(|t| t.id),
+                    self.project.tasks.get(target).map(|t| t.id),
+                ) else {
+                    return;
+                };
+                self.checkpoint();
+                self.project.add_link(Link::finish_to_start(from, to));
+                self.reschedule();
+                if let Some(error) = self.schedule_error() {
+                    self.undo();
+                    self.dialog = Some(Dialog::Message {
+                        title: "Cannot create this link".into(),
+                        body: error,
+                    });
+                } else {
+                    self.status = "Tasks linked".into();
+                }
+            }
+        }
+    }
+
+    // ---- menus ----------------------------------------------------------
+
+    /// Start editing a cell, remembering where to anchor any popup.
+    pub fn edit_cell_at(&mut self, row: usize, column: Column, x: f64, y: f64) {
+        self.editing = Some((row, column));
+        self.popup_at = (x, y);
+        self.context_menu = None;
+    }
+
+    pub fn open_task_menu(&mut self, row: usize, x: f64, y: f64) {
+        if !self.is_selected(row) {
+            self.select(row);
+        }
+        self.context_menu = Some(ContextMenu::Task { row, x, y });
+    }
+
+    pub fn open_chart_menu(&mut self, x: f64, y: f64) {
+        self.context_menu = Some(ContextMenu::Chart { x, y });
+    }
+
+    pub fn open_column_menu(&mut self, index: usize, x: f64, y: f64) {
+        self.context_menu = Some(ContextMenu::Column { index, x, y });
+    }
+
+    pub fn open_resource_menu(&mut self, index: usize, x: f64, y: f64) {
+        self.selected_resource = Some(index);
+        self.context_menu = Some(ContextMenu::Resource { index, x, y });
+    }
+
+    pub fn close_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    pub fn note(&mut self, message: impl Into<String>) {
+        self.status = message.into();
+    }
+
+    /// Placeholder for ribbon commands that are present but not yet wired up.
+    pub fn not_implemented(&mut self, command: &str) {
+        self.status = format!("{command} is not available in this build");
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Start with whatever file the command line names.
+///
+/// This is how a desktop file association arrives: the system runs the binary
+/// with the document as its argument. Without it, double-clicking a plan opens
+/// an empty window, and the association looks broken even though it fired.
+pub fn from_command_line() -> AppState {
+    let mut state = AppState::new();
+    state.apply_settings(crate::settings::Settings::load());
+    if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) {
+        if path.is_file() {
+            state.splash = false;
+            state.open_any(path);
+        }
+    }
+    state
+}
+
+/// Sort the sibling blocks that start at `level` within `start..end`, sorting
+/// each block's own children the same way.
+fn sort_range(project: &Project, start: usize, end: usize, level: u16, key: &str) -> Vec<Task> {
+    // Split the range into blocks, each a sibling plus its descendants.
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let mut next = cursor + 1;
+        while next < end && project.tasks[next].outline_level > level {
+            next += 1;
+        }
+        blocks.push((cursor, next));
+        cursor = next;
+    }
+
+    let sort_key = |index: usize| -> (i64, String) {
+        let task = &project.tasks[index];
+        let value = match key {
+            "start" => task.scheduled.start.and_utc().timestamp(),
+            "finish" => task.scheduled.finish.and_utc().timestamp(),
+            "duration" => task.scheduled.duration_minutes,
+            "cost" => (task.scheduled.cost * 100.0) as i64,
+            _ => 0,
+        };
+        (value, task.name.to_lowercase())
+    };
+
+    blocks.sort_by(|a, b| sort_key(a.0).cmp(&sort_key(b.0)));
+
+    let mut out = Vec::with_capacity(end - start);
+    for (head, tail) in blocks {
+        out.push(project.tasks[head].clone());
+        if tail > head + 1 {
+            out.extend(sort_range(project, head + 1, tail, level + 1, key));
+        }
+    }
+    out
+}
+
+fn empty_report(start: NaiveDateTime) -> ScheduleReport {
+    ScheduleReport {
+        start,
+        finish: start,
+        duration_minutes: 0,
+        critical_task_count: 0,
+        total_cost: 0.0,
+        total_work_minutes: 0,
+        overallocations: Vec::new(),
+    }
+}
+
+/// A new plan starts today, at the start of the working day. A plan created on
+/// a weekend or a holiday rolls on to the next working morning, because the
+/// scheduler has nowhere to put work otherwise.
+pub fn default_start() -> NaiveDateTime {
+    let today = Local::now().naive_local().date();
+    let morning = today.and_hms_opt(8, 0, 0).expect("valid time");
+    WorkCalendar::standard().next_working_instant(morning)
+}
+
+/// The next Monday on or after a date, used by the template previews so they
+/// all line up on a tidy week boundary.
+pub fn next_monday(from: NaiveDate) -> NaiveDate {
+    let mut date = from;
+    while date.weekday() != chrono::Weekday::Mon {
+        date += chrono::Duration::days(1);
+    }
+    date
+}
+
+/// Accepts `2026-08-17`, `17/08/2026` and `08/17/2026`, with optional time.
+pub fn parse_date(input: &str) -> Option<NaiveDateTime> {
+    let text = input.trim();
+    if text.is_empty() {
+        return None;
+    }
+    for format in ["%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M"] {
+        if let Ok(value) = NaiveDateTime::parse_from_str(text, format) {
+            return Some(value);
+        }
+    }
+    for format in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d %b %y", "%d %B %Y"] {
+        if let Ok(date) = NaiveDate::parse_from_str(text, format) {
+            return date.and_hms_opt(8, 0, 0);
+        }
+    }
+    None
+}
+
+/// The date styles offered on the Display options page.
+pub const DATE_FORMATS: [(&str, &str); 5] = [
+    ("Mon 17/08/26", "%a %d/%m/%y"),
+    ("17/08/2026", "%d/%m/%Y"),
+    ("Mon 17 Aug '26", "%a %d %b '%y"),
+    ("17 August 2026", "%d %B %Y"),
+    ("2026-08-17", "%Y-%m-%d"),
+];
+
+/// The chosen format, held globally so the many `format_date` call sites do not
+/// each have to be handed the application state.
+static DATE_FORMAT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_date_format(index: usize) {
+    DATE_FORMAT.store(
+        index.min(DATE_FORMATS.len() - 1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn format_date(value: NaiveDateTime) -> String {
+    let index = DATE_FORMAT.load(std::sync::atomic::Ordering::Relaxed);
+    let pattern = DATE_FORMATS
+        .get(index)
+        .map(|f| f.1)
+        .unwrap_or(DATE_FORMATS[0].1);
+    value.format(pattern).to_string()
+}
+
+pub fn format_date_long(value: NaiveDateTime) -> String {
+    value.format("%d %B %Y").to_string()
+}
+
+// ---- recent file list ---------------------------------------------------
+
+fn recent_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("alterion-open-project").join("recent.json"))
+}
+
+fn load_recent() -> Vec<RecentEntry> {
+    let Some(path) = recent_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(paths) = serde_json::from_str::<Vec<String>>(&text) else {
+        return Vec::new();
+    };
+    paths
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .map(|path| RecentEntry {
+            name: path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Project".into()),
+            path,
+        })
+        .collect()
+}
+
+fn save_recent(entries: &[RecentEntry]) {
+    let Some(path) = recent_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let paths: Vec<String> = entries
+        .iter()
+        .map(|e| e.path.to_string_lossy().to_string())
+        .collect();
+    if let Ok(text) = serde_json::to_string_pretty(&paths) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+fn qat_path() -> Option<PathBuf> {
+    recent_path().map(|p| p.with_file_name("quick-access.json"))
+}
+
+fn load_qat() -> Vec<QatCommand> {
+    let Some(path) = qat_path() else {
+        return DEFAULT_QAT.to_vec();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return DEFAULT_QAT.to_vec();
+    };
+    let Ok(keys) = serde_json::from_str::<Vec<String>>(&text) else {
+        return DEFAULT_QAT.to_vec();
+    };
+    let restored: Vec<QatCommand> = keys
+        .iter()
+        .filter_map(|k| QatCommand::from_key(k))
+        .collect();
+    if restored.is_empty() {
+        DEFAULT_QAT.to_vec()
+    } else {
+        restored
+    }
+}
+
+fn save_qat(commands: &[QatCommand]) {
+    let Some(path) = qat_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let keys: Vec<&str> = commands.iter().map(|c| c.key()).collect();
+    if let Ok(text) = serde_json::to_string_pretty(&keys) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// The default folder the Save As and Open panes start in.
+pub fn documents_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Documents"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aop_core::MINUTES_PER_DAY;
+
+    /// A four row outline: Phase / Child A / Child B / Standalone.
+    fn outlined() -> AppState {
+        let mut state = AppState::new();
+        state.project.tasks.clear();
+        state.project.links.clear();
+        for name in ["Phase", "Child A", "Child B", "Standalone"] {
+            state.project.push_task(name, MINUTES_PER_DAY);
+        }
+        state.project.tasks[1].outline_level = 1;
+        state.project.tasks[2].outline_level = 1;
+        state.reschedule();
+        state
+    }
+
+    fn names(state: &AppState) -> Vec<&str> {
+        state.project.tasks.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    fn levels(state: &AppState) -> Vec<u16> {
+        state.project.tasks.iter().map(|t| t.outline_level).collect()
+    }
+
+    #[test]
+    fn dropping_below_a_row_reorders_it() {
+        let mut state = outlined();
+        // Move "Standalone" above "Phase".
+        state.drop_row(3, 0, DropWhere::Above);
+        assert_eq!(names(&state), ["Standalone", "Phase", "Child A", "Child B"]);
+        assert_eq!(levels(&state), [0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn dropping_into_a_row_nests_underneath_it() {
+        let mut state = outlined();
+        // Drop "Standalone" onto "Phase" to make it a third child.
+        state.drop_row(3, 0, DropWhere::Into);
+        assert_eq!(names(&state), ["Phase", "Child A", "Child B", "Standalone"]);
+        assert_eq!(levels(&state), [0, 1, 1, 1], "should land one level deeper");
+    }
+
+    #[test]
+    fn dragging_a_summary_carries_its_children() {
+        let mut state = outlined();
+        // Move the whole "Phase" block below "Standalone".
+        state.drop_row(0, 3, DropWhere::Below);
+        assert_eq!(names(&state), ["Standalone", "Phase", "Child A", "Child B"]);
+        assert_eq!(levels(&state), [0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn a_summary_cannot_be_dropped_inside_itself() {
+        let mut state = outlined();
+        let before = names(&state).join(",");
+        state.drop_row(0, 1, DropWhere::Into);
+        assert_eq!(names(&state).join(","), before, "the outline must not change");
+    }
+
+    #[test]
+    fn outdenting_a_child_by_dropping_it_at_the_top_level() {
+        let mut state = outlined();
+        state.drop_row(1, 3, DropWhere::Below);
+        assert_eq!(names(&state), ["Phase", "Child B", "Standalone", "Child A"]);
+        assert_eq!(levels(&state), [0, 1, 0, 0], "should adopt the target's level");
+    }
+
+    #[test]
+    fn a_bar_drag_of_zero_days_changes_nothing() {
+        let mut state = outlined();
+        let before = state.project.tasks[3].constraint;
+        state.begin_bar_drag(3, BarDragKind::Move, 100.0, 26.0);
+        state.update_bar_drag(103.0);
+        state.finish_bar_drag(26.0);
+        assert_eq!(state.project.tasks[3].constraint, before);
+    }
+
+    #[test]
+    fn dragging_a_bar_right_pins_the_task_later() {
+        let mut state = outlined();
+        let start = state.project.tasks[3].scheduled.start;
+        state.begin_bar_drag(3, BarDragKind::Move, 100.0, 26.0);
+        // Two days at 26 pixels per day.
+        state.update_bar_drag(152.0);
+        state.finish_bar_drag(26.0);
+
+        let task = &state.project.tasks[3];
+        assert_eq!(task.constraint, ConstraintType::StartNoEarlierThan);
+        assert!(task.scheduled.start > start, "the task should have moved later");
+    }
+
+    #[test]
+    fn dragging_the_right_edge_changes_the_duration() {
+        let mut state = outlined();
+        state.begin_bar_drag(3, BarDragKind::Resize, 100.0, 26.0);
+        state.update_bar_drag(178.0); // three days wider
+        state.finish_bar_drag(26.0);
+        assert_eq!(state.project.tasks[3].duration_minutes, MINUTES_PER_DAY * 4);
+    }
+
+    #[test]
+    fn a_resize_can_never_produce_a_negative_duration() {
+        let mut state = outlined();
+        state.begin_bar_drag(3, BarDragKind::Resize, 400.0, 26.0);
+        state.update_bar_drag(0.0);
+        state.finish_bar_drag(26.0);
+        assert_eq!(state.project.tasks[3].duration_minutes, 0);
+    }
+
+    #[test]
+    fn dragging_from_the_left_edge_sets_progress() {
+        let mut state = outlined();
+        state.begin_bar_drag(3, BarDragKind::Progress, 100.0, 40.0);
+        state.update_bar_drag(120.0); // half the bar width
+        state.finish_bar_drag(26.0);
+        assert_eq!(state.project.tasks[3].percent_complete, 50);
+    }
+
+    #[test]
+    fn shift_dragging_one_bar_onto_another_links_them() {
+        let mut state = outlined();
+        state.begin_bar_drag(3, BarDragKind::Link, 100.0, 26.0);
+        state.set_bar_hover(1);
+        state.finish_bar_drag(26.0);
+
+        let from = state.project.tasks[3].id;
+        let to = state.project.tasks[1].id;
+        assert!(state.project.link_exists(from, to));
+    }
+
+    #[test]
+    fn a_summary_bar_refuses_to_drag() {
+        let mut state = outlined();
+        state.begin_bar_drag(0, BarDragKind::Move, 100.0, 26.0);
+        assert!(state.bar_drag.is_none(), "summary bars are derived");
+    }
+
+    #[test]
+    fn undo_restores_the_outline_after_a_drop() {
+        let mut state = outlined();
+        state.drop_row(3, 0, DropWhere::Into);
+        assert_eq!(levels(&state), [0, 1, 1, 1]);
+        state.undo();
+        assert_eq!(names(&state), ["Phase", "Child A", "Child B", "Standalone"]);
+        assert_eq!(levels(&state), [0, 1, 1, 0]);
+    }
+
+    // ---- unsaved work --------------------------------------------------
+
+    #[test]
+    fn a_clean_plan_is_discarded_without_asking() {
+        let mut state = AppState::new();
+        state.dirty = false;
+        state.guard(PendingAction::CloseProject);
+        assert!(state.dialog.is_none(), "nothing was at stake");
+    }
+
+    #[test]
+    fn unsaved_work_is_asked_about_before_it_is_thrown_away() {
+        let mut state = AppState::new();
+        state.dirty = true;
+        state.guard(PendingAction::Quit);
+        assert!(
+            matches!(state.dialog, Some(Dialog::UnsavedChanges(PendingAction::Quit))),
+            "the question has to be asked, and remember what it was asked about"
+        );
+        assert!(!state.quit_requested, "and nothing happens until it is answered");
+    }
+
+    #[test]
+    fn declining_to_save_goes_ahead_with_what_was_asked_for() {
+        let mut state = AppState::new();
+        state.dirty = true;
+        state.guard(PendingAction::Quit);
+        state.carry_out(PendingAction::Quit);
+        assert!(state.quit_requested);
+        assert!(state.dialog.is_none());
+    }
+
+    #[test]
+    fn saving_a_plan_with_no_file_defers_until_a_name_is_chosen() {
+        // Save on an unnamed plan cannot finish on its own, so the action it
+        // was standing in the way of must wait rather than run regardless.
+        let mut state = AppState::new();
+        state.dirty = true;
+        state.file_path = None;
+        state.save_then(PendingAction::Quit);
+
+        assert!(!state.quit_requested, "the plan is still unsaved");
+        assert_eq!(state.after_save, Some(PendingAction::Quit));
+        assert_eq!(state.backstage, Some(BackstagePage::SaveAs));
+    }
+
+    #[test]
+    fn a_save_that_fails_abandons_what_was_waiting_on_it() {
+        // Otherwise a failed save would still let the plan be thrown away.
+        let mut state = AppState::new();
+        state.dirty = true;
+        state.after_save = Some(PendingAction::Quit);
+        state.save_to(PathBuf::from("/proc/nonexistent-directory/plan.aprj"));
+
+        assert!(!state.quit_requested, "the work was never written");
+        assert!(state.after_save.is_none());
+        assert!(state.dirty, "and it is still unsaved");
+    }
+}
