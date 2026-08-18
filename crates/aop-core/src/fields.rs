@@ -56,8 +56,33 @@ pub enum Field {
     BaselineStart,
     BaselineFinish,
     BaselineDuration,
+    BaselineCost,
     StartVariance,
     FinishVariance,
+
+    // what actually happened, as opposed to what was planned
+    ActualStart,
+    ActualFinish,
+    ActualWork,
+    ActualCost,
+    RemainingWork,
+    PhysicalPercentComplete,
+
+    // earned value, all measured as at the status date. Named the way
+    // Microsoft names them, with the older names people still ask for kept as
+    // the column headings.
+    PlannedValue,
+    EarnedValue,
+    CostVariance,
+    ScheduleVariance,
+    CostVariancePercent,
+    ScheduleVariancePercent,
+    Cpi,
+    Spi,
+    Eac,
+    Bac,
+    Vac,
+    Tcpi,
 
     // free text
     Notes,
@@ -81,11 +106,13 @@ pub enum FieldGroup {
     Progress,
     Cost,
     Baseline,
+    Actual,
+    EarnedValue,
     Text,
 }
 
 impl FieldGroup {
-    pub const ORDER: [FieldGroup; 8] = [
+    pub const ORDER: [FieldGroup; 10] = [
         FieldGroup::Outline,
         FieldGroup::Schedule,
         FieldGroup::Links,
@@ -93,6 +120,8 @@ impl FieldGroup {
         FieldGroup::Progress,
         FieldGroup::Cost,
         FieldGroup::Baseline,
+        FieldGroup::Actual,
+        FieldGroup::EarnedValue,
         FieldGroup::Text,
     ];
 
@@ -104,6 +133,8 @@ impl FieldGroup {
             FieldGroup::Constraints => "Constraints",
             FieldGroup::Progress => "Progress",
             FieldGroup::Cost => "Work and cost",
+            FieldGroup::Actual => "Actuals",
+            FieldGroup::EarnedValue => "Earned value",
             FieldGroup::Baseline => "Baseline",
             FieldGroup::Text => "Text",
         }
@@ -112,7 +143,7 @@ impl FieldGroup {
 
 impl Field {
     /// Every field, in the order Insert Column lists them.
-    pub const ALL: [Field; 34] = [
+    pub const ALL: [Field; 53] = [
         Field::Id,
         Field::Wbs,
         Field::OutlineLevel,
@@ -146,6 +177,25 @@ impl Field {
         Field::BaselineDuration,
         Field::StartVariance,
         Field::FinishVariance,
+        Field::BaselineCost,
+        Field::ActualStart,
+        Field::ActualFinish,
+        Field::ActualWork,
+        Field::ActualCost,
+        Field::RemainingWork,
+        Field::PhysicalPercentComplete,
+        Field::PlannedValue,
+        Field::EarnedValue,
+        Field::CostVariance,
+        Field::ScheduleVariance,
+        Field::CostVariancePercent,
+        Field::ScheduleVariancePercent,
+        Field::Cpi,
+        Field::Spi,
+        Field::Eac,
+        Field::Bac,
+        Field::Vac,
+        Field::Tcpi,
         Field::Notes,
     ];
 
@@ -196,6 +246,25 @@ impl Field {
             Field::BaselineFinish => "Baseline Finish",
             Field::BaselineDuration => "Baseline Duration",
             Field::StartVariance => "Start Variance",
+            Field::BaselineCost => "Baseline Cost",
+            Field::ActualStart => "Actual Start",
+            Field::ActualFinish => "Actual Finish",
+            Field::ActualWork => "Actual Work",
+            Field::ActualCost => "Actual Cost",
+            Field::RemainingWork => "Remaining Work",
+            Field::PhysicalPercentComplete => "Physical % Complete",
+            Field::PlannedValue => "Planned Value (BCWS)",
+            Field::EarnedValue => "Earned Value (BCWP)",
+            Field::CostVariance => "Cost Variance (CV)",
+            Field::ScheduleVariance => "Schedule Variance (SV)",
+            Field::CostVariancePercent => "CV %",
+            Field::ScheduleVariancePercent => "SV %",
+            Field::Cpi => "CPI",
+            Field::Spi => "SPI",
+            Field::Eac => "EAC",
+            Field::Bac => "BAC",
+            Field::Vac => "VAC",
+            Field::Tcpi => "TCPI",
             Field::FinishVariance => "Finish Variance",
             Field::Notes => "Notes",
         }
@@ -246,6 +315,25 @@ impl Field {
             Field::BaselineDuration => "Duration when the baseline was taken",
             Field::StartVariance => "How far the start has moved from the baseline",
             Field::FinishVariance => "How far the finish has moved from the baseline",
+            Field::BaselineCost => "What the plan said this would cost when the baseline was taken. Earned value calls it BAC",
+            Field::ActualStart => "When the work really began, as reported. Blank until it has",
+            Field::ActualFinish => "When the work really ended, as reported. Blank until it has",
+            Field::ActualWork => "Effort really spent, as reported",
+            Field::ActualCost => "Money really spent, as reported. Earned value calls it ACWP",
+            Field::RemainingWork => "Effort still to spend",
+            Field::PhysicalPercentComplete => "How much of the deliverable exists, judged by hand rather than from elapsed time",
+            Field::PlannedValue => "What the baseline said would have been spent by the status date",
+            Field::EarnedValue => "What the work actually done was budgeted to cost",
+            Field::CostVariance => "Earned value less actual cost. Negative means the work cost more than it was meant to",
+            Field::ScheduleVariance => "Earned value less planned value, in money. Negative means less is done than planned",
+            Field::CostVariancePercent => "Cost variance as a share of earned value, so tasks of different sizes compare",
+            Field::ScheduleVariancePercent => "Schedule variance as a share of planned value",
+            Field::Cpi => "Budgeted value earned per unit spent. Below 1 is over budget",
+            Field::Spi => "The share of planned progress achieved. Below 1 is behind",
+            Field::Eac => "What this will cost in total if today's efficiency holds",
+            Field::Bac => "The budget at completion, which is the baseline cost",
+            Field::Vac => "Budget less the forecast. Negative means it is heading over",
+            Field::Tcpi => "The efficiency the remaining work must run at to still land on budget",
             Field::Notes => "Free text kept with the task",
         }
     }
@@ -269,6 +357,25 @@ impl Field {
             | Field::ResourceInitials => FieldGroup::Cost,
             Field::BaselineStart | Field::BaselineFinish | Field::BaselineDuration
             | Field::StartVariance | Field::FinishVariance => FieldGroup::Baseline,
+            Field::BaselineCost => FieldGroup::Baseline,
+            Field::ActualStart => FieldGroup::Actual,
+            Field::ActualFinish => FieldGroup::Actual,
+            Field::ActualWork => FieldGroup::Actual,
+            Field::ActualCost => FieldGroup::Actual,
+            Field::RemainingWork => FieldGroup::Actual,
+            Field::PhysicalPercentComplete => FieldGroup::Actual,
+            Field::PlannedValue => FieldGroup::EarnedValue,
+            Field::EarnedValue => FieldGroup::EarnedValue,
+            Field::CostVariance => FieldGroup::EarnedValue,
+            Field::ScheduleVariance => FieldGroup::EarnedValue,
+            Field::CostVariancePercent => FieldGroup::EarnedValue,
+            Field::ScheduleVariancePercent => FieldGroup::EarnedValue,
+            Field::Cpi => FieldGroup::EarnedValue,
+            Field::Spi => FieldGroup::EarnedValue,
+            Field::Eac => FieldGroup::EarnedValue,
+            Field::Bac => FieldGroup::EarnedValue,
+            Field::Vac => FieldGroup::EarnedValue,
+            Field::Tcpi => FieldGroup::EarnedValue,
             Field::Notes => FieldGroup::Text,
         }
     }
@@ -398,6 +505,68 @@ impl Field {
                 .finish_variance_minutes(&project.calendar)
                 .map(signed)
                 .unwrap_or_default(),
+            Field::BaselineCost => task
+                .baseline
+                .as_ref()
+                .map(|b| format!("{}{:.2}", project.currency_symbol, b.cost))
+                .unwrap_or_default(),
+            Field::ActualStart => task
+                .actual_start
+                .map(|at| at.format(date_format).to_string())
+                .unwrap_or_default(),
+            Field::ActualFinish => task
+                .actual_finish
+                .map(|at| at.format(date_format).to_string())
+                .unwrap_or_default(),
+            Field::ActualWork => crate::format_work(task.reported_actual_work_minutes()),
+            Field::ActualCost => {
+                format!("{}{:.2}", project.currency_symbol, task.reported_actual_cost())
+            }
+            Field::RemainingWork => crate::format_work(task.remaining_work()),
+            Field::PhysicalPercentComplete => task
+                .physical_percent_complete
+                .map(|percent| format!("{percent}%"))
+                .unwrap_or_default(),
+
+            // Read from the one place that knows how to work these out, so a
+            // column and a report can never give different answers. Blank
+            // rather than zero when there is no baseline: zero is an answer,
+            // and there is no answer to give.
+            Field::PlannedValue
+            | Field::EarnedValue
+            | Field::CostVariance
+            | Field::ScheduleVariance
+            | Field::CostVariancePercent
+            | Field::ScheduleVariancePercent
+            | Field::Cpi
+            | Field::Spi
+            | Field::Eac
+            | Field::Bac
+            | Field::Vac
+            | Field::Tcpi => match crate::earned_value::task_earned_value(project, index) {
+                None => String::new(),
+                Some(value) => {
+                    let money = |amount: f64| format!("{}{:.2}", project.currency_symbol, amount);
+                    match self {
+                        Field::PlannedValue => money(value.planned_value),
+                        Field::EarnedValue => money(value.earned_value),
+                        Field::CostVariance => money(value.cost_variance()),
+                        Field::ScheduleVariance => money(value.schedule_variance()),
+                        Field::CostVariancePercent => {
+                            format!("{:.0}%", value.cost_variance_percent())
+                        }
+                        Field::ScheduleVariancePercent => {
+                            format!("{:.0}%", value.schedule_variance_percent())
+                        }
+                        Field::Cpi => format!("{:.2}", value.cpi()),
+                        Field::Spi => format!("{:.2}", value.spi()),
+                        Field::Eac => money(value.eac()),
+                        Field::Bac => money(value.bac),
+                        Field::Vac => money(value.vac()),
+                        _ => format!("{:.2}", value.tcpi()),
+                    }
+                }
+            },
             Field::Notes => task.notes.replace('\n', " "),
         }
     }

@@ -2127,11 +2127,22 @@ button { font: inherit; color: inherit; }
 .report-legend { display: flex; gap: 14px; font-size: 10.5px; color: var(--ink-soft); }
 .report-legend span { display: inline-flex; align-items: center; gap: 6px; }
 .report-legend .sw { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
-.report-legend .sw.ideal { background: var(--ink-faint); }
+/* Dashed in the key because it is dashed on the chart: a solid swatch beside a
+   dashed line is a legend that points at the wrong series. */
+.report-legend .sw.ideal {
+  border-radius: 0;
+  background: repeating-linear-gradient(
+    to right, var(--ink-faint) 0 5px, transparent 5px 9px);
+}
 .report-legend .sw.actual { background: var(--accent-bright); }
 .report-legend .sw.scope { background: var(--ink-faint); }
 .report-legend .sw.done { background: var(--bar-progress); }
 .report-legend .sw.planned { background: var(--bar); }
+.report-legend .sw.average {
+  border-radius: 0;
+  background: repeating-linear-gradient(
+    to right, var(--accent-bright) 0 5px, transparent 5px 9px);
+}
 
 /* Velocity: planned behind, completed in front, so the gap between them is
    the thing you read rather than two bars to compare by eye. */
@@ -2142,13 +2153,31 @@ button { font: inherit; color: inherit; }
   height: 170px;
   margin: 10px 0 6px;
   padding-bottom: 16px;
-  padding-left: 62px;
+  padding-left: 78px;
   position: relative;
+}
+
+/* What the bars count, said once up the side, the way the burn charts say it. */
+.vel-title {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 16px;
+  width: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font-size: 9.5px;
+  color: var(--ink-soft);
+  letter-spacing: 0.4px;
+  white-space: nowrap;
 }
 
 /* The scale the bars are read against. Bars with no axis show which iteration
    was busiest but not by how much. */
-.vel-axis { position: absolute; left: 0; top: 0; bottom: 16px; width: 56px; }
+.vel-axis { position: absolute; left: 16px; top: 0; bottom: 16px; width: 56px; }
 .vel-tick {
   position: absolute;
   right: 6px;
@@ -2159,9 +2188,20 @@ button { font: inherit; color: inherit; }
 }
 .vel-grid {
   position: absolute;
-  left: 62px;
+  left: 78px;
   right: 0;
   border-top: 1px solid var(--grid-line);
+}
+
+/* The average, which is the line a velocity chart is actually read against:
+   without it a column of bars says which iteration was busiest and nothing
+   about whether the team is holding its pace. */
+.vel-average {
+  position: absolute;
+  left: 78px;
+  right: 0;
+  border-top: 1.5px dashed var(--accent-bright);
+  pointer-events: none;
 }
 .vel-col { flex: 1 1 0; min-width: 10px; height: 100%; position: relative; }
 .vel-stack { position: relative; height: 100%; }
@@ -2174,6 +2214,9 @@ button { font: inherit; color: inherit; }
 }
 .vel-planned { background: var(--bar); opacity: 0.35; }
 .vel-done { background: var(--bar-progress); }
+/* The iteration in progress is not a finished number, so it is drawn as one
+   still being filled in rather than as a delivered total. */
+.vel-done.running { background: var(--bar-progress); opacity: 0.55; }
 .vel-label {
   position: absolute;
   bottom: -15px;
@@ -2210,6 +2253,10 @@ button { font: inherit; color: inherit; }
 .crit-name { flex: 1; min-width: 0; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .crit-dates { color: var(--ink-soft); font-size: 10.5px; white-space: nowrap; }
 
+/* A resource in the usage view heads the bookings under it, so it is ruled off
+   from the group above rather than left to run into it. */
+.sheet tr.usage-head td { border-top: 1px solid var(--line); }
+
 /* ---------- report pages ---------- */
 
 .rep-head { margin-bottom: 16px; }
@@ -2239,6 +2286,15 @@ button { font: inherit; color: inherit; }
   margin-bottom: 18px;
 }
 .velocity.tall { height: 260px; }
+
+/* Said when there is nothing to draw. Axes with no lines and no explanation
+   read as a broken chart rather than as an empty one. */
+.rep-chart-note {
+  margin: 6px 0 8px;
+  font-size: 11px;
+  color: var(--ink-soft);
+  line-height: 1.5;
+}
 
 .rep-section {
   font-size: 13px;

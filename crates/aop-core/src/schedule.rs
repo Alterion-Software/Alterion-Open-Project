@@ -7,7 +7,7 @@
 //! successor, a summary's rolled-up dates are always known by the time a
 //! successor reads them, and a single forward pass is enough.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 
@@ -140,6 +140,11 @@ struct Graph {
     outgoing: HashMap<usize, Vec<Link>>,
     /// Task id -> the leaf rows it covers.
     leaves_of: HashMap<TaskId, Vec<usize>>,
+    /// Every link flattened onto the pairs of leaf rows it really joins, with
+    /// summary ends expanded and switched off tasks bridged over, in a fixed
+    /// order. `incoming` keeps the link but loses which leaf of a summary it
+    /// arrived from, and the critical path trace needs that pair.
+    edges: Vec<(usize, usize, Link)>,
 }
 
 fn build_graph(project: &Project) -> Result<Graph, ScheduleError> {
@@ -220,7 +225,16 @@ fn build_graph(project: &Project) -> Result<Graph, ScheduleError> {
                         .any(|(a, b, _)| a == pred && b == succ)
                         || bridged.iter().any(|(a, b, _)| a == pred && b == succ);
                     if pred != succ && !already {
-                        bridged.push((*pred, *succ, *onward));
+                        // The short cut has to name the pair it really joins.
+                        // Both passes read a predecessor's dates through the
+                        // id on the link, so one still pointing at the
+                        // switched off task hands the successor a span
+                        // nothing is waiting for, and the chain reads as a
+                        // gap at exactly the row that was meant to vanish.
+                        let mut joined = *onward;
+                        joined.predecessor = project.tasks[*pred].id;
+                        joined.successor = project.tasks[*succ].id;
+                        bridged.push((*pred, *succ, joined));
                     }
                 }
             }
@@ -235,7 +249,11 @@ fn build_graph(project: &Project) -> Result<Graph, ScheduleError> {
         edges.retain(|(pred, succ, _)| !inactive.contains(pred) && !inactive.contains(succ));
     }
 
-    for (pred, succ, link) in edges {
+    // Nothing downstream may depend on the order links happened to be typed
+    // in, so the pairs are put in a fixed one here and read in it everywhere.
+    edges.sort_by_key(|(pred, succ, link)| (*succ, *pred, link.kind as u8, link.lag_minutes));
+
+    for &(pred, succ, link) in &edges {
         incoming.entry(succ).or_default().push(link);
         outgoing.entry(pred).or_default().push(link);
         adjacency.entry(pred).or_default().push(succ);
@@ -279,6 +297,7 @@ fn build_graph(project: &Project) -> Result<Graph, ScheduleError> {
         incoming,
         outgoing,
         leaves_of,
+        edges,
     })
 }
 
@@ -479,18 +498,53 @@ fn backward_pass(project: &mut Project, graph: &Graph, project_finish: NaiveDate
     }
 }
 
-fn compute_slack(project: &mut Project, graph: &Graph) {
-    let calendar = project.calendar.clone();
-    let project_finish = project
+/// How much total slack a task is allowed and still counts as critical.
+///
+/// Project makes this a per-plan setting, "tasks are critical if slack is less
+/// than or equal to N days", zero by default, so a team that treats anything
+/// inside half a week as at risk can say so once. There is nowhere on
+/// `Project` to keep it yet: the field belongs beside `show_project_summary`
+/// in `model::Project` as a serde-defaulted `critical_slack_minutes: i64`, and
+/// only this function has to change when it lands.
+pub const DEFAULT_CRITICAL_SLACK_MINUTES: i64 = 0;
+
+fn critical_slack_threshold(_project: &Project) -> i64 {
+    DEFAULT_CRITICAL_SLACK_MINUTES
+}
+
+/// The latest finish among the tasks that count.
+///
+/// A switched off task is not part of the plan, so it must not set the date
+/// the plan finishes, and it must not stretch the backward pass and hand every
+/// other task slack it has not got. Bridging the logic around it was only half
+/// the job: its own dates are still worked out, and they were still being
+/// counted here.
+fn scheduled_finish(project: &Project) -> NaiveDateTime {
+    project
         .tasks
         .iter()
-        .map(|t| t.scheduled.finish)
+        .filter(|task| task.active)
+        .map(|task| task.scheduled.finish)
         .max()
-        .unwrap_or(project.start_date);
+        .unwrap_or(project.start_date)
+}
+
+fn compute_slack(project: &mut Project, graph: &Graph) {
+    let calendar = project.calendar.clone();
+    let project_finish = scheduled_finish(project);
+
+    let threshold = critical_slack_threshold(project);
 
     for &index in &graph.order {
         let scheduled = project.tasks[index].scheduled;
-        let total = calendar.work_minutes_between(scheduled.finish, scheduled.late_finish);
+        // Microsoft's total slack is the smaller of the two slips, not the
+        // finish one on its own. They agree whenever a task's late dates sit
+        // exactly one duration apart, but a late start pulled in harder than
+        // the late finish leaves the task only the smaller of them to give
+        // away, and reading the finish alone then calls it non-critical.
+        let by_finish = calendar.work_minutes_between(scheduled.finish, scheduled.late_finish);
+        let by_start = calendar.work_minutes_between(scheduled.start, scheduled.late_start);
+        let total = by_finish.min(by_start);
 
         // Free slack is how far this task can slip before it moves anything.
         let mut free = None;
@@ -513,7 +567,7 @@ fn compute_slack(project: &mut Project, graph: &Graph) {
         let slot = &mut project.tasks[index].scheduled;
         slot.total_slack_minutes = total;
         slot.free_slack_minutes = free;
-        slot.critical = total <= 0 && active;
+        slot.critical = total <= threshold && active;
     }
 }
 
@@ -946,12 +1000,7 @@ pub fn schedule(project: &mut Project) -> Result<ScheduleReport, ScheduleError> 
 
     forward_pass(project, &graph, &no_pins);
 
-    let mut project_finish = project
-        .tasks
-        .iter()
-        .map(|t| t.scheduled.finish)
-        .max()
-        .unwrap_or(project.start_date);
+    let mut project_finish = scheduled_finish(project);
     // Scheduling backwards from a required finish date targets that date even
     // when the plan is shorter than the window available.
     if project.schedule_from == ScheduleFrom::ProjectFinishDate {
@@ -986,18 +1035,16 @@ pub fn schedule(project: &mut Project) -> Result<ScheduleReport, ScheduleError> 
     compute_cost_and_work(project);
     roll_up_summaries(project);
 
+    // Switched off rows are left out of both ends: they are not part of the
+    // plan, so they must not stretch the dates it reports.
     let start = project
         .tasks
         .iter()
+        .filter(|task| task.active)
         .map(|t| t.scheduled.start)
         .min()
         .unwrap_or(project.start_date);
-    let finish = project
-        .tasks
-        .iter()
-        .map(|t| t.scheduled.finish)
-        .max()
-        .unwrap_or(project.start_date);
+    let finish = scheduled_finish(project);
     project.finish_date = finish;
 
     let critical_task_count = (0..project.tasks.len())
@@ -1036,6 +1083,48 @@ mod tests {
             project.push_task(format!("Task {}", n + 1), duration);
         }
         project
+    }
+
+    #[test]
+    fn a_switched_off_task_does_not_set_the_project_finish() {
+        // Bridging the logic around it was only half the job. Its own dates
+        // are still worked out, and a long switched off row was still setting
+        // the finish date and handing every other task slack it had not got.
+        let mut project = Project::blank(
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 5)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        );
+        let mut ids = Vec::new();
+        for (name, minutes) in [("P", 960), ("Q", 2400), ("R", 960)] {
+            let id = project.allocate_task_id();
+            project.tasks.push(crate::model::Task::new(id, name, minutes));
+            ids.push(id);
+        }
+        for pair in ids.windows(2) {
+            project.links.push(Link {
+                predecessor: pair[0],
+                successor: pair[1],
+                kind: LinkType::FS,
+                lag_minutes: 0,
+            });
+        }
+        project.tasks[1].active = false;
+
+        schedule(&mut project).expect("schedules");
+
+        let last_real = project
+            .tasks
+            .iter()
+            .filter(|task| task.active)
+            .map(|task| task.scheduled.finish)
+            .max()
+            .expect("two active tasks");
+        assert_eq!(
+            project.finish_date, last_real,
+            "the plan finishes when its real work does, not when the switched off row would have"
+        );
     }
 
     #[test]
@@ -1766,7 +1855,7 @@ mod external_tests {
     }
 }
 
-/// One step along the critical path.
+/// One step along a critical chain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CriticalStep {
     /// Row index in the plan.
@@ -1776,114 +1865,281 @@ pub struct CriticalStep {
     pub lag_minutes: i64,
 }
 
-/// The critical path: the longest chain of dependent tasks that sets the
-/// project's finish date.
+/// One run of driving relationships: a task nothing drives, through to a task
+/// that drives nothing further.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CriticalChain {
+    /// The tasks in order, first to last.
+    pub steps: Vec<CriticalStep>,
+    /// Whether the run ends on the plan's own finish date. Only those are
+    /// critical paths in the strict sense. The rest are runs held by a
+    /// deadline or a constraint further back, which a planner still has to
+    /// see, since they have no slack to give either.
+    pub ends_at_project_finish: bool,
+}
+
+/// A plan whose network fans out can hold an enormous number of distinct
+/// routes back through it, and nobody reads the ten thousandth. The chains are
+/// produced end by end, and the ends are taken in row order, so what a cap
+/// drops is always the tail of the report rather than something arbitrary.
+const MAX_CHAINS: usize = 64;
+
+/// Whether `link`, arriving from leaf row `pred`, is what actually places
+/// `succ`, rather than a relationship the successor meets anyway.
 ///
-/// This is not the same as "every task with zero slack". Those tasks are the
-/// candidates, but the path is the sequence through them, joined by their
-/// links. A plan can hold several zero-slack chains running in parallel, and
-/// only the longest one determines the finish, so that is the one returned.
+/// This is the driving test, and it is the whole of the critical path
+/// definition: hand the successor the date this link demands, put it through
+/// the same calendar snapping the forward pass applies, and see whether that
+/// is where the successor really starts. Earlier means the successor could
+/// have started then regardless and the link is merely satisfied.
+fn is_driving(project: &Project, link: &Link, pred: usize, succ: usize) -> bool {
+    let (Some(from), Some(to)) = (project.tasks.get(pred), project.tasks.get(succ)) else {
+        return false;
+    };
+    // A manually scheduled task sits where the planner put it; the forward
+    // pass skips its links outright, so nothing drives it.
+    if to.mode == TaskMode::Manual {
+        return false;
+    }
+    let calendar = &project.calendar;
+    let duration = to.duration_minutes;
+    let handed = driven_start(
+        calendar,
+        link,
+        from.scheduled.start,
+        from.scheduled.finish,
+        duration,
+    );
+    // A milestone is snapped as a marker and a task as a start, exactly as in
+    // the forward pass. Comparing the raw instant instead would miss every
+    // handover that lands in an evening or a weekend.
+    let placed = if duration == 0 {
+        calendar.snap_marker(handed)
+    } else {
+        calendar.next_working_instant(handed)
+    };
+    placed == to.scheduled.start
+}
+
+/// Walk back from `node` along every driving relationship into it, emitting
+/// one chain per distinct route.
+fn trace_driving(
+    node: usize,
+    driven_by: &BTreeMap<usize, Vec<(usize, Link)>>,
+    seen: &mut HashSet<usize>,
+    suffix: &mut Vec<CriticalStep>,
+    out: &mut Vec<Vec<CriticalStep>>,
+) {
+    if out.len() >= MAX_CHAINS {
+        return;
+    }
+    seen.insert(node);
+
+    // The network is acyclic by the time anything is scheduled, so the guard
+    // is belt and braces against a plan assembled by hand in a test or by an
+    // importer that has not been through `schedule` yet.
+    let onward: Vec<(usize, Link)> = driven_by
+        .get(&node)
+        .map(|drivers| {
+            drivers
+                .iter()
+                .copied()
+                .filter(|(from, _)| !seen.contains(from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if onward.is_empty() {
+        // Nothing drives this one, so the chain begins here.
+        suffix.push(CriticalStep {
+            index: node,
+            link_from_previous: None,
+            lag_minutes: 0,
+        });
+        out.push(suffix.iter().rev().cloned().collect());
+        suffix.pop();
+    } else {
+        for (from, link) in onward {
+            suffix.push(CriticalStep {
+                index: node,
+                link_from_previous: Some(link.kind),
+                lag_minutes: link.lag_minutes,
+            });
+            trace_driving(from, driven_by, seen, suffix, out);
+            suffix.pop();
+        }
+    }
+
+    seen.remove(&node);
+}
+
+/// Every critical chain in the plan, the one that sets the finish date first.
 ///
-/// Summary rows are left out: their span is rolled up from their children, so
-/// including them would put the same time on the path twice.
-pub fn critical_path(project: &Project) -> Vec<CriticalStep> {
+/// The critical path is not "the tasks with zero slack", and it is not the
+/// longest run of durations either. AACE RP 49R-06, Oracle and the GAO all
+/// put it the same way: begin at the activities whose early finish is the
+/// plan's own finish, and follow driving relationships back to the start. A
+/// relationship drives when the date it hands its successor is the date the
+/// successor starts, so the chain that comes back is the run of handovers a
+/// delay would really travel along.
+///
+/// Several such runs can exist at once, and a plan of any size usually has
+/// several: two branches finishing on the same day are both critical and
+/// Project paints both. All of them are returned, ranked, rather than one
+/// picked arbitrarily. Runs that end short of the plan's finish, which is
+/// what a deadline or a late constraint produces, come after the ones that
+/// reach it.
+///
+/// Summary rows are left out: their span is their children's, so including
+/// them would put the same time on the path twice. So are switched off tasks,
+/// which take no part in the schedule at all; the network is bridged across
+/// them when it is built, so their chain still reads as one run.
+pub fn critical_paths(project: &Project) -> Vec<CriticalChain> {
+    let Ok(graph) = build_graph(project) else {
+        // A plan with a dependency loop has no path to report, and `schedule`
+        // already names the loop, which is the message worth showing.
+        return Vec::new();
+    };
+
     // What the scheduler worked out, not what the warning list chooses to
     // show. `shows_as_critical` also hides tasks whose critical warning the
     // planner has dismissed, and dismissing a warning says nothing about the
     // schedule: letting it reach the algorithm broke the chain wherever one
     // had been dismissed, and the report then drew a fragment of the path.
-    let candidates: Vec<usize> = (0..project.tasks.len())
-        .filter(|&index| {
-            !project.is_summary(index)
-                && project.tasks[index].active
-                && project.tasks[index].scheduled.critical
+    let on_chain = |index: usize| {
+        project
+            .tasks
+            .get(index)
+            .is_some_and(|task| task.active && task.scheduled.critical)
+            && !project.is_summary(index)
+    };
+
+    // Leaf row -> the predecessors that actually place it. Ordered maps
+    // throughout: a hash order reaching the output would change the path a
+    // planner is shown between two runs of a plan nobody edited.
+    let mut driven_by: BTreeMap<usize, Vec<(usize, Link)>> = BTreeMap::new();
+    let mut drives: BTreeSet<usize> = BTreeSet::new();
+    for &(pred, succ, link) in &graph.edges {
+        if !on_chain(pred) || !on_chain(succ) || !is_driving(project, &link, pred, succ) {
+            continue;
+        }
+        let into = driven_by.entry(succ).or_default();
+        // Two links between one pair, an SS and an FF say, describe a single
+        // handover between them. Following both would report the same chain
+        // twice over.
+        if into.iter().any(|&(already, _)| already == pred) {
+            continue;
+        }
+        into.push((pred, link));
+        drives.insert(pred);
+    }
+
+    // Where the chains end: a critical task that drives nothing critical.
+    // Anything with a driving successor is in the middle of a chain, not at
+    // the end of one.
+    let ends: Vec<usize> = (0..project.tasks.len())
+        .filter(|&index| on_chain(index) && !drives.contains(&index))
+        .collect();
+
+    let mut routes: Vec<Vec<CriticalStep>> = Vec::new();
+    for end in ends {
+        let mut seen = HashSet::new();
+        let mut suffix = Vec::new();
+        trace_driving(end, &driven_by, &mut seen, &mut suffix, &mut routes);
+    }
+
+    // The plan's own finish: the latest early finish of the work that counts,
+    // which is what the chains are anchored to.
+    let finish_line = project
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|&(index, task)| task.active && !project.is_summary(index))
+        .map(|(_, task)| task.scheduled.finish)
+        .max();
+
+    let mut chains: Vec<CriticalChain> = routes
+        .into_iter()
+        .map(|steps| {
+            let ends_at_project_finish = match (steps.last(), finish_line) {
+                (Some(last), Some(line)) => project
+                    .tasks
+                    .get(last.index)
+                    .is_some_and(|task| task.scheduled.finish == line),
+                _ => false,
+            };
+            CriticalChain {
+                steps,
+                ends_at_project_finish,
+            }
         })
         .collect();
 
-    if candidates.is_empty() {
-        return Vec::new();
-    }
+    // Ranked so the chain that sets the finish date reads first, then the
+    // longest, and finally by row so two chains of the same shape always come
+    // back in the same order.
+    chains.sort_by_cached_key(|chain| {
+        (
+            !chain.ends_at_project_finish,
+            std::cmp::Reverse(critical_path_span_minutes(project, &chain.steps)),
+            std::cmp::Reverse(chain.steps.len()),
+            chain.steps.iter().map(|step| step.index).collect::<Vec<_>>(),
+        )
+    });
+    chains
+}
 
-    let position: HashMap<usize, usize> = candidates
-        .iter()
-        .enumerate()
-        .map(|(slot, &index)| (index, slot))
-        .collect();
+/// The critical path: the chain that sets the project finish date.
+///
+/// The primary chain out of [`critical_paths`], for callers that want the one
+/// answer. A plan with parallel critical chains has more than one, and they
+/// are all equally red on a Gantt chart, so anything reporting on criticality
+/// rather than summarising it wants [`critical_paths`] instead.
+pub fn critical_path(project: &Project) -> Vec<CriticalStep> {
+    critical_paths(project)
+        .into_iter()
+        .next()
+        .map(|chain| chain.steps)
+        .unwrap_or_default()
+}
 
-    // Links that run between two candidates, which is what makes a chain
-    // rather than a list.
-    let mut incoming: HashMap<usize, Vec<(usize, Link)>> = HashMap::new();
-    for link in &project.links {
-        let (Some(from), Some(to)) = (
-            project.index_of(link.predecessor),
-            project.index_of(link.successor),
-        ) else {
-            continue;
-        };
-        if position.contains_key(&from) && position.contains_key(&to) {
-            incoming.entry(to).or_default().push((from, *link));
-        }
-    }
-
-    // Longest chain ending at each task, measured in duration so that the
-    // path returned is the one that actually sets the finish date. The plan is
-    // already known to be acyclic here, since it scheduled.
-    let mut order = candidates.clone();
-    order.sort_by_key(|&index| project.tasks[index].scheduled.start);
-
-    let mut best: HashMap<usize, i64> = HashMap::new();
-    let mut came_from: HashMap<usize, (usize, Link)> = HashMap::new();
-
-    for &index in &order {
-        let own = project.tasks[index].scheduled.duration_minutes.max(0);
-        let mut longest = own;
-        for (from, link) in incoming.get(&index).into_iter().flatten() {
-            let through = best.get(from).copied().unwrap_or(0) + own;
-            if through > longest {
-                longest = through;
-                came_from.insert(index, (*from, *link));
-            }
-        }
-        best.insert(index, longest);
-    }
-
-    // Walk back from wherever the longest chain ended.
-    let Some((&tail, _)) = best.iter().max_by_key(|(index, length)| {
-        // Ties broken by the later finish, so the path ends where the project
-        // does rather than at whichever row happened to hash first.
-        (**length, project.tasks[**index].scheduled.finish)
-    }) else {
-        return Vec::new();
+/// The elapsed working time a chain runs for, from its first start to its last
+/// finish.
+///
+/// This is what "how long is the critical path" means to a planner, and it is
+/// not the durations added up: adding those misses the lag between two steps,
+/// the calendar's non-working time and any gap the chain has, so a fortnight
+/// of waiting reads as the two days of work either side of it.
+pub fn critical_path_span_minutes(project: &Project, path: &[CriticalStep]) -> i64 {
+    let dates = || path.iter().filter_map(|step| project.tasks.get(step.index));
+    let (Some(start), Some(finish)) = (
+        dates().map(|task| task.scheduled.start).min(),
+        dates().map(|task| task.scheduled.finish).max(),
+    ) else {
+        return 0;
     };
+    project.calendar.work_minutes_between(start, finish)
+}
 
-    let mut chain = Vec::new();
-    let mut cursor = tail;
-    loop {
-        let step = came_from.get(&cursor).copied();
-        chain.push(CriticalStep {
-            index: cursor,
-            link_from_previous: step.map(|(_, link)| link.kind),
-            lag_minutes: step.map(|(_, link)| link.lag_minutes).unwrap_or(0),
-        });
-        match step {
-            Some((previous, _)) => cursor = previous,
-            None => break,
-        }
-        // A malformed graph must not spin here.
-        if chain.len() > project.tasks.len() {
-            break;
-        }
-    }
-
-    chain.reverse();
-    chain
+/// The work on a chain, in working minutes: its durations added up.
+///
+/// Shorter than the span whenever the chain waits on anything, which is why it
+/// answers "how much work is on the path" and not "how long does it run".
+pub fn critical_path_duration_minutes(project: &Project, path: &[CriticalStep]) -> i64 {
+    path.iter()
+        .filter_map(|step| project.tasks.get(step.index))
+        .map(|task| task.scheduled.duration_minutes.max(0))
+        .sum()
 }
 
 /// How long the critical path runs, in working minutes.
+///
+/// The name the rest of the tree already calls, answering with the elapsed
+/// span: the durations added up called a chain with a fortnight of lag in it
+/// two days long. Callers that want one reading or the other by name have
+/// [`critical_path_span_minutes`] and [`critical_path_duration_minutes`].
 pub fn critical_path_minutes(project: &Project, path: &[CriticalStep]) -> i64 {
-    path.iter()
-        .map(|step| project.tasks[step.index].scheduled.duration_minutes.max(0))
-        .sum()
+    critical_path_span_minutes(project, path)
 }
 
 #[cfg(test)]
@@ -1921,6 +2177,40 @@ mod critical_path_tests {
             previous = Some(id);
         }
         project
+    }
+
+    /// A plan of named tasks with their durations in working minutes, and the
+    /// ids in the same order, for linking them up.
+    fn plan(tasks: &[(&str, i64)]) -> (Project, Vec<crate::model::TaskId>) {
+        let mut project = Project::blank(at(2026, 1, 5));
+        project.tasks.clear();
+        let ids = tasks
+            .iter()
+            .map(|(name, minutes)| project.push_task(*name, *minutes))
+            .collect();
+        (project, ids)
+    }
+
+    fn join(
+        project: &mut Project,
+        predecessor: crate::model::TaskId,
+        successor: crate::model::TaskId,
+        kind: LinkType,
+        lag_minutes: i64,
+    ) {
+        project.links.push(Link {
+            predecessor,
+            successor,
+            kind,
+            lag_minutes,
+        });
+    }
+
+    fn names(project: &Project, steps: &[CriticalStep]) -> Vec<String> {
+        steps
+            .iter()
+            .map(|step| project.tasks[step.index].name.clone())
+            .collect()
     }
 
     #[test]
@@ -2001,11 +2291,14 @@ mod critical_path_tests {
     }
 
     #[test]
-    fn the_path_length_is_the_sum_of_its_steps() {
+    fn the_path_length_is_the_time_it_runs_for() {
+        // Nothing waits on anything here, so the span and the work on the
+        // chain come to the same three days.
         let mut project = chain(&[480, 960]);
         crate::schedule(&mut project).unwrap();
         let path = critical_path(&project);
         assert_eq!(critical_path_minutes(&project, &path), 1440);
+        assert_eq!(critical_path_duration_minutes(&project, &path), 1440);
     }
 
     #[test]
@@ -2018,6 +2311,210 @@ mod critical_path_tests {
 
         let path = critical_path(&project);
         assert!(path.iter().all(|step| !project.is_summary(step.index)));
+    }
+
+    // ---- the eight readings the old walk got wrong ----------------------
+
+    #[test]
+    fn two_milestones_in_a_row_are_both_on_the_path() {
+        // Half a real plan is milestones, and a chain of them carries no
+        // duration at all, so a walk that measures its steps in duration
+        // never joins one milestone to the next and reports the first alone.
+        let (mut project, ids) = plan(&[("M1", 0), ("M2", 0)]);
+        join(&mut project, ids[0], ids[1], LinkType::FS, 0);
+        crate::schedule(&mut project).expect("two markers schedule");
+
+        assert!(
+            project.tasks.iter().all(|t| t.scheduled.critical),
+            "both markers are critical to begin with"
+        );
+        assert_eq!(names(&project, &critical_path(&project)), ["M1", "M2"]);
+    }
+
+    #[test]
+    fn a_zero_length_predecessor_sharing_a_start_still_comes_first() {
+        // The marker hands over the moment it is reached, so it starts on the
+        // same instant as the task it releases. Ordering the walk by start
+        // date then leaves the two in whichever order the rows happen to sit
+        // in, and the chain is built backwards from the wrong end.
+        let (mut project, ids) = plan(&[("A", 480), ("C", 480), ("M", 0)]);
+        join(&mut project, ids[0], ids[2], LinkType::FS, 0);
+        join(&mut project, ids[2], ids[1], LinkType::FS, 0);
+        crate::schedule(&mut project).expect("a marker between two tasks schedules");
+
+        assert_eq!(
+            project.tasks[2].scheduled.start, project.tasks[1].scheduled.start,
+            "the marker and the task it releases share a start, which is the trap"
+        );
+        assert_eq!(names(&project, &critical_path(&project)), ["A", "M", "C"]);
+    }
+
+    #[test]
+    fn a_link_hung_on_a_summary_puts_its_children_on_the_path() {
+        // Planners link phases, not only tasks. The scheduler already expands
+        // such a link onto the phase's leaves; a report reading the raw links
+        // sees a summary at one end, cannot place it, and drops the handover.
+        let (mut project, ids) = plan(&[("Phase", 0), ("X", 480), ("Y", 480)]);
+        project.tasks[1].outline_level = 1;
+        join(&mut project, ids[0], ids[2], LinkType::FS, 0);
+        crate::schedule(&mut project).expect("a link on a phase schedules");
+
+        assert!(project.is_summary(0), "Phase has to be a summary for this to mean anything");
+        assert_eq!(names(&project, &critical_path(&project)), ["X", "Y"]);
+    }
+
+    #[test]
+    fn every_chain_that_reaches_the_finish_is_a_critical_path() {
+        // Two branches finishing on the same day are both critical and
+        // Project paints all four bars red. Returning one chain silently
+        // loses half the tasks a delay would travel along.
+        let (mut project, ids) = plan(&[("A1", 960), ("A2", 1440), ("B1", 480), ("B2", 1920)]);
+        join(&mut project, ids[0], ids[1], LinkType::FS, 0);
+        join(&mut project, ids[2], ids[3], LinkType::FS, 0);
+        crate::schedule(&mut project).expect("two branches schedule");
+
+        assert!(
+            project.tasks.iter().all(|t| t.scheduled.critical),
+            "all four have zero float, which is what makes this the case it is"
+        );
+        assert_eq!(
+            project.tasks[1].scheduled.finish, project.tasks[3].scheduled.finish,
+            "both branches finish together"
+        );
+
+        let chains = critical_paths(&project);
+        assert_eq!(chains.len(), 2, "one chain per branch");
+        assert!(chains.iter().all(|chain| chain.ends_at_project_finish));
+        assert_eq!(names(&project, &chains[0].steps), ["A1", "A2"]);
+        assert_eq!(names(&project, &chains[1].steps), ["B1", "B2"]);
+    }
+
+    #[test]
+    fn the_same_plan_reports_the_same_path_every_run() {
+        // The tail used to be whichever row a HashMap handed back first, so an
+        // exact tie between two branches showed a different chain from one run
+        // to the next with nothing about the plan having changed.
+        let (mut project, ids) = plan(&[("A1", 960), ("A2", 1440), ("B1", 480), ("B2", 1920)]);
+        join(&mut project, ids[0], ids[1], LinkType::FS, 0);
+        join(&mut project, ids[2], ids[3], LinkType::FS, 0);
+        crate::schedule(&mut project).expect("two tied branches schedule");
+
+        let first = critical_paths(&project);
+        for _ in 0..25 {
+            assert_eq!(critical_paths(&project), first, "the answer has to be the plan's, not the hasher's");
+            assert_eq!(critical_path(&project), first[0].steps);
+        }
+    }
+
+    #[test]
+    fn the_path_ends_where_the_project_does() {
+        // A deadline gives a run of tasks zero slack without it going anywhere
+        // near the finish date. Picking the chain with the most duration on it
+        // then reports that run, and the planner reads a critical path that
+        // stops a fortnight before the plan does.
+        let (mut project, ids) = plan(&[("S", 480), ("T", 480), ("U", 2400), ("V", 2400)]);
+        join(&mut project, ids[0], ids[1], LinkType::FS, 20 * crate::MINUTES_PER_DAY);
+        join(&mut project, ids[2], ids[3], LinkType::FS, 0);
+        crate::schedule(&mut project).expect("schedules once for the dates");
+
+        // Hold the second run to the date it already meets, which is what
+        // takes its slack away without moving anything.
+        project.tasks[3].deadline = Some(project.tasks[3].scheduled.finish);
+        crate::schedule(&mut project).expect("schedules again with the deadline");
+
+        assert!(
+            project.tasks.iter().all(|t| t.scheduled.critical),
+            "both runs are critical, one by the finish date and one by the deadline"
+        );
+        assert!(
+            project.tasks[3].scheduled.finish < project.tasks[1].scheduled.finish,
+            "the deadline run carries more work but ends first, which is the trap"
+        );
+
+        let chains = critical_paths(&project);
+        assert_eq!(names(&project, &chains[0].steps), ["S", "T"], "the finish comes first");
+        assert!(chains[0].ends_at_project_finish);
+        assert_eq!(names(&project, &chains[1].steps), ["U", "V"], "the deadline run is still reported");
+        assert!(!chains[1].ends_at_project_finish);
+        assert_eq!(names(&project, &critical_path(&project)), ["S", "T"]);
+    }
+
+    #[test]
+    fn waiting_time_counts_towards_how_long_the_path_runs() {
+        // A day of work, a fortnight of waiting, another day of work. Adding
+        // the durations up calls that two days; the plan runs from the fifth
+        // of January to the twentieth.
+        let (mut project, ids) = plan(&[("A", 480), ("B", 480)]);
+        join(&mut project, ids[0], ids[1], LinkType::FS, 10 * crate::MINUTES_PER_DAY);
+        crate::schedule(&mut project).expect("a lagged pair schedules");
+
+        let path = critical_path(&project);
+        assert_eq!(names(&project, &path), ["A", "B"]);
+        assert_eq!(path[1].lag_minutes, 10 * crate::MINUTES_PER_DAY, "the lag is on the step");
+        assert_eq!(
+            critical_path_duration_minutes(&project, &path),
+            2 * crate::MINUTES_PER_DAY,
+            "two days of work, which is all the durations know about"
+        );
+        assert_eq!(
+            critical_path_span_minutes(&project, &path),
+            12 * crate::MINUTES_PER_DAY,
+            "twelve working days from the fifth to the twentieth of January"
+        );
+        assert_eq!(
+            critical_path_minutes(&project, &path),
+            critical_path_span_minutes(&project, &path),
+            "the length a report shows is the time it runs for"
+        );
+    }
+
+    #[test]
+    fn a_chain_bridged_over_a_switched_off_task_reads_as_one_run() {
+        // A switched off task takes no part in the schedule, and the network
+        // is joined across it so the work either side still lines up. The
+        // path has to read the same way: a gap where the row used to be is
+        // the chain broken in half, not a shorter chain.
+        // Q is kept short so its own phantom span cannot outlast the work
+        // either side of it: a switched off row is still given dates, and a
+        // long one takes the rest of the plan off the critical path.
+        let (mut project, ids) = plan(&[("P", 960), ("Q", 480), ("R", 480)]);
+        join(&mut project, ids[0], ids[1], LinkType::FS, 0);
+        join(&mut project, ids[1], ids[2], LinkType::FS, 0);
+        project.tasks[1].active = false;
+        crate::schedule(&mut project).expect("schedules with one row switched off");
+
+        assert_eq!(
+            project.tasks[2].scheduled.start,
+            project.calendar.next_working_instant(project.tasks[0].scheduled.finish),
+            "R follows P directly, since the switched off row contributes nothing"
+        );
+        assert_eq!(names(&project, &critical_path(&project)), ["P", "R"]);
+    }
+
+    #[test]
+    fn total_slack_is_the_smaller_of_the_start_and_finish_slips() {
+        // Microsoft's total slack is the lesser of (late finish - finish) and
+        // (late start - start). The two agree for as long as a task's late
+        // dates sit exactly one duration apart, which they do on a single
+        // calendar, so what separates the formulas is a late start pulled in
+        // on its own: a second calendar or a start driven link does that, and
+        // reading the finish alone then hands the task slack it has not got.
+        let (mut project, _) = plan(&[("Short", 480), ("Long", 960)]);
+        crate::schedule(&mut project).expect("two parallel tasks schedule");
+        assert_eq!(
+            project.tasks[0].scheduled.total_slack_minutes, 480,
+            "the shorter one has a day of slack to begin with"
+        );
+
+        let graph = build_graph(&project).expect("no loop to report");
+        project.tasks[0].scheduled.late_start = project.tasks[0].scheduled.start;
+        compute_slack(&mut project, &graph);
+
+        assert_eq!(
+            project.tasks[0].scheduled.total_slack_minutes, 0,
+            "it cannot start any later, so it has no slack whatever its finish says"
+        );
+        assert!(project.tasks[0].scheduled.critical, "and Project calls that critical");
     }
 }
 
@@ -2264,3 +2761,4 @@ mod update_tests {
         );
     }
 }
+

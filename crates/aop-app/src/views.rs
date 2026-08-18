@@ -5,12 +5,38 @@ use std::collections::HashMap;
 use chrono::{Datelike, Duration, NaiveDate};
 use dioxus::prelude::*;
 
-use aop_core::{format_duration, format_work, ResourceKind, TaskId};
+use aop_core::agile::{Basis, Iteration, Metrics};
+use aop_core::{format_duration, format_work, Resource, ResourceKind, TaskId};
 
 use crate::gantt::{chart_range, Scale};
 use crate::state::{format_date, AppState, Dialog, ViewKind};
 
 // -------------------------------------------------------- resource sheet
+
+/// What one booking costs, charged the way the scheduler charges it.
+///
+/// Hours times rate is only right for a work resource. A material is bought by
+/// the unit and a cost resource is a lump sum with no per-use charge on top, so
+/// running every kind through the same sum puts a number in the Cost column
+/// that the plan's own totals disagree with.
+fn booking_cost(resource: &Resource, duration_minutes: i64, units: f64) -> f64 {
+    match resource.kind {
+        ResourceKind::Work => {
+            let minutes = (duration_minutes as f64 * units).round() as i64;
+            minutes as f64 / 60.0 * resource.standard_rate + resource.cost_per_use
+        }
+        ResourceKind::Material => units * resource.standard_rate + resource.cost_per_use,
+        ResourceKind::Cost => units * resource.standard_rate,
+    }
+}
+
+/// Work a booking books, which only a work resource does at all.
+fn booking_work(resource: &Resource, duration_minutes: i64, units: f64) -> i64 {
+    match resource.kind {
+        ResourceKind::Work => (duration_minutes as f64 * units).round() as i64,
+        _ => 0,
+    }
+}
 
 #[component]
 fn ResourceCell(index: usize, field: String, initial: String) -> Element {
@@ -70,16 +96,23 @@ pub fn ResourceSheet() -> Element {
         .map(|r| r.overallocations.iter().map(|o| o.resource).collect())
         .unwrap_or_default();
 
-    // Booked work per resource, summed across every leaf task.
+    // Booked work per resource, summed across every leaf task, and what those
+    // bookings cost at the rates the scheduler itself charges.
     let mut booked: HashMap<u32, i64> = HashMap::new();
+    let mut costs: HashMap<u32, f64> = HashMap::new();
     for index in 0..project.tasks.len() {
         if project.is_summary(index) {
             continue;
         }
         let task = &project.tasks[index];
         for assignment in &task.assignments {
+            let Some(resource) = project.resource(assignment.resource) else {
+                continue;
+            };
             *booked.entry(assignment.resource).or_insert(0) +=
-                (task.duration_minutes as f64 * assignment.units).round() as i64;
+                booking_work(resource, task.duration_minutes, assignment.units);
+            *costs.entry(assignment.resource).or_insert(0.0) +=
+                booking_cost(resource, task.duration_minutes, assignment.units);
         }
     }
 
@@ -121,7 +154,7 @@ pub fn ResourceSheet() -> Element {
                             if over { class.push_str("over "); }
                             if selected { class.push_str("selected"); }
                             let minutes = booked.get(&resource.id).copied().unwrap_or(0);
-                            let cost = minutes as f64 / 60.0 * resource.standard_rate;
+                            let cost = costs.get(&resource.id).copied().unwrap_or(0.0);
                             let editing_field = s.editing_resource_field.clone();
 
                             rsx! {
@@ -256,17 +289,23 @@ pub fn TaskUsage() -> Element {
                                 // Assignment rows sit under their task, indented further.
                                 for assignment in task.assignments.iter() {
                                     {
-                                        let name = project
-                                            .resource(assignment.resource)
-                                            .map(|r| r.name.clone())
-                                            .unwrap_or_default();
-                                        let minutes = (task.duration_minutes as f64 * assignment.units).round() as i64;
+                                        let resource = project.resource(assignment.resource);
+                                        let name = resource.map(|r| r.name.clone()).unwrap_or_default();
+                                        // A material or a cost resource books no work,
+                                        // so hours beside it would be a number the
+                                        // scheduler never counted.
+                                        let work = match resource {
+                                            Some(r) if r.kind == ResourceKind::Work => {
+                                                format_work(booking_work(r, task.duration_minutes, assignment.units))
+                                            }
+                                            _ => String::new(),
+                                        };
                                         rsx! {
                                             tr { key: "tu{index}a{assignment.resource}",
                                                 style: "color: var(--ink-soft);",
                                                 td { "" }
                                                 td { style: "padding-left: {indent + 28.0}px; font-style: italic;", "{name}" }
-                                                td { "{format_work(minutes)}" }
+                                                td { "{work}" }
                                                 td { "{assignment.units * 100.0:.0}%" }
                                                 td { "{format_date(task.scheduled.start)}" }
                                                 td { "{format_date(task.scheduled.finish)}" }
@@ -277,6 +316,187 @@ pub fn TaskUsage() -> Element {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------- resource usage
+
+/// Resource Usage: every resource with the tasks booked against it.
+///
+/// The mirror of Task Usage, which lists the resources under each task. It is
+/// its own view rather than a relabelled Resource Sheet, because a sheet says
+/// what a resource is and this says what it is doing and when. Tasks nobody is
+/// booked on are gathered at the end: an empty plan for a resource is easy to
+/// see, but work with nobody on it is what actually goes unnoticed.
+#[component]
+pub fn ResourceUsage() -> Element {
+    let state = use_context::<Signal<AppState>>();
+    let s = state.read();
+    let project = &s.project;
+    let currency = project.currency_symbol.clone();
+
+    let mut bookings: HashMap<u32, Vec<(usize, f64)>> = HashMap::new();
+    let mut unassigned: Vec<usize> = Vec::new();
+    for index in 0..project.tasks.len() {
+        if project.is_summary(index) {
+            continue;
+        }
+        let task = &project.tasks[index];
+        if task.assignments.is_empty() {
+            unassigned.push(index);
+            continue;
+        }
+        for assignment in &task.assignments {
+            bookings
+                .entry(assignment.resource)
+                .or_default()
+                .push((index, assignment.units));
+        }
+    }
+
+    rsx! {
+        div { class: "sheet-pane",
+            table { class: "sheet",
+                colgroup {
+                    col { style: "width: 40px;" }
+                    col { style: "width: 300px;" }
+                    col { style: "width: 90px;" }
+                    col { style: "width: 110px;" }
+                    col { style: "width: 80px;" }
+                    col { style: "width: 110px;" }
+                    col { style: "width: 130px;" }
+                    col { style: "width: 130px;" }
+                }
+                thead {
+                    tr {
+                        th { "ID" }
+                        th { "Resource Name" }
+                        th { "Type" }
+                        th { "Work" }
+                        th { "Units" }
+                        th { "Cost" }
+                        th { "Start" }
+                        th { "Finish" }
+                    }
+                }
+                tbody {
+                    for (index, resource) in project.resources.iter().enumerate() {
+                        {
+                            let rows = bookings.get(&resource.id).cloned().unwrap_or_default();
+                            let work: i64 = rows
+                                .iter()
+                                .map(|(task, units)| {
+                                    booking_work(resource, project.tasks[*task].duration_minutes, *units)
+                                })
+                                .sum();
+                            let cost: f64 = rows
+                                .iter()
+                                .map(|(task, units)| {
+                                    booking_cost(resource, project.tasks[*task].duration_minutes, *units)
+                                })
+                                .sum();
+                            let span = rows
+                                .iter()
+                                .map(|(task, _)| project.tasks[*task].scheduled)
+                                .fold(None, |acc: Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)>, s| {
+                                    Some(match acc {
+                                        Some((start, finish)) => {
+                                            (start.min(s.start), finish.max(s.finish))
+                                        }
+                                        None => (s.start, s.finish),
+                                    })
+                                });
+
+                            rsx! {
+                                tr { key: "ru{index}", class: "usage-head",
+                                    td { "{index + 1}" }
+                                    td { style: "font-weight: 700;", "{resource.name}" }
+                                    td { "{resource.kind.label()}" }
+                                    td {
+                                        if resource.kind == ResourceKind::Work {
+                                            "{format_work(work)}"
+                                        }
+                                    }
+                                    // Units belong to the bookings, not to the
+                                    // resource: what it is capable of is the
+                                    // sheet's business, not this view's.
+                                    td { "" }
+                                    td { "{currency}{cost:.2}" }
+                                    td { if let Some((start, _)) = span { "{format_date(start)}" } }
+                                    td { if let Some((_, finish)) = span { "{format_date(finish)}" } }
+                                }
+
+                                if rows.is_empty() {
+                                    tr { key: "ru{index}none", style: "color: var(--ink-soft);",
+                                        td { "" }
+                                        td { style: "padding-left: 28px; font-style: italic;",
+                                            "Not booked on anything" }
+                                        td {} td {} td {} td {} td {} td {}
+                                    }
+                                }
+
+                                for (task, units) in rows.iter() {
+                                    {
+                                        let row = &project.tasks[*task];
+                                        let work = booking_work(resource, row.duration_minutes, *units);
+                                        let cost = booking_cost(resource, row.duration_minutes, *units);
+                                        rsx! {
+                                            tr { key: "ru{index}t{task}", style: "color: var(--ink-soft);",
+                                                td { "{task + 1}" }
+                                                td { style: "padding-left: 28px;", "{row.name}" }
+                                                td { "" }
+                                                td {
+                                                    if resource.kind == ResourceKind::Work {
+                                                        "{format_work(work)}"
+                                                    }
+                                                }
+                                                td { "{units * 100.0:.0}%" }
+                                                td { "{currency}{cost:.2}" }
+                                                td { "{format_date(row.scheduled.start)}" }
+                                                td { "{format_date(row.scheduled.finish)}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Work with nobody on it. Project shows this the same way,
+                    // and it is the half of the report that gets acted on.
+                    if !unassigned.is_empty() {
+                        tr { class: "usage-head",
+                            td { "" }
+                            td { style: "font-weight: 700;", "Unassigned" }
+                            td {} td {} td {} td {} td {} td {}
+                        }
+                        for task in unassigned.iter() {
+                            {
+                                let row = &project.tasks[*task];
+                                rsx! {
+                                    tr { key: "run{task}", style: "color: var(--ink-soft);",
+                                        td { "{task + 1}" }
+                                        td { style: "padding-left: 28px;", "{row.name}" }
+                                        td { "" }
+                                        td { "" }
+                                        td { "" }
+                                        td { "{currency}{row.fixed_cost:.2}" }
+                                        td { "{format_date(row.scheduled.start)}" }
+                                        td { "{format_date(row.scheduled.finish)}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if project.resources.is_empty() {
+                div { class: "hint", style: "padding: 14px;",
+                    "Nobody is booked on this plan yet. Add resources on the Resource Sheet, then book them onto tasks from the Resource Names column."
                 }
             }
         }
@@ -717,6 +937,60 @@ mod tests {
     fn a_negative_width_is_handled_rather_than_panicking() {
         assert_eq!(fit_bar_label("Kickoff", -50.0), "");
     }
+
+    fn resource(kind: ResourceKind, rate: f64, per_use: f64) -> Resource {
+        let mut resource = Resource::new(1, "Someone");
+        resource.kind = kind;
+        resource.standard_rate = rate;
+        resource.cost_per_use = per_use;
+        resource
+    }
+
+    #[test]
+    fn a_work_booking_is_charged_by_the_hour_plus_its_per_use_fee() {
+        // Two days at full time, charged at the rate, with the call-out fee
+        // the scheduler also charges.
+        let cost = booking_cost(&resource(ResourceKind::Work, 50.0, 25.0), 960, 1.0);
+        assert!((cost - (16.0 * 50.0 + 25.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_material_is_charged_by_the_unit_rather_than_by_the_hour() {
+        // Hours times rate against a material invents a cost out of how long
+        // the task runs, which the plan's own totals never counted.
+        let cost = booking_cost(&resource(ResourceKind::Material, 12.0, 30.0), 4800, 5.0);
+        assert!((cost - (5.0 * 12.0 + 30.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_cost_resource_is_a_lump_sum_with_nothing_added_on_top() {
+        let cost = booking_cost(&resource(ResourceKind::Cost, 400.0, 99.0), 4800, 2.0);
+        assert!((cost - 800.0).abs() < 0.01, "the per-use fee is not charged again");
+    }
+
+    #[test]
+    fn only_a_work_resource_books_work() {
+        assert_eq!(booking_work(&resource(ResourceKind::Work, 0.0, 0.0), 960, 0.5), 480);
+        assert_eq!(booking_work(&resource(ResourceKind::Material, 0.0, 0.0), 960, 5.0), 0);
+        assert_eq!(booking_work(&resource(ResourceKind::Cost, 0.0, 0.0), 960, 1.0), 0);
+    }
+
+    #[test]
+    fn a_series_that_stops_early_is_drawn_on_the_full_axis() {
+        // The actual line ends at the status date. Drawn over its own length
+        // it would stretch across the whole chart and read as complete.
+        let plot = Plot::new(200.0, 100.0);
+        let short = plot.partial_path(&[10, 5], 5, 10);
+        let full = plot.path(&[10, 5], 10);
+        assert_ne!(short, full, "half a series must not fill the width");
+        assert!(short.ends_with(&format!("{:.1},{:.1}", plot.left + plot.inner_w() / 4.0, plot.top + plot.inner_h() / 2.0)));
+    }
+
+    #[test]
+    fn an_axis_names_its_unit_once_and_a_count_names_it_never_twice() {
+        assert_eq!(measure_title(Basis::Work, "remaining", 4800), "work remaining (days)");
+        assert_eq!(measure_title(Basis::Count, "remaining", 12), "tasks remaining");
+    }
 }
 
 // ---------------------------------------------------------------- reports
@@ -771,6 +1045,13 @@ impl Plot {
     }
 
     fn path(&self, values: &[i64], peak: i64) -> String {
+        self.partial_path(values, values.len(), peak)
+    }
+
+    /// A series that stops short of the right edge, on the same scale as the
+    /// ones that do not. The actual line ends at the status date, and drawing
+    /// it over its own length would stretch it across the whole chart.
+    fn partial_path(&self, values: &[i64], count: usize, peak: i64) -> String {
         if values.len() < 2 {
             return String::new();
         }
@@ -778,7 +1059,7 @@ impl Plot {
             .iter()
             .enumerate()
             .map(|(index, value)| {
-                let (x, y) = self.point(index, values.len(), *value, peak);
+                let (x, y) = self.point(index, count, *value, peak);
                 format!("{x:.1},{y:.1}")
             })
             .collect::<Vec<_>>()
@@ -786,30 +1067,27 @@ impl Plot {
     }
 }
 
-/// One unit for a whole axis, chosen from its largest value.
+/// A tick label in the axis's own unit, without repeating the unit each time.
 ///
 /// Formatting each tick on its own gives a scale reading "200000 mins", then
 /// "2500 hrs", then "0 days", which cannot be compared by eye and is worse
 /// than no labels at all. The unit is named once, in the axis title.
-fn axis_unit(peak: i64) -> (&'static str, f64) {
-    const HOUR: f64 = 60.0;
-    const DAY: f64 = 480.0;
-    if peak as f64 >= DAY * 5.0 {
-        ("days", DAY)
-    } else if peak as f64 >= HOUR * 3.0 {
-        ("hours", HOUR)
-    } else {
-        ("minutes", 1.0)
-    }
-}
-
-/// A tick label in the axis's own unit, without repeating the unit each time.
 fn axis_tick(value: i64, per_unit: f64) -> String {
     let scaled = value as f64 / per_unit;
     if scaled.fract().abs() < 0.05 {
         format!("{scaled:.0}")
     } else {
         format!("{scaled:.1}")
+    }
+}
+
+/// What the numbers up an axis are counting, said once and in the unit they
+/// are scaled to. A count of tasks is already its own unit, so naming it twice
+/// only adds noise.
+fn measure_title(basis: Basis, what: &str, peak: i64) -> String {
+    match basis {
+        Basis::Count => format!("tasks {what}"),
+        Basis::Work => format!("work {what} ({})", basis.axis_unit(peak).0),
     }
 }
 
@@ -836,16 +1114,17 @@ fn Axes(
     plot_w: f64,
     plot_h: f64,
     peak: i64,
-    dates: Vec<chrono::NaiveDate>,
-    unit: String,
+    dates: Vec<NaiveDate>,
+    basis: Basis,
+    what: String,
 ) -> Element {
     let plot = Plot::new(plot_w, plot_h);
     let steps = 4;
-    let (unit_name, per_unit) = axis_unit(peak);
+    let (_, per_unit) = basis.axis_unit(peak);
 
     // Six dates at most: more overlap and stop being readable.
     let stride = (dates.len() / 5).max(1);
-    let ticks: Vec<(usize, chrono::NaiveDate)> = dates
+    let ticks: Vec<(usize, NaiveDate)> = dates
         .iter()
         .enumerate()
         .filter(|(index, _)| index % stride == 0)
@@ -914,13 +1193,41 @@ fn Axes(
                 class: "axis-title",
                 transform: "rotate(-90 11 {plot.top + plot.inner_h() / 2.0})",
                 text_anchor: "middle",
-                "{unit} ({unit_name})"
+                "{measure_title(basis, &what, peak)}"
             }
         }
     }
 }
 
-/// A report page: the figures first, then the chart, then the detail.
+/// The line marking the day the report is written against, so that the actual
+/// series stopping there reads as "nothing has happened yet" rather than as a
+/// chart that gave up.
+#[component]
+fn StatusRule(plot_w: f64, plot_h: f64, index: usize, count: usize, peak: i64) -> Element {
+    let plot = Plot::new(plot_w, plot_h);
+    let (x, _) = plot.point(index, count, 0, peak);
+    rsx! {
+        g { class: "status-rule",
+            line {
+                x1: "{x:.1}", y1: "{plot.top}", x2: "{x:.1}", y2: "{plot.top + plot.inner_h()}",
+                stroke: "var(--contextual)", stroke_width: "1", stroke_dasharray: "3 3",
+            }
+            text {
+                x: "{x - 4.0:.1}", y: "{plot.top + 9.0}",
+                text_anchor: "end", class: "axis-label",
+                "status date"
+            }
+        }
+    }
+}
+
+/// Said when there is nothing to draw, rather than drawing empty axes and
+/// leaving the reader to wonder what went wrong.
+#[component]
+fn ChartNote(text: String) -> Element {
+    rsx! { p { class: "rep-chart-note", "{text}" } }
+}
+
 /// A report page: the figures first, then the chart, then the detail.
 ///
 /// A chart on its own says a shape but not a number, which is why each of
@@ -941,7 +1248,6 @@ pub fn ReportPage(kind: ViewKind) -> Element {
     }
 
     let metrics = aop_core::agile::metrics(project, s.iteration_days);
-    let basis = metrics.basis.label();
 
     // Measured rather than assumed. A fixed coordinate space is centred in
     // whatever room it is given, which left the plot stranded in the middle of
@@ -964,9 +1270,9 @@ pub fn ReportPage(kind: ViewKind) -> Element {
                 }
             },
             match kind {
-                ViewKind::Burndown => rsx! { BurndownPage { metrics: metrics.clone(), w, h, basis } },
-                ViewKind::Burnup => rsx! { BurnupPage { metrics: metrics.clone(), w, h, basis } },
-                ViewKind::Velocity => rsx! { VelocityPage { metrics: metrics.clone(), basis } },
+                ViewKind::Burndown => rsx! { BurndownPage { metrics: metrics.clone(), w, h } },
+                ViewKind::Burnup => rsx! { BurnupPage { metrics: metrics.clone(), w, h } },
+                ViewKind::Velocity => rsx! { VelocityPage { metrics: metrics.clone() } },
                 _ => rsx! { CriticalPathPage {} },
             }
         }
@@ -988,156 +1294,200 @@ fn Figures(cells: Vec<(String, String)>) -> Element {
     }
 }
 
+/// How far off the plan the page is, in words, from the one drift figure.
+fn against_plan(metrics: &Metrics) -> String {
+    use std::cmp::Ordering;
+    let drift = metrics.against_plan();
+    match drift.cmp(&0) {
+        Ordering::Equal => "on plan".into(),
+        Ordering::Greater => format!("{} behind", metrics.basis.format(drift)),
+        Ordering::Less => format!("{} ahead", metrics.basis.format(-drift)),
+    }
+}
+
 #[component]
-fn BurndownPage(
-    metrics: aop_core::agile::Metrics,
-    w: f64,
-    h: f64,
-    basis: &'static str,
-) -> Element {
+fn BurndownPage(metrics: Metrics, w: f64, h: f64) -> Element {
+    let basis = metrics.basis;
     let peak = nice_peak(
         metrics
             .points
             .iter()
-            .map(|p| p.remaining_minutes.max(p.ideal_remaining_minutes))
+            .map(|p| p.remaining.unwrap_or(0).max(p.ideal_remaining))
             .max()
             .unwrap_or(1),
     );
-    let remaining: Vec<i64> = metrics.points.iter().map(|p| p.remaining_minutes).collect();
-    let ideal: Vec<i64> = metrics.points.iter().map(|p| p.ideal_remaining_minutes).collect();
-    let dates: Vec<chrono::NaiveDate> = metrics.points.iter().map(|p| p.date).collect();
+    // The ideal runs the length of the plan; the actual stops at the status
+    // date, because past it nothing has had the chance to happen.
+    let ideal: Vec<i64> = metrics.points.iter().map(|p| p.ideal_remaining).collect();
+    let actual: Vec<i64> = metrics.points.iter().filter_map(|p| p.remaining).collect();
+    let dates: Vec<NaiveDate> = metrics.points.iter().map(|p| p.date).collect();
     let plot = Plot::new(w, h);
-
-    // Where the plan stands against where it planned to be.
-    let drift = metrics
+    let status_index = metrics
         .points
-        .last()
-        .map(|_| {
-            let today = chrono::Local::now().naive_local().date();
-            metrics
-                .points
-                .iter()
-                .find(|p| p.date >= today)
-                .map(|p| p.remaining_minutes - p.ideal_remaining_minutes)
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
+        .iter()
+        .position(|p| p.date == metrics.status_date);
+
+    let comparison = if metrics.ideal_from_baseline {
+        "The ideal line is the baseline's own remaining curve, stepping down on the dates the baseline said each task would finish."
+    } else {
+        "No baseline has been taken, so the ideal line is a straight run from the total to zero. Set a baseline to compare against what was planned."
+    };
 
     rsx! {
         div { class: "rep-head",
             h1 { class: "rep-title", "Burndown" }
             p { class: "rep-sub",
-                "{basis} still to do, against a plan running exactly to schedule. The ideal line follows the baseline when one has been set." }
+                "{basis.label()} still to do, day by day. The actual line stops at the status date: nothing after it has happened yet. {comparison}" }
         }
         Figures { cells: vec![
-            ("Total".into(), aop_core::format_duration(metrics.total_minutes)),
-            ("Remaining".into(), aop_core::format_duration(metrics.remaining_minutes())),
+            ("Total".into(), basis.format(metrics.total)),
+            ("Remaining".into(), basis.format(metrics.remaining())),
             ("Complete".into(), format!("{:.0}%", metrics.percent_complete())),
-            ("Against plan".into(), if drift > 0 {
-                format!("{} behind", aop_core::format_duration(drift))
-            } else if drift < 0 {
-                format!("{} ahead", aop_core::format_duration(-drift))
-            } else { "on plan".into() }),
+            ("Against plan".into(), against_plan(&metrics)),
         ] }
         div { class: "rep-chart-box",
             svg { class: "report-chart", view_box: "0 0 {w} {h}", width: "100%", height: "{h}",
-                Axes { plot_w: w, plot_h: h, peak, dates: dates.clone(),
-                    unit: format!("{basis} remaining") }
+                Axes { plot_w: w, plot_h: h, peak, dates: dates.clone(), basis,
+                    what: "remaining".to_string() }
+                if let Some(index) = status_index {
+                    StatusRule { plot_w: w, plot_h: h, index, count: dates.len(), peak }
+                }
                 polyline { points: "{plot.path(&ideal, peak)}", fill: "none",
                     stroke: "var(--ink-faint)", stroke_width: "1.5", stroke_dasharray: "5 4" }
-                polyline { points: "{plot.path(&remaining, peak)}", fill: "none",
+                polyline { points: "{plot.partial_path(&actual, dates.len(), peak)}", fill: "none",
                     stroke: "var(--accent-bright)", stroke_width: "2.5" }
+            }
+            if dates.len() < 2 {
+                ChartNote { text: "The plan is one day long, so there is no line to draw across it yet. The figures above are the whole story.".to_string() }
+            } else if actual.len() < 2 {
+                ChartNote { text: "The status date is on or before the plan's first day, so there is no progress to draw yet.".to_string() }
             }
             div { class: "report-legend",
                 span { span { class: "sw ideal" } "Ideal" }
                 span { span { class: "sw actual" } "Remaining" }
             }
         }
-        IterationTable { metrics }
+        BurndownTable { metrics }
     }
 }
 
 #[component]
-fn BurnupPage(
-    metrics: aop_core::agile::Metrics,
-    w: f64,
-    h: f64,
-    basis: &'static str,
-) -> Element {
-    let peak = nice_peak(metrics.points.iter().map(|p| p.scope_minutes).max().unwrap_or(1));
-    let done: Vec<i64> = metrics.points.iter().map(|p| p.completed_minutes).collect();
-    let scope: Vec<i64> = metrics.points.iter().map(|p| p.scope_minutes).collect();
-    let dates: Vec<chrono::NaiveDate> = metrics.points.iter().map(|p| p.date).collect();
+fn BurnupPage(metrics: Metrics, w: f64, h: f64) -> Element {
+    let basis = metrics.basis;
+    let peak = nice_peak(metrics.points.iter().map(|p| p.scope).max().unwrap_or(1));
+    let done: Vec<i64> = metrics.points.iter().filter_map(|p| p.completed).collect();
+    let scope: Vec<i64> = metrics.points.iter().map(|p| p.scope).collect();
+    let dates: Vec<NaiveDate> = metrics.points.iter().map(|p| p.date).collect();
     let plot = Plot::new(w, h);
+    let status_index = metrics
+        .points
+        .iter()
+        .position(|p| p.date == metrics.status_date);
+
+    // The one scope movement that can be shown without a history of the plan.
+    let fourth = match metrics.scope_change() {
+        Some(0) => ("Since baseline".into(), "unchanged".to_string()),
+        Some(change) if change > 0 => ("Since baseline".into(), format!("{} added", basis.format(change))),
+        Some(change) => ("Since baseline".into(), format!("{} dropped", basis.format(-change))),
+        None => (
+            "Forecast finish".into(),
+            metrics
+                .projected_finish
+                .map(|d| d.format("%d %b %Y").to_string())
+                .unwrap_or_else(|| "not yet".into()),
+        ),
+    };
 
     rsx! {
         div { class: "rep-head",
             h1 { class: "rep-title", "Burnup" }
             p { class: "rep-sub",
-                "{basis} completed rising towards the total. Drawn beside a burndown because this one shows scope being added, which a burndown hides." }
+                "{basis.label()} completed, rising towards the plan's total. The scope line is that total as it stands today: no record is kept of when scope was added, so it cannot rise part way along. What the plan has gained or lost since the baseline is the figure beside it." }
         }
         Figures { cells: vec![
-            ("Scope".into(), aop_core::format_duration(metrics.total_minutes)),
-            ("Completed".into(), aop_core::format_duration(metrics.completed_minutes)),
-            ("Remaining".into(), aop_core::format_duration(metrics.remaining_minutes())),
-            ("Forecast finish".into(), metrics.projected_finish
-                .map(|d| d.format("%d %b %Y").to_string())
-                .unwrap_or_else(|| "not yet".into())),
+            ("Scope".into(), basis.format(metrics.total)),
+            ("Completed".into(), basis.format(metrics.completed)),
+            ("Remaining".into(), basis.format(metrics.remaining())),
+            fourth,
         ] }
         div { class: "rep-chart-box",
             svg { class: "report-chart", view_box: "0 0 {w} {h}", width: "100%", height: "{h}",
-                Axes { plot_w: w, plot_h: h, peak, dates: dates.clone(),
-                    unit: format!("{basis} done") }
+                Axes { plot_w: w, plot_h: h, peak, dates: dates.clone(), basis,
+                    what: "done".to_string() }
+                if let Some(index) = status_index {
+                    StatusRule { plot_w: w, plot_h: h, index, count: dates.len(), peak }
+                }
                 polyline { points: "{plot.path(&scope, peak)}", fill: "none",
                     stroke: "var(--ink-faint)", stroke_width: "1.5" }
-                polyline { points: "{plot.path(&done, peak)}", fill: "none",
+                polyline { points: "{plot.partial_path(&done, dates.len(), peak)}", fill: "none",
                     stroke: "var(--bar-progress)", stroke_width: "2.5" }
+            }
+            if dates.len() < 2 {
+                ChartNote { text: "The plan is one day long, so there is no line to draw across it yet. The figures above are the whole story.".to_string() }
+            } else if done.len() < 2 {
+                ChartNote { text: "The status date is on or before the plan's first day, so there is nothing completed to draw yet.".to_string() }
             }
             div { class: "report-legend",
                 span { span { class: "sw scope" } "Scope" }
                 span { span { class: "sw done" } "Completed" }
             }
         }
-        IterationTable { metrics }
+        BurnupTable { metrics }
     }
 }
 
 #[component]
-fn VelocityPage(metrics: aop_core::agile::Metrics, basis: &'static str) -> Element {
-    let fastest = metrics
+fn VelocityPage(metrics: Metrics) -> Element {
+    let basis = metrics.basis;
+    let today = metrics.status_date;
+    // A velocity chart shows the iterations that have happened. One that has
+    // not started yet has no velocity to report, only a plan.
+    let shown: Vec<Iteration> = metrics
         .iterations
         .iter()
-        .map(|i| i.planned_minutes.max(i.completed_minutes))
+        .filter(|iteration| iteration.start <= today)
+        .cloned()
+        .collect();
+    let fastest = shown
+        .iter()
+        .map(|i| i.planned.max(i.completed))
         .max()
         .unwrap_or(1)
+        .max(metrics.average_velocity)
         .max(1);
-    let today = chrono::Local::now().naive_local().date();
-    let closed = metrics.iterations.iter().filter(|i| i.is_finished(today)).count();
+    let average_height = (metrics.average_velocity as f64 / fastest as f64 * 100.0).min(100.0);
+
+    let cadence = if metrics.iterations_declared {
+        "Iterations are the sprints the plan declares."
+    } else {
+        "The plan declares no sprints, so iterations are fixed windows from its start."
+    };
 
     rsx! {
         div { class: "rep-head",
             h1 { class: "rep-title", "Velocity" }
             p { class: "rep-sub",
-                "{basis} completed per iteration. A planning aid for forecasting the next one, not a measure of anybody's productivity. Only finished iterations count towards the average." }
+                "{basis.label()} delivered per iteration. Only tasks reported finished count, because a task half done was not delivered, and each is credited to the iteration its actual finish falls in, or its scheduled finish where the plan records no actual. A planning aid for forecasting the next iteration, not a measure of anybody's productivity. {cadence}" }
         }
         Figures { cells: vec![
-            ("Average".into(), aop_core::format_duration(metrics.average_velocity_minutes)),
-            ("Iterations".into(), format!("{} of {}", closed, metrics.iterations.len())),
-            ("Remaining".into(), aop_core::format_duration(metrics.remaining_minutes())),
+            ("Average".into(), basis.format(metrics.average_velocity)),
+            ("Iterations".into(), format!("{} of {} closed", metrics.closed_iterations(), metrics.iterations.len())),
+            ("Not yet finished".into(), basis.format(metrics.incomplete)),
             ("Forecast finish".into(), metrics.projected_finish
                 .map(|d| d.format("%d %b %Y").to_string())
                 .unwrap_or_else(|| "not yet".into())),
         ] }
         div { class: "rep-chart-box",
             div { class: "velocity tall",
-                // The scale, so a bar can be read as a quantity rather than
-                // only compared with the bar beside it.
+                // What the bars are counting, so a bar can be read as a
+                // quantity rather than only against the bar beside it.
+                div { class: "vel-title", "{measure_title(basis, \"delivered\", fastest)}" }
                 div { class: "vel-axis",
                     for step in 0..=4 {
                         {
                             let value = fastest * step / 4;
                             let from_bottom = step as f64 / 4.0 * 100.0;
-                            let (_, per_unit) = axis_unit(fastest);
+                            let (_, per_unit) = basis.axis_unit(fastest);
                             rsx! {
                                 span { key: "vt{step}", class: "vel-tick",
                                     style: "bottom: {from_bottom}%;",
@@ -1155,44 +1505,137 @@ fn VelocityPage(metrics: aop_core::agile::Metrics, basis: &'static str) -> Eleme
                         }
                     }
                 }
-                for iteration in metrics.iterations.iter() {
+                for iteration in shown.iter() {
                     {
-                        let planned = (iteration.planned_minutes as f64 / fastest as f64 * 100.0).min(100.0);
-                        let done = (iteration.completed_minutes as f64 / fastest as f64 * 100.0).min(100.0);
+                        let planned = (iteration.planned as f64 / fastest as f64 * 100.0).min(100.0);
+                        let done = (iteration.completed as f64 / fastest as f64 * 100.0).min(100.0);
+                        let running = if iteration.is_running(today) { " running" } else { "" };
                         rsx! {
                             div { key: "v{iteration.number}", class: "vel-col",
-                                title: "{iteration.start} to {iteration.end}",
+                                title: "{iteration.name}: {iteration.start} to {iteration.end}",
                                 div { class: "vel-stack",
                                     div { class: "vel-planned", style: "height: {planned}%;" }
-                                    div { class: "vel-done", style: "height: {done}%;" }
+                                    div { class: "vel-done{running}", style: "height: {done}%;" }
                                 }
                                 span { class: "vel-label", "{iteration.number}" }
                             }
                         }
                     }
                 }
+                // The average is the one line a velocity chart is read against.
+                if metrics.average_velocity > 0 {
+                    div { class: "vel-average", style: "bottom: calc({average_height}% + 16px);" }
+                }
+            }
+            if shown.is_empty() {
+                ChartNote { text: "No iteration has started yet, so there is no velocity to show.".to_string() }
             }
             div { class: "report-legend",
                 span { span { class: "sw planned" } "Planned" }
-                span { span { class: "sw done" } "Completed" }
+                span { span { class: "sw done" } "Delivered" }
+                span { span { class: "sw average" } "Average" }
             }
         }
         IterationTable { metrics }
     }
 }
 
-/// The rows behind the chart. A report without them is only a picture.
+/// The rows behind the burndown. A burndown is a daily chart, so its table is
+/// the daily burn rather than a summary by iteration.
 #[component]
-fn IterationTable(metrics: aop_core::agile::Metrics) -> Element {
-    let today = chrono::Local::now().naive_local().date();
+fn BurndownTable(metrics: Metrics) -> Element {
+    let basis = metrics.basis;
+    // Only the days the actual line covers: the ideal runs on past the status
+    // date, but a row of it beside an empty Remaining says nothing.
+    let rows: Vec<(NaiveDate, i64, i64)> = metrics
+        .points
+        .iter()
+        .filter_map(|p| p.remaining.map(|remaining| (p.date, remaining, p.ideal_remaining)))
+        .collect();
+
+    rsx! {
+        h2 { class: "rep-section", "Day by day, to the status date" }
+        table { class: "rep-table",
+            thead {
+                tr {
+                    th { "Date" }
+                    th { class: "n", "Remaining" }
+                    th { class: "n", "Ideal" }
+                    th { class: "n", "Variance" }
+                }
+            }
+            tbody {
+                for (date, remaining, ideal) in rows.iter() {
+                    {
+                        let variance = remaining - ideal;
+                        rsx! {
+                            tr { key: "d{date}",
+                                td { "{date.format(\"%d %b %Y\")}" }
+                                td { class: "n", "{basis.format(*remaining)}" }
+                                td { class: "n", "{basis.format(*ideal)}" }
+                                td { class: "n",
+                                    if variance == 0 { "on plan" }
+                                    else if variance > 0 { "{basis.format(variance)} behind" }
+                                    else { "{basis.format(-variance)} ahead" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The rows behind the burnup, on the same daily footing.
+#[component]
+fn BurnupTable(metrics: Metrics) -> Element {
+    let basis = metrics.basis;
+    let rows: Vec<(NaiveDate, i64, i64, i64)> = metrics
+        .points
+        .iter()
+        .filter_map(|p| Some((p.date, p.completed?, p.remaining?, p.scope)))
+        .collect();
+
+    rsx! {
+        h2 { class: "rep-section", "Day by day, to the status date" }
+        table { class: "rep-table",
+            thead {
+                tr {
+                    th { "Date" }
+                    th { class: "n", "Completed" }
+                    th { class: "n", "Remaining" }
+                    th { class: "n", "Scope" }
+                }
+            }
+            tbody {
+                for (date, done, remaining, scope) in rows.iter() {
+                    tr { key: "u{date}",
+                        td { "{date.format(\"%d %b %Y\")}" }
+                        td { class: "n", "{basis.format(*done)}" }
+                        td { class: "n", "{basis.format(*remaining)}" }
+                        td { class: "n", "{basis.format(*scope)}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The rows behind the velocity chart. A report without them is only a
+/// picture.
+#[component]
+fn IterationTable(metrics: Metrics) -> Element {
+    let basis = metrics.basis;
+    let today = metrics.status_date;
     rsx! {
         h2 { class: "rep-section", "By iteration" }
         table { class: "rep-table",
             thead {
                 tr {
-                    th { "#" } th { "From" } th { "To" }
-                    th { class: "n", "Tasks" } th { class: "n", "Done" }
-                    th { class: "n", "Planned" } th { class: "n", "Completed" }
+                    th { "#" } th { "Iteration" } th { "From" } th { "To" }
+                    th { class: "n", "Tasks" } th { class: "n", "Finished" }
+                    th { class: "n", "Planned" } th { class: "n", "Delivered" }
                     th { "Status" }
                 }
             }
@@ -1200,16 +1643,17 @@ fn IterationTable(metrics: aop_core::agile::Metrics) -> Element {
                 for iteration in metrics.iterations.iter() {
                     tr { key: "r{iteration.number}",
                         td { "{iteration.number}" }
+                        td { "{iteration.name}" }
                         td { "{iteration.start.format(\"%d %b %Y\")}" }
                         td { "{iteration.end.format(\"%d %b %Y\")}" }
                         td { class: "n", "{iteration.planned_tasks}" }
                         td { class: "n", "{iteration.completed_tasks}" }
-                        td { class: "n", "{aop_core::format_duration(iteration.planned_minutes)}" }
-                        td { class: "n", "{aop_core::format_duration(iteration.completed_minutes)}" }
+                        td { class: "n", "{basis.format(iteration.planned)}" }
+                        td { class: "n", "{basis.format(iteration.completed)}" }
                         td {
                             if iteration.is_finished(today) { "Closed" }
-                            else if iteration.start <= today { "In progress" }
-                            else { "Ahead" }
+                            else if iteration.is_running(today) { "In progress" }
+                            else { "Not started" }
                         }
                     }
                 }

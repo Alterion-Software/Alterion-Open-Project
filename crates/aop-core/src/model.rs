@@ -375,6 +375,35 @@ pub struct Task {
     pub baseline: Option<Baseline>,
     #[serde(default)]
     pub scheduled: Scheduled,
+
+    // ---- what really happened -------------------------------------------
+    //
+    // Everything below is defaulted, so a plan saved before any of it existed
+    // opens unchanged, and a plan that tracks nothing but percent complete
+    // carries none of it in the file.
+    /// When work really began. `None` until the task has started.
+    #[serde(default)]
+    pub actual_start: Option<NaiveDateTime>,
+    /// When it really ended. `None` while it is still running.
+    #[serde(default)]
+    pub actual_finish: Option<NaiveDateTime>,
+    /// Work really done, in minutes. Zero means nobody has said, not that
+    /// nothing was done: `reported_actual_work_minutes` derives one instead.
+    #[serde(default)]
+    pub actual_work_minutes: i64,
+    /// Money really spent. Zero means nobody has said, for the same reason.
+    #[serde(default)]
+    pub actual_cost: f64,
+    /// Work still to do, in minutes. Zero means derive it from the rest.
+    #[serde(default)]
+    pub remaining_work_minutes: i64,
+    /// How much of the job is judged done, as opposed to how much of the time
+    /// has gone. Typed by hand, and only meaningful when somebody has.
+    #[serde(default)]
+    pub physical_percent_complete: Option<u8>,
+    /// Which measure of progress earns value. Affects earned value only.
+    #[serde(default)]
+    pub earned_value_method: crate::earned_value::EarnedValueMethod,
 }
 
 impl Task {
@@ -408,6 +437,13 @@ impl Task {
             manual_start: None,
             baseline: None,
             scheduled: Scheduled::default(),
+            actual_start: None,
+            actual_finish: None,
+            actual_work_minutes: 0,
+            actual_cost: 0.0,
+            remaining_work_minutes: 0,
+            physical_percent_complete: None,
+            earned_value_method: crate::earned_value::EarnedValueMethod::default(),
         }
     }
 
@@ -443,6 +479,60 @@ impl Task {
     pub fn finish_variance_minutes(&self, calendar: &WorkCalendar) -> Option<i64> {
         self.baseline
             .map(|b| calendar.work_minutes_between(b.finish, self.scheduled.finish))
+    }
+
+    // ---- actuals --------------------------------------------------------
+
+    /// Whether any work has been reported against this task at all.
+    ///
+    /// A plan that tracks nothing but percent complete never fills in an actual
+    /// start, so progress on its own counts as having begun.
+    pub fn has_started(&self) -> bool {
+        self.actual_start.is_some() || self.percent_complete > 0
+    }
+
+    /// What has really been spent.
+    ///
+    /// Nothing typed in falls back to what the reported progress implies about
+    /// the scheduled cost. Treating a zero as "not entered" rather than as
+    /// "free" is the pragmatic reading: a task nobody has costed is far more
+    /// common than one that truly cost nothing, and a plan whose only progress
+    /// input is percent complete would otherwise report every actual as nil.
+    pub fn reported_actual_cost(&self) -> f64 {
+        if self.actual_cost != 0.0 {
+            return self.actual_cost;
+        }
+        self.scheduled.cost * self.percent_complete as f64 / 100.0
+    }
+
+    /// Work really done, derived from progress when nobody has said.
+    pub fn reported_actual_work_minutes(&self) -> i64 {
+        if self.actual_work_minutes != 0 {
+            return self.actual_work_minutes;
+        }
+        self.scheduled.work_minutes * self.percent_complete as i64 / 100
+    }
+
+    /// Work still to do. A typed figure wins, because a planner who has
+    /// re-estimated the remainder knows something the subtraction does not.
+    pub fn remaining_work(&self) -> i64 {
+        if self.remaining_work_minutes != 0 {
+            return self.remaining_work_minutes;
+        }
+        (self.scheduled.work_minutes - self.reported_actual_work_minutes()).max(0)
+    }
+
+    /// The progress figure earned value should read for this task.
+    pub fn earned_percent(&self) -> u8 {
+        match self.earned_value_method {
+            crate::earned_value::EarnedValueMethod::PercentComplete => self.percent_complete,
+            // Switching the method is one action and typing a figure is
+            // another. Falling back stops a task earning nothing merely
+            // because only the first of the two has happened yet.
+            crate::earned_value::EarnedValueMethod::PhysicalPercentComplete => self
+                .physical_percent_complete
+                .unwrap_or(self.percent_complete),
+        }
     }
 }
 

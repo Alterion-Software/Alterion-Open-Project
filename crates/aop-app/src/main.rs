@@ -676,6 +676,7 @@ fn Workspace(view: ViewKind) -> Element {
                             }
                         },
                         ViewKind::TaskUsage => rsx! { views::TaskUsage {} },
+                        ViewKind::ResourceUsage => rsx! { views::ResourceUsage {} },
                         ViewKind::NetworkDiagram => rsx! { views::NetworkDiagram {} },
                         ViewKind::CalendarView => rsx! { views::CalendarView {} },
                         ViewKind::Burndown

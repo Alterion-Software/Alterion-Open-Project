@@ -8,6 +8,7 @@ pub mod calendar;
 pub mod custom;
 pub mod draw;
 pub mod duration;
+pub mod earned_value;
 pub mod excel;
 pub mod fields;
 pub mod grouping;
