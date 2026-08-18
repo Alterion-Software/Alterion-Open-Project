@@ -16,6 +16,13 @@ use std::path::PathBuf;
 use crate::theme::ThemeChoice;
 
 /// Everything remembered between sessions.
+/// Where Alterion's own identity provider lives. Only a default: the whole
+/// point of the setting is that it can point somewhere else.
+pub const DEFAULT_IDP: &str = "https://auth.coraldune.cloud";
+
+/// What this application calls itself when signing in.
+pub const DEFAULT_CLIENT_ID: &str = "alterion-open-project";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub user_name: String,
@@ -42,6 +49,18 @@ pub struct Settings {
     /// Whether annotation shapes are drawn over the chart. A per view choice
     /// in Project too, kept with the planner rather than in the plan.
     pub show_drawings: bool,
+
+    // ---- Alterion Collaborate -------------------------------------------
+    /// Where the identity provider lives. Everything else about it is read
+    /// from its own discovery document, so somebody running their own only
+    /// changes this one line.
+    pub idp_issuer: String,
+    /// How this application identifies itself to that provider. Not a secret:
+    /// a desktop application is a public client and proves itself with PKCE
+    /// rather than with something it would have to hide on disk.
+    pub idp_client_id: String,
+    /// Whether to offer signing in and syncing at all.
+    pub collaborate: bool,
     /// Only the bindings the user has changed. Defaults are left out so a later
     /// release can improve one and have it reach anyone who never touched it.
     pub keys: crate::keymap::Keymap,
@@ -64,6 +83,11 @@ impl Default for Settings {
             show_links: true,
             bar_text: true,
             show_drawings: true,
+            idp_issuer: DEFAULT_IDP.to_string(),
+            idp_client_id: DEFAULT_CLIENT_ID.to_string(),
+            // Off until somebody asks for it. A planner who never signs in
+            // should never be shown a sign in button.
+            collaborate: false,
             // Marking the critical path everywhere by default turns the whole
             // plan red, which says nothing about which parts matter.
             show_critical: false,
@@ -115,6 +139,14 @@ impl Settings {
              show_links = {}\n\
              bar_text = {}\n\
              show_drawings = {}\n\
+             \n\
+             [collaborate]\n\
+             # The identity provider to sign in against. Self hosted providers\n\
+             # work by changing this alone: everything else is read from its\n\
+             # own discovery document.\n\
+             collaborate = {}\n\
+             idp_issuer = {}\n\
+             idp_client_id = {}\n\
              {}",
             self.user_name,
             self.user_initials,
@@ -131,6 +163,9 @@ impl Settings {
             self.show_links,
             self.bar_text,
             self.show_drawings,
+            self.collaborate,
+            self.idp_issuer,
+            self.idp_client_id,
             self.keyboard_section(),
         )
     }
@@ -217,6 +252,13 @@ impl Settings {
         settings.show_links = flag("show_links", settings.show_links);
         settings.bar_text = flag("bar_text", settings.bar_text);
         settings.show_drawings = flag("show_drawings", settings.show_drawings);
+        settings.collaborate = flag("collaborate", settings.collaborate);
+        if let Some(value) = text_of("idp_issuer").filter(|v| !v.trim().is_empty()) {
+            settings.idp_issuer = value;
+        }
+        if let Some(value) = text_of("idp_client_id").filter(|v| !v.trim().is_empty()) {
+            settings.idp_client_id = value;
+        }
 
         settings
     }
@@ -279,6 +321,9 @@ mod tests {
             show_links: false,
             bar_text: false,
             show_drawings: false,
+            idp_issuer: "https://auth.example.test".into(),
+            idp_client_id: "a-client".into(),
+            collaborate: true,
             keys: {
                 let mut keys = crate::keymap::Keymap::default();
                 keys.bind(crate::keymap::Action::SetBaseline, "Ctrl+B");

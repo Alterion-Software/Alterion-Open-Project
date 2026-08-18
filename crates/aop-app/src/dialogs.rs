@@ -52,6 +52,7 @@ pub fn DialogHost(dialog: Dialog) -> Element {
                     Dialog::CustomFields => rsx! { CustomFieldsDialog {} },
                     Dialog::ExternalDependencies => rsx! { ExternalDependenciesDialog {} },
                     Dialog::InsertColumn(at) => rsx! { InsertColumn { at } },
+                    Dialog::History => rsx! { HistoryDialog {} },
                     Dialog::UnsavedChanges(action) => rsx! { UnsavedChanges { action } },
                     Dialog::Recover(found) => rsx! { Recover { found } },
                     Dialog::Message { title, body } => rsx! { MessageBox { title, body } },
@@ -880,6 +881,102 @@ fn LinksBetweenProjects() -> Element {
         div { class: "dlg-foot",
             button { class: "btn", onclick: move |_| state.write().dialog = Some(Dialog::ExternalDependencies),
                 "External Dependencies" }
+            button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Close" }
+        }
+    }
+}
+
+// ------------------------------------------------------------- change log
+
+/// Everything that has been done to this plan, newest first.
+///
+/// The command each entry holds is shown beside the sentence about it, because
+/// the command is the part that replays and the part a planner can check. A
+/// summary on its own would be a description of the plan's history rather than
+/// the history itself.
+#[component]
+fn HistoryDialog() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    // How many entries the panel will show at once. A long session runs to
+    // thousands, and a list nobody can scroll to the end of is not a list.
+    const SHOWN: usize = 250;
+
+    let (entries, kept, unsent) = {
+        let s = state.read();
+        let log = &s.project.history;
+        let entries: Vec<(u64, String, String, String, String, usize)> = log
+            .recent(SHOWN)
+            .map(|change| {
+                (
+                    change.id,
+                    change.at.format("%Y-%m-%d %H:%M").to_string(),
+                    change.author.clone(),
+                    change.summary.clone(),
+                    change.first_line().to_string(),
+                    change.command_count(),
+                )
+            })
+            .collect();
+        (entries, log.len(), log.unsent().len())
+    };
+
+    rsx! {
+        Head { title: "Change Log".to_string() }
+        div { class: "dlg-body", style: "min-width: 760px; max-height: 62vh; overflow-y: auto;",
+            div { class: "hint", style: "margin: 0 0 12px;",
+                "Every edit made to this plan, newest first, kept as the command that made it. The command is what a replay runs and what the panel shows, so what is stored and what is read are the same thing."
+            }
+
+            div { class: "hist-tally",
+                span { "{kept} change(s) recorded" }
+                span { class: "hist-unsent",
+                    "{unsent} not yet copied to a server"
+                }
+            }
+            p { class: "hint", style: "margin-top: 4px;",
+                "Nothing sends them anywhere yet. The count is here because it is the work a shared plan would have to catch up on."
+            }
+
+            if entries.is_empty() {
+                p { class: "hint", "Nothing has been changed in this plan yet." }
+            } else {
+                table { class: "assign-table", style: "margin-top: 12px;",
+                    thead {
+                        tr {
+                            th { style: "width: 128px;", "When" }
+                            th { style: "width: 132px;", "Who" }
+                            th { "What it did" }
+                            th { style: "width: 250px;", "Command" }
+                        }
+                    }
+                    tbody {
+                        for (id, when, who, what, command, count) in entries.iter() {
+                            tr { key: "{id}",
+                                td { class: "hist-when", "{when}" }
+                                td { "{who}" }
+                                td { "{what}" }
+                                td { class: "hist-cmd",
+                                    "{command}"
+                                    if *count > 1 {
+                                        // One entry, several commands: a
+                                        // grouped step was one thing the
+                                        // planner did.
+                                        span { class: "hist-more", " and {count - 1} more" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if kept > entries.len() {
+                    p { class: "hint",
+                        "Showing the most recent {entries.len()} of {kept}."
+                    }
+                }
+            }
+        }
+        div { class: "dlg-foot",
             button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Close" }
         }
     }

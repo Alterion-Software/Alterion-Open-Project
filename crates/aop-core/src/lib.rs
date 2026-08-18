@@ -12,6 +12,7 @@ pub mod earned_value;
 pub mod excel;
 pub mod fields;
 pub mod grouping;
+pub mod history;
 pub mod issues;
 pub mod leveling;
 pub mod model;

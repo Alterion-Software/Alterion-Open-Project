@@ -17,6 +17,7 @@ use aop_core::{
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 
 use crate::gantt::{bar_edges, chart_range, Scale, ROW_H};
+use crate::macros::cmd::{Cmd, ResourceField, Row, ViewOption};
 
 const UNDO_LIMIT: usize = 60;
 
@@ -190,18 +191,20 @@ pub enum OptionsPage {
     Schedule,
     Save,
     Advanced,
+    Collaborate,
     Keyboard,
     CustomizeRibbon,
     QuickAccess,
 }
 
 impl OptionsPage {
-    pub const ORDER: [OptionsPage; 8] = [
+    pub const ORDER: [OptionsPage; 9] = [
         OptionsPage::General,
         OptionsPage::Display,
         OptionsPage::Schedule,
         OptionsPage::Save,
         OptionsPage::Advanced,
+        OptionsPage::Collaborate,
         OptionsPage::Keyboard,
         OptionsPage::CustomizeRibbon,
         OptionsPage::QuickAccess,
@@ -214,6 +217,7 @@ impl OptionsPage {
             OptionsPage::Schedule => "Schedule",
             OptionsPage::Save => "Save",
             OptionsPage::Advanced => "Advanced",
+            OptionsPage::Collaborate => "Alterion Collaborate",
             OptionsPage::Keyboard => "Keyboard",
             OptionsPage::CustomizeRibbon => "Customize Ribbon",
             OptionsPage::QuickAccess => "Quick Access Toolbar",
@@ -570,6 +574,8 @@ pub enum Dialog {
     Recover(crate::recovery::Recovered),
     /// Pick a field to insert as a column, at the given position.
     InsertColumn(usize),
+    /// Who changed what, and when, newest first.
+    History,
     Message { title: String, body: String },
 }
 
@@ -705,6 +711,20 @@ pub struct AppState {
     macro_depth: u32,
     /// A reschedule was asked for while deferred and is still owed.
     reschedule_owed: bool,
+    /// Commands seen but not yet written into the change log.
+    ///
+    /// Held so a run of them can become one entry: the rows selected before an
+    /// edit belong with it, and everything inside one grouped step is one
+    /// thing the planner did. Each command is kept beside the sentence that
+    /// describes it, worked out while the plan still looked as it did when the
+    /// command was given.
+    pending: Vec<(Cmd, String)>,
+    /// True while a script is being replayed.
+    ///
+    /// The commands a replay carries out were recorded when they were first
+    /// done, and the run writes one entry of its own, so recording them again
+    /// would count the same work twice.
+    replaying: bool,
     /// How the rows are banded, when the planner has asked for that.
     pub group_by: Option<aop_core::grouping::GroupBy>,
     /// The look each category of row gets, before any row's own formatting.
@@ -741,6 +761,12 @@ pub struct AppState {
     pub selected_drawing: Option<DrawingId>,
     pub draw_drag: Option<DrawDrag>,
     pub show_drawings: bool,
+    /// Where to sign in, and as what. Not secret: a desktop application is a
+    /// public client and proves itself with PKCE rather than with anything it
+    /// would have to keep hidden on disk.
+    pub idp_issuer: String,
+    pub idp_client_id: String,
+    pub collaborate: bool,
     /// The row currently being dragged, and where it would land.
     pub drag_row: Option<usize>,
     pub drop_target: Option<(usize, DropWhere)>,
@@ -820,6 +846,8 @@ impl AppState {
             fill_field: None,
             macro_depth: 0,
             reschedule_owed: false,
+            pending: Vec::new(),
+            replaying: false,
             group_by: None,
             text_styles: aop_core::textstyle::TextStyles::new(),
             painter: None,
@@ -845,6 +873,9 @@ impl AppState {
             selected_drawing: None,
             draw_drag: None,
             show_drawings: true,
+            idp_issuer: crate::settings::DEFAULT_IDP.to_string(),
+            idp_client_id: crate::settings::DEFAULT_CLIENT_ID.to_string(),
+            collaborate: false,
             drag_row: None,
             drop_target: None,
             backstage_message: None,
@@ -947,7 +978,12 @@ impl AppState {
 
     fn end_macro(&mut self) {
         self.macro_depth = self.macro_depth.saturating_sub(1);
-        if self.macro_depth == 0 && std::mem::take(&mut self.reschedule_owed) {
+        if self.macro_depth > 0 {
+            return;
+        }
+        // The step has closed, so what it did becomes one entry in the log.
+        self.write_pending();
+        if std::mem::take(&mut self.reschedule_owed) {
             self.reschedule();
         }
     }
@@ -976,29 +1012,182 @@ impl AppState {
         !self.redo.is_empty()
     }
 
+    /// Step back one change, and say in the log that the step was taken back.
+    ///
+    /// An undo is written down rather than quietly deleting the entry it puts
+    /// back. Dropping that entry would leave a log saying the work never
+    /// happened, and a trail that hides removals is not a trail. What the
+    /// entry does not do is describe itself: it names the step being taken
+    /// back, so the panel reads as what became of the plan rather than as a
+    /// list of keys pressed.
     pub fn undo(&mut self) {
-        if let Some(previous) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.project, previous));
-            self.dirty = true;
-            self.clamp_selection();
-            self.reschedule();
-            self.status = "Undo".into();
+        if !self.can_undo() {
+            return;
         }
+        let taken_back = match self.project.history.recent(1).next() {
+            Some(change) if !is_undo_entry(change) => format!("Undid: {}", change.summary),
+            // An undo of an undo moves to an older step, so naming the step the
+            // last entry named would be a lie about what has just happened.
+            _ => "Undid the last change".to_string(),
+        };
+        self.record_as(Cmd::Undo {}, taken_back);
+        self.roll_back();
+        self.status = "Undo".into();
     }
 
     pub fn redo(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.project, next));
-            self.dirty = true;
-            self.clamp_selection();
-            self.reschedule();
-            self.status = "Redo".into();
+        let Some(next) = self.redo.pop() else {
+            return;
+        };
+        let put_back = match self
+            .project
+            .history
+            .recent(1)
+            .next()
+            .and_then(|change| change.summary.strip_prefix("Undid: "))
+        {
+            // The undo said which step it took back, so the redo can say which
+            // step it is putting on again.
+            Some(work) => format!("Redid: {work}"),
+            None => "Redid the last change".to_string(),
+        };
+        self.record_as(Cmd::Redo {}, put_back);
+        let log = std::mem::take(&mut self.project.history);
+        self.undo.push(std::mem::replace(&mut self.project, next));
+        self.project.history = log;
+        self.dirty = true;
+        self.clamp_selection();
+        self.reschedule();
+        self.status = "Redo".into();
+    }
+
+    /// Put the plan back to the last checkpoint without saying anything about
+    /// it.
+    ///
+    /// The rollback a command does when the scheduler refuses what it has just
+    /// been asked for. Nobody asked for an undo, so this is neither written in
+    /// the log nor announced in the status bar; the command that called it
+    /// says what happened instead.
+    fn roll_back(&mut self) {
+        let Some(previous) = self.undo.pop() else {
+            return;
+        };
+        // The log rides inside the plan so that it travels with the file, but
+        // it is not part of what an undo puts back. Rolling it back with
+        // everything else would erase the record of the work being taken out,
+        // which is the one record an audit trail exists to keep.
+        let log = std::mem::take(&mut self.project.history);
+        self.redo.push(std::mem::replace(&mut self.project, previous));
+        self.project.history = log;
+        self.dirty = true;
+        self.clamp_selection();
+        self.reschedule();
+    }
+
+    // ---- the change log -------------------------------------------------
+
+    /// Take note of a command, for the change log and for the macro recorder
+    /// when it is running. One hook, two consumers.
+    ///
+    /// Called at the top of the method that carries the command out, while the
+    /// plan still looks as it did when the command was given: how many rows
+    /// were selected, who was already booked, whether a task was active. Half
+    /// the sentences in the panel are read off the plan, and after the edit
+    /// they would describe the answer rather than the question.
+    fn record(&mut self, cmd: Cmd) {
+        // Checked here as well as in `record_as` so a replay does not pay for
+        // a sentence nobody will read.
+        if self.replaying {
+            return;
         }
+        let summary = describe(&cmd, self);
+        self.record_as(cmd, summary);
+    }
+
+    /// Take note of a command under a sentence the caller has already worked
+    /// out, which an undo needs because only it knows what it took back.
+    fn record_as(&mut self, cmd: Cmd, summary: String) {
+        if self.replaying {
+            return;
+        }
+        // Selecting row 3, then 4, then 5 is one act of selecting, so the last
+        // of a run replaces the ones before it rather than each arrow key
+        // earning its own entry.
+        if is_selecting(&cmd)
+            && self
+                .pending
+                .last()
+                .is_some_and(|(held, _)| is_selecting(held))
+        {
+            self.pending.pop();
+        }
+        self.pending.push((cmd, summary));
+
+        // Inside a grouped step the whole run becomes one entry, written when
+        // the step closes: a fill down over twenty rows is one thing the
+        // planner did, not twenty.
+        if self.macro_depth > 0 {
+            return;
+        }
+        // A selection on its own is held back. Nearly every command acts on
+        // the selection, so the rows are the context that makes the entry
+        // replayable, and they belong in the entry for the edit that follows.
+        if self.pending.iter().all(|(held, _)| is_selecting(held)) {
+            return;
+        }
+        self.write_pending();
+    }
+
+    /// Write everything held back as one entry.
+    fn write_pending(&mut self) {
+        let held = std::mem::take(&mut self.pending);
+        if held.is_empty() {
+            return;
+        }
+        let script = held
+            .iter()
+            .map(|(cmd, _)| cmd.to_script())
+            .collect::<Vec<String>>()
+            .join("\n");
+        let summary = describe_run(&held);
+        self.write_change(script, summary);
+    }
+
+    /// Put one entry in the plan's log, under whoever is at the keyboard.
+    pub(crate) fn write_change(&mut self, script: String, summary: String) {
+        // A blank name is what a fresh install has. Saying so is better than
+        // signing somebody else's work with a guess.
+        let author = match self.user_name.trim() {
+            "" => "Unknown".to_string(),
+            name => name.to_string(),
+        };
+        self.project
+            .history
+            .record(author, script, summary, Local::now().naive_local());
+    }
+
+    /// Carry something out without recording the commands inside it.
+    ///
+    /// Two callers want this. A method built out of other recorded methods, so
+    /// that a cut reads as one act rather than as a copy and then a delete;
+    /// and a macro replay, where every command was recorded when it was first
+    /// done and the run writes a single entry of its own.
+    pub(crate) fn unrecorded<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> T {
+        // Whatever is held belongs to what the planner did by hand, so it is
+        // written first rather than being swept into the run.
+        self.write_pending();
+        let was = std::mem::replace(&mut self.replaying, true);
+        let out = work(self);
+        self.replaying = was;
+        out
     }
 
     // ---- selection ------------------------------------------------------
 
     pub fn select(&mut self, index: usize) {
+        self.record(Cmd::SelectRow {
+            row: Row(index as u32 + 1),
+        });
         self.selected_drawing = None;
         // Selecting a different row abandons any edit in progress; staying on
         // the same row does not, so clicking about inside a cell is safe.
@@ -1010,6 +1199,10 @@ impl AppState {
 
     pub fn extend_selection(&mut self, index: usize) {
         if let Some(&anchor) = self.selection.first() {
+            self.record(Cmd::SelectRows {
+                from: Row(anchor as u32 + 1),
+                to: Row(index as u32 + 1),
+            });
             let (lo, hi) = if anchor <= index {
                 (anchor, index)
             } else {
@@ -1026,6 +1219,9 @@ impl AppState {
     }
 
     pub fn toggle_selection(&mut self, index: usize) {
+        self.record(Cmd::ToggleRow {
+            row: Row(index as u32 + 1),
+        });
         if let Some(position) = self.selection.iter().position(|&i| i == index) {
             self.selection.remove(position);
         } else {
@@ -1077,6 +1273,7 @@ impl AppState {
         self.dirty = false;
         self.undo.clear();
         self.redo.clear();
+        self.pending.clear();
         self.selection = if self.project.tasks.is_empty() {
             Vec::new()
         } else {
@@ -1101,6 +1298,7 @@ impl AppState {
                 self.dirty = false;
                 self.undo.clear();
                 self.redo.clear();
+                self.pending.clear();
                 self.selection = if self.project.tasks.is_empty() {
                     Vec::new()
                 } else {
@@ -1133,6 +1331,7 @@ impl AppState {
                 self.dirty = true;
                 self.undo.clear();
                 self.redo.clear();
+                self.pending.clear();
                 self.selection = if self.project.tasks.is_empty() {
                     Vec::new()
                 } else {
@@ -1167,6 +1366,7 @@ impl AppState {
                 self.dirty = true;
                 self.undo.clear();
                 self.redo.clear();
+                self.pending.clear();
                 self.selection = if self.project.tasks.is_empty() {
                     Vec::new()
                 } else {
@@ -1217,6 +1417,9 @@ impl AppState {
         self.show_links = settings.show_links;
         self.bar_text = settings.bar_text;
         self.show_drawings = settings.show_drawings;
+        self.idp_issuer = settings.idp_issuer.clone();
+        self.idp_client_id = settings.idp_client_id.clone();
+        self.collaborate = settings.collaborate;
         self.keys = settings.keys;
     }
 
@@ -1238,6 +1441,9 @@ impl AppState {
             show_links: self.show_links,
             bar_text: self.bar_text,
             show_drawings: self.show_drawings,
+            idp_issuer: self.idp_issuer.clone(),
+            idp_client_id: self.idp_client_id.clone(),
+            collaborate: self.collaborate,
             keys: self.keys.clone(),
         }
     }
@@ -1421,6 +1627,7 @@ impl AppState {
                 self.dirty = true;
                 self.undo.clear();
                 self.redo.clear();
+                self.pending.clear();
                 self.selection = if self.project.tasks.is_empty() {
                     Vec::new()
                 } else {
@@ -1630,6 +1837,7 @@ impl AppState {
 
     /// Insert a blank task above the selection, the behaviour of the Task button.
     pub fn insert_task(&mut self) {
+        self.record(Cmd::InsertTask {});
         self.checkpoint();
         let at = self.primary().unwrap_or(self.project.tasks.len());
         let id = self.project.insert_task(at, "");
@@ -1645,6 +1853,9 @@ impl AppState {
 
     /// Append a row at the bottom, used when typing into the blank last row.
     pub fn append_task(&mut self, name: &str) -> usize {
+        self.record(Cmd::AppendTask {
+            name: name.to_string(),
+        });
         self.checkpoint();
         let at = self.project.tasks.len();
         let id = self.project.insert_task(at, name);
@@ -1656,6 +1867,7 @@ impl AppState {
     }
 
     pub fn insert_milestone(&mut self) {
+        self.record(Cmd::InsertMilestone {});
         self.checkpoint();
         let at = self.primary().unwrap_or(self.project.tasks.len());
         let id = self.project.insert_task(at, "New milestone");
@@ -1671,6 +1883,7 @@ impl AppState {
 
     /// Insert a summary row and nest the selection underneath it.
     pub fn insert_summary(&mut self) {
+        self.record(Cmd::InsertSummary {});
         self.checkpoint();
         let at = self.primary().unwrap_or(self.project.tasks.len());
         let rows = self.ordered_selection();
@@ -1704,6 +1917,7 @@ impl AppState {
         if self.selection.is_empty() {
             return;
         }
+        self.record(Cmd::DeleteTasks {});
         self.checkpoint();
         let mut rows = self.ordered_selection();
         rows.reverse();
@@ -1719,6 +1933,7 @@ impl AppState {
         if self.selection.is_empty() {
             return;
         }
+        self.record(Cmd::Indent {});
         self.checkpoint();
         for row in self.ordered_selection() {
             self.project.indent(row);
@@ -1730,6 +1945,7 @@ impl AppState {
         if self.selection.is_empty() {
             return;
         }
+        self.record(Cmd::Outdent {});
         self.checkpoint();
         for row in self.ordered_selection() {
             self.project.outdent(row);
@@ -1751,6 +1967,11 @@ impl AppState {
             }
         };
         let Some(target) = target else { return };
+        self.record(if delta < 0 {
+            Cmd::MoveUp {}
+        } else {
+            Cmd::MoveDown {}
+        });
         self.checkpoint();
         self.project.move_task(row, target);
         let landed = if delta < 0 { target } else { target - span };
@@ -1764,6 +1985,7 @@ impl AppState {
             self.status = "Select two or more tasks to link them".into();
             return;
         }
+        self.record(Cmd::Link {});
         self.checkpoint();
         let ids: Vec<_> = self
             .selection
@@ -1775,7 +1997,7 @@ impl AppState {
         }
         self.reschedule();
         if let Some(error) = self.schedule_error() {
-            self.undo();
+            self.roll_back();
             self.dialog = Some(Dialog::Message {
                 title: "Cannot create this link".into(),
                 body: error,
@@ -1789,6 +2011,7 @@ impl AppState {
         if self.selection.is_empty() {
             return;
         }
+        self.record(Cmd::Unlink {});
         self.checkpoint();
         let ids: Vec<_> = self
             .ordered_selection()
@@ -1806,6 +2029,9 @@ impl AppState {
         if self.selection.is_empty() {
             return;
         }
+        self.record(Cmd::SetPercentComplete {
+            percent: percent.min(100),
+        });
         self.checkpoint();
         for row in self.ordered_selection() {
             if self.project.is_summary(row) {
@@ -1823,6 +2049,7 @@ impl AppState {
         if self.selection.is_empty() {
             return;
         }
+        self.record(Cmd::SetTaskMode { mode });
         self.checkpoint();
         for row in self.ordered_selection() {
             let start = self.project.tasks.get(row).map(|t| t.scheduled.start);
@@ -1864,6 +2091,7 @@ impl AppState {
         if self.selection.is_empty() {
             return;
         }
+        self.record(Cmd::RespectLinks {});
         self.checkpoint();
         let mut released = 0;
         for row in self.ordered_selection() {
@@ -1904,6 +2132,7 @@ impl AppState {
         if self.selection.is_empty() {
             return;
         }
+        self.record(Cmd::ToggleActive {});
         self.checkpoint();
         for row in self.ordered_selection() {
             if let Some(task) = self.project.tasks.get_mut(row) {
@@ -1920,12 +2149,22 @@ impl AppState {
     }
 
     pub fn expand_all(&mut self, collapsed: bool) {
+        self.record(if collapsed {
+            Cmd::CollapseAll {}
+        } else {
+            Cmd::ExpandAll {}
+        });
         for task in &mut self.project.tasks {
             task.collapsed = collapsed;
         }
     }
 
     pub fn copy_selected(&mut self) {
+        // Nothing selected copies nothing, and a log that said otherwise would
+        // have a paste in it with no source.
+        if !self.selection.is_empty() {
+            self.record(Cmd::CopyTasks {});
+        }
         self.clipboard = self
             .ordered_selection()
             .iter()
@@ -1935,14 +2174,21 @@ impl AppState {
     }
 
     pub fn cut_selected(&mut self) {
-        self.copy_selected();
-        self.delete_selected();
+        self.record(Cmd::CutTasks {});
+        // A cut is one act. Left to themselves the two calls below would put a
+        // copy and then a delete in the log, which is how it was done and not
+        // what was asked for.
+        self.unrecorded(|state| {
+            state.copy_selected();
+            state.delete_selected();
+        });
     }
 
     pub fn paste(&mut self) {
         if self.clipboard.is_empty() {
             return;
         }
+        self.record(Cmd::PasteTasks {});
         self.checkpoint();
         let at = self.primary().unwrap_or(self.project.tasks.len());
         let rows: Vec<Task> = self.clipboard.clone();
@@ -1991,6 +2237,11 @@ impl AppState {
             return;
         }
 
+        self.record(Cmd::SetField {
+            row: Row(row as u32 + 1),
+            field: field_of(column),
+            value: value.clone(),
+        });
         self.checkpoint();
 
         match column {
@@ -2057,7 +2308,7 @@ impl AppState {
         // A link edit is the one cell that can create a loop; roll it back.
         if column == Column::Predecessors
             && let Some(error) = self.schedule_error() {
-                self.undo();
+                self.roll_back();
                 self.dialog = Some(Dialog::Message {
                     title: "Cannot create this link".into(),
                     body: error,
@@ -2073,6 +2324,14 @@ impl AppState {
         if predecessor == successor {
             return;
         }
+        if let Some(from) = self.row_of(predecessor) {
+            self.record(Cmd::SetLink {
+                row: Row(row as u32 + 1),
+                predecessor: Row(from as u32 + 1),
+                kind,
+                lag_minutes,
+            });
+        }
         self.checkpoint();
         self.project.unlink(predecessor, successor);
         self.project.links.push(Link {
@@ -2083,7 +2342,7 @@ impl AppState {
         });
         self.reschedule();
         if let Some(error) = self.schedule_error() {
-            self.undo();
+            self.roll_back();
             self.dialog = Some(Dialog::Message {
                 title: "Cannot create this link".into(),
                 body: error,
@@ -2095,6 +2354,12 @@ impl AppState {
         let Some(successor) = self.project.tasks.get(row).map(|t| t.id) else {
             return;
         };
+        if let Some(from) = self.row_of(predecessor) {
+            self.record(Cmd::RemoveLink {
+                row: Row(row as u32 + 1),
+                predecessor: Row(from as u32 + 1),
+            });
+        }
         self.checkpoint();
         self.project.unlink(predecessor, successor);
         self.reschedule();
@@ -2102,6 +2367,23 @@ impl AppState {
 
     /// Book or unbook a resource against an explicit row, with units.
     pub fn set_assignment(&mut self, row: usize, resource: ResourceId, units: Option<f64>) {
+        if let Some(name) = self
+            .project
+            .resources
+            .iter()
+            .find(|held| held.id == resource)
+            .map(|held| held.name.clone())
+        {
+            let at = Row(row as u32 + 1);
+            self.record(match units {
+                Some(units) => Cmd::AssignResource {
+                    row: at,
+                    name,
+                    units_percent: units * 100.0,
+                },
+                None => Cmd::UnassignResource { row: at, name },
+            });
+        }
         self.checkpoint();
         if let Some(task) = self.project.tasks.get_mut(row) {
             match units {
@@ -2121,6 +2403,9 @@ impl AppState {
     // ---- resources ------------------------------------------------------
 
     pub fn add_resource(&mut self, name: &str) {
+        self.record(Cmd::AddResource {
+            name: name.to_string(),
+        });
         self.checkpoint();
         self.project.add_resource(name);
         self.reschedule();
@@ -2130,6 +2415,9 @@ impl AppState {
         let Some(id) = self.project.resources.get(index).map(|r| r.id) else {
             return;
         };
+        self.record(Cmd::DeleteResource {
+            resource_row: Row(index as u32 + 1),
+        });
         self.checkpoint();
         self.project.delete_resource(id);
         self.selected_resource = None;
@@ -2139,6 +2427,15 @@ impl AppState {
     pub fn commit_resource_cell(&mut self, index: usize, field: &str, value: &str) {
         if index >= self.project.resources.len() {
             return;
+        }
+        // A key the sheet does not know is ignored below, so it is not written
+        // down as a change either.
+        if let Some(field) = resource_field_of(field) {
+            self.record(Cmd::SetResourceField {
+                resource_row: Row(index as u32 + 1),
+                field,
+                value: value.trim().to_string(),
+            });
         }
         self.checkpoint();
         let value = value.trim().to_string();
@@ -2180,6 +2477,30 @@ impl AppState {
         let Some(resource_id) = self.project.resources.get(resource_index).map(|r| r.id) else {
             return;
         };
+        // Which way the booking went, because "toggled" is not something a
+        // script can replay or a person can read afterwards.
+        let booked = self
+            .project
+            .tasks
+            .get(row)
+            .is_some_and(|task| task.assignments.iter().any(|a| a.resource == resource_id));
+        if let Some(name) = self
+            .project
+            .resources
+            .get(resource_index)
+            .map(|resource| resource.name.clone())
+        {
+            let row = Row(row as u32 + 1);
+            self.record(if booked {
+                Cmd::UnassignResource { row, name }
+            } else {
+                Cmd::AssignResource {
+                    row,
+                    name,
+                    units_percent: 100.0,
+                }
+            });
+        }
         self.checkpoint();
         if let Some(task) = self.project.tasks.get_mut(row) {
             if let Some(position) = task.assignments.iter().position(|a| a.resource == resource_id)
@@ -2193,6 +2514,14 @@ impl AppState {
             }
         }
         self.reschedule();
+    }
+
+    /// The row a task sits on, which is how the change log names it.
+    ///
+    /// The log counts rows the way the ID column does, so the one place a task
+    /// id turns back into a position is here.
+    fn row_of(&self, task: TaskId) -> Option<usize> {
+        self.project.tasks.iter().position(|held| held.id == task)
     }
 
     /// Find a resource by the name shown on screen.
@@ -2219,6 +2548,11 @@ impl AppState {
             self.note(format!("There is no resource called {name}."));
             return;
         };
+        self.record(Cmd::AssignResource {
+            row: Row(row as u32 + 1),
+            name: name.to_string(),
+            units_percent: units * 100.0,
+        });
         self.checkpoint();
         if let Some(task) = self.project.tasks.get_mut(row) {
             match task.assignments.iter_mut().find(|a| a.resource == resource) {
@@ -2238,6 +2572,11 @@ impl AppState {
         let Some(resource) = self.resource_id_by_name(name) else {
             return;
         };
+        self.record(Cmd::SetAssignmentUnits {
+            row: Row(row as u32 + 1),
+            name: name.to_string(),
+            units_percent: units * 100.0,
+        });
         self.checkpoint();
         if let Some(task) = self.project.tasks.get_mut(row)
             && let Some(existing) = task.assignments.iter_mut().find(|a| a.resource == resource)
@@ -2254,6 +2593,10 @@ impl AppState {
         let Some(resource) = self.resource_id_by_name(name) else {
             return;
         };
+        self.record(Cmd::UnassignResource {
+            row: Row(row as u32 + 1),
+            name: name.to_string(),
+        });
         self.checkpoint();
         if let Some(task) = self.project.tasks.get_mut(row) {
             task.assignments.retain(|a| a.resource != resource);
@@ -2265,6 +2608,7 @@ impl AppState {
     // ---- project commands -----------------------------------------------
 
     pub fn set_baseline(&mut self) {
+        self.record(Cmd::SetBaseline {});
         self.checkpoint();
         self.project.set_baseline();
         self.show_baseline = true;
@@ -2272,6 +2616,7 @@ impl AppState {
     }
 
     pub fn clear_baseline(&mut self) {
+        self.record(Cmd::ClearBaseline {});
         self.checkpoint();
         self.project.clear_baseline();
         self.show_baseline = false;
@@ -2279,6 +2624,7 @@ impl AppState {
     }
 
     pub fn set_project_start(&mut self, date: NaiveDateTime) {
+        self.record(Cmd::SetProjectStart { date });
         self.checkpoint();
         self.project.start_date = date;
         self.reschedule();
@@ -2352,6 +2698,11 @@ impl AppState {
             return;
         }
 
+        // Deliberately not recorded. The vocabulary can move a block past its
+        // sibling, which is not what a drop does: a row dragged anywhere in the
+        // outline and re-levelled where it lands has no command that says so,
+        // and inventing one that says something else would be worse than the
+        // gap.
         self.checkpoint();
         self.project.move_task(from, insert_at);
 
@@ -2399,6 +2750,10 @@ impl AppState {
             return;
         }
         let at = at.min(self.columns.len());
+        self.record(Cmd::ShowColumn {
+            field,
+            at: Row(at as u32 + 1),
+        });
         self.columns.insert(at, ColumnSpec::new(field));
         self.status = format!("Inserted the {} column", field.label());
     }
@@ -2406,6 +2761,11 @@ impl AppState {
     pub fn remove_column(&mut self, index: usize) {
         if self.columns.len() <= 1 || index >= self.columns.len() {
             return;
+        }
+        if let Some(column) = self.columns.get(index) {
+            self.record(Cmd::HideColumn {
+                field: column.field,
+            });
         }
         let removed = self.columns.remove(index);
         self.status = format!("Hid the {} column", removed.field.label());
@@ -2420,6 +2780,7 @@ impl AppState {
     }
 
     pub fn reset_columns(&mut self) {
+        self.record(Cmd::ResetColumns {});
         self.columns = default_columns();
         self.table_pane_width = self.grid_width();
         self.status = "Columns reset to the Entry table".into();
@@ -2564,6 +2925,9 @@ impl AppState {
             _ => None,
         }
         .map(aop_core::grouping::GroupBy::new);
+        self.record(Cmd::GroupBy {
+            field: self.group_by.as_ref().map(|spec| spec.field),
+        });
         self.selection.clear();
         self.status = match &self.group_by {
             Some(spec) => format!("Grouped by {}", spec.field.label()),
@@ -2578,12 +2942,16 @@ impl AppState {
             "incomplete" => TaskFilter::Incomplete,
             _ => TaskFilter::All,
         };
+        self.record(Cmd::SetFilter {
+            filter: self.filter,
+        });
         self.selection.clear();
         self.status = format!("Filter: {}", self.filter.label());
     }
 
     /// Fit the whole plan on screen by picking a timescale for its span.
     pub fn zoom_to_fit(&mut self) {
+        self.record(Cmd::ZoomToFit {});
         let span = (self.project.finish_date - self.project.start_date).num_days();
         self.zoom = if span > 720 {
             Zoom::Quarters
@@ -2602,6 +2970,10 @@ impl AppState {
     pub fn sort_tasks(&mut self, key: &str) {
         if self.project.tasks.len() < 2 {
             return;
+        }
+        // A key nothing sorts by leaves the plan alone, so it is not a change.
+        if let Some(field) = sort_field_of(key) {
+            self.record(Cmd::SortBy { field });
         }
         self.checkpoint();
         let sorted = sort_range(&self.project, 0, self.project.tasks.len(), 0, key);
@@ -2682,6 +3054,14 @@ impl AppState {
                 }
                 let moved = drag.base_start + chrono::Duration::days(days);
                 let snapped = self.project.calendar.next_working_instant(moved);
+                // What the drag came to, not the frames it took to get there.
+                // The pointer moving is not a change to the plan; where it was
+                // let go is.
+                self.record(Cmd::SetField {
+                    row: Row(drag.row as u32 + 1),
+                    field: Field::Start,
+                    value: snapped.format("%Y-%m-%d %H:%M").to_string(),
+                });
                 self.checkpoint();
                 if let Some(task) = self.project.tasks.get_mut(drag.row) {
                     // Project pins a dragged bar with a start constraint.
@@ -2700,6 +3080,11 @@ impl AppState {
                     return;
                 }
                 let minutes = (drag.base_duration + days * aop_core::MINUTES_PER_DAY).max(0);
+                self.record(Cmd::SetField {
+                    row: Row(drag.row as u32 + 1),
+                    field: Field::Duration,
+                    value: aop_core::format_duration(minutes),
+                });
                 self.checkpoint();
                 if let Some(task) = self.project.tasks.get_mut(drag.row) {
                     task.duration_minutes = minutes;
@@ -2713,6 +3098,9 @@ impl AppState {
                 if percent == drag.base_percent {
                     return;
                 }
+                // Which row it lands on is already selected: a drag starts by
+                // selecting the bar it takes hold of.
+                self.record(Cmd::SetPercentComplete { percent });
                 self.checkpoint();
                 if let Some(task) = self.project.tasks.get_mut(drag.row) {
                     task.percent_complete = percent;
@@ -2731,11 +3119,17 @@ impl AppState {
                 ) else {
                     return;
                 };
+                self.record(Cmd::SetLink {
+                    row: Row(target as u32 + 1),
+                    predecessor: Row(drag.row as u32 + 1),
+                    kind: LinkType::FS,
+                    lag_minutes: 0,
+                });
                 self.checkpoint();
                 self.project.add_link(Link::finish_to_start(from, to));
                 self.reschedule();
                 if let Some(error) = self.schedule_error() {
-                    self.undo();
+                    self.roll_back();
                     self.dialog = Some(Dialog::Message {
                         title: "Cannot create this link".into(),
                         body: error,
@@ -3012,6 +3406,13 @@ impl AppState {
     /// Push overbooked work later until nobody is asked for more hours than
     /// they have. The scope decides how much of the plan is fair game.
     pub fn level(&mut self, scope: aop_core::leveling::LevelScope) {
+        // The vocabulary has one levelling command and it levels the whole
+        // plan. Writing it down for a narrower run would put a line in the log
+        // that replays as something the planner did not ask for, which is
+        // worse than an entry that is not there.
+        if scope == aop_core::leveling::LevelScope::EntireProject {
+            self.record(Cmd::Level {});
+        }
         self.checkpoint();
         let options = aop_core::leveling::LevelingOptions {
             scope,
@@ -3067,10 +3468,14 @@ impl AppState {
         self.checkpoint();
         let filled = aop_core::grouping::fill_down(&mut self.project, field, &rows);
         if filled == 0 {
-            self.undo();
+            self.roll_back();
             self.note("Nothing to fill. Those rows already match.");
             return;
         }
+        // Written once something has actually moved. An entry saying a column
+        // was filled when every row already matched would be a line the log
+        // can never take back.
+        self.record(Cmd::FillDown { field });
         self.reschedule();
         self.dirty = true;
         self.note(format!(
@@ -3103,7 +3508,7 @@ impl AppState {
                 );
             }
             Err(error) => {
-                self.undo();
+                self.roll_back();
                 self.dialog = Some(Dialog::Message {
                     title: "Insert Subproject".to_string(),
                     body: error.to_string(),
@@ -3149,7 +3554,7 @@ impl AppState {
                 if summary.changed() == 0 {
                     // Nothing moved, so the checkpoint would be an empty step
                     // in the undo history.
-                    self.undo();
+                    self.roll_back();
                 }
                 self.dirty = summary.changed() > 0;
                 self.dialog = None;
@@ -3157,7 +3562,7 @@ impl AppState {
                 self.reschedule();
             }
             Err(error) => {
-                self.undo();
+                self.roll_back();
                 self.dialog = Some(Dialog::Message {
                     title: "Update Project".to_string(),
                     body: error.to_string(),
@@ -3255,6 +3660,7 @@ impl AppState {
 
     /// Take back the delays levelling put in.
     pub fn clear_leveling(&mut self) {
+        self.record(Cmd::ClearLeveling {});
         self.checkpoint();
         let cleared = aop_core::leveling::clear_leveling(&mut self.project);
         self.reschedule();
@@ -3334,6 +3740,283 @@ fn sort_range(project: &Project, start: usize, end: usize, level: u16, key: &str
         }
     }
     out
+}
+
+// ---- what the change log says -------------------------------------------
+
+/// Whether a command only moves the selection about.
+fn is_selecting(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::SelectRow { .. }
+            | Cmd::SelectRows { .. }
+            | Cmd::ToggleRow { .. }
+            | Cmd::SelectAll {}
+            | Cmd::ClearSelection {}
+    )
+}
+
+/// Whether an entry is itself an undo or a redo, which is what stops the two
+/// of them naming each other's work in turn.
+fn is_undo_entry(change: &aop_core::history::Change) -> bool {
+    let last = change.script.lines().next_back().unwrap_or("").trim();
+    last == "undo();" || last == "redo();"
+}
+
+/// "1 task" or "4 tasks", so a sentence can be built without a stray plural.
+fn tasks_phrase(count: usize) -> String {
+    match count {
+        1 => "1 task".to_string(),
+        other => format!("{other} tasks"),
+    }
+}
+
+fn rows_phrase(count: usize) -> String {
+    match count {
+        1 => "1 row".to_string(),
+        other => format!("{other} rows"),
+    }
+}
+
+/// The field a grid column types into. The inverse of the mapping the macro
+/// vocabulary keeps, and the reason a typed cell can be written as a command.
+fn field_of(column: Column) -> Field {
+    match column {
+        Column::Name => Field::Name,
+        Column::Duration => Field::Duration,
+        Column::Start => Field::Start,
+        Column::Finish => Field::Finish,
+        Column::Predecessors => Field::Predecessors,
+        Column::Resources => Field::ResourceNames,
+    }
+}
+
+/// The resource sheet column a key names, for the commands that carry one.
+fn resource_field_of(key: &str) -> Option<ResourceField> {
+    Some(match key {
+        "name" => ResourceField::Name,
+        "initials" => ResourceField::Initials,
+        "group" => ResourceField::Group,
+        "max" => ResourceField::MaxUnits,
+        "rate" => ResourceField::Rate,
+        "kind" => ResourceField::Kind,
+        _ => return None,
+    })
+}
+
+fn resource_field_label(field: ResourceField) -> &'static str {
+    match field {
+        ResourceField::Name => "Name",
+        ResourceField::Initials => "Initials",
+        ResourceField::Group => "Group",
+        ResourceField::MaxUnits => "Max Units",
+        ResourceField::Rate => "Rate",
+        ResourceField::Kind => "Type",
+    }
+}
+
+fn view_option_label(option: ViewOption) -> &'static str {
+    match option {
+        ViewOption::CriticalPath => "the critical path",
+        ViewOption::Timeline => "the timeline",
+        ViewOption::OutlineNumber => "outline numbers",
+        ViewOption::Slack => "slack",
+        ViewOption::Baseline => "the baseline",
+        ViewOption::Links => "link lines",
+        ViewOption::BarText => "bar text",
+        ViewOption::RoundBars => "rounded bars",
+    }
+}
+
+/// The field a sort key names, so a sort can be written as a command.
+fn sort_field_of(key: &str) -> Option<Field> {
+    Some(match key {
+        "start" => Field::Start,
+        "finish" => Field::Finish,
+        "duration" => Field::Duration,
+        "cost" => Field::Cost,
+        "name" => Field::Name,
+        _ => return None,
+    })
+}
+
+/// One short sentence for a command, in the words a planner would use.
+///
+/// Worked out before the command runs, because half of these read the plan as
+/// it was: how many rows were selected, whether a task was active, who was
+/// already booked. The match is exhaustive so a new command cannot arrive
+/// without somebody deciding what the panel should say about it.
+fn describe(cmd: &Cmd, state: &AppState) -> String {
+    let rows = state.selection.len();
+    match cmd {
+        Cmd::SelectRow { row } => format!("Selected row {}", row.0),
+        Cmd::SelectRows { from, to } => format!("Selected rows {} to {}", from.0, to.0),
+        Cmd::ToggleRow { row } => {
+            let already = (row.0 as usize)
+                .checked_sub(1)
+                .is_some_and(|index| state.is_selected(index));
+            if already {
+                format!("Took row {} out of the selection", row.0)
+            } else {
+                format!("Added row {} to the selection", row.0)
+            }
+        }
+        Cmd::SelectAll {} => "Selected every row".to_string(),
+        Cmd::ClearSelection {} => "Selected nothing".to_string(),
+        Cmd::InsertTask {} => "Inserted a task".to_string(),
+        Cmd::InsertMilestone {} => "Inserted a milestone".to_string(),
+        Cmd::InsertSummary {} => "Inserted a summary task".to_string(),
+        Cmd::AppendTask { name } => match name.trim() {
+            "" => "Added a task at the end".to_string(),
+            named => format!("Added the task {named}"),
+        },
+        Cmd::DeleteTasks {} => format!("Deleted {}", tasks_phrase(rows)),
+        Cmd::Indent {} => format!("Indented {}", tasks_phrase(rows)),
+        Cmd::Outdent {} => format!("Outdented {}", tasks_phrase(rows)),
+        Cmd::MoveUp {} => "Moved a task up".to_string(),
+        Cmd::MoveDown {} => "Moved a task down".to_string(),
+        Cmd::CopyTasks {} => format!("Copied {}", tasks_phrase(rows)),
+        Cmd::CutTasks {} => format!("Cut {}", tasks_phrase(rows)),
+        Cmd::PasteTasks {} => "Pasted from the clipboard".to_string(),
+        Cmd::ExpandAll {} => "Opened every summary row".to_string(),
+        Cmd::CollapseAll {} => "Closed every summary row".to_string(),
+        Cmd::Link {} => format!("Linked {}", tasks_phrase(rows)),
+        Cmd::Unlink {} => format!("Unlinked {}", tasks_phrase(rows)),
+        Cmd::SetLink {
+            row,
+            predecessor,
+            kind,
+            ..
+        } => format!(
+            "Linked row {} to row {} ({})",
+            predecessor.0,
+            row.0,
+            kind.code()
+        ),
+        Cmd::RemoveLink { row, predecessor } => format!(
+            "Took the link from row {} off row {}",
+            predecessor.0, row.0
+        ),
+        Cmd::SetField { row, field, value } => match value.trim() {
+            "" => format!("Cleared {} on row {}", field.label(), row.0),
+            typed => format!("Set {} on row {} to {typed}", field.label(), row.0),
+        },
+        Cmd::SetPercentComplete { percent } => {
+            format!("Marked {} {percent}% complete", tasks_phrase(rows))
+        }
+        Cmd::SetTaskMode { mode } => format!(
+            "Set {} to {} scheduling",
+            tasks_phrase(rows),
+            match mode {
+                TaskMode::Manual => "manual",
+                TaskMode::Auto => "automatic",
+            }
+        ),
+        Cmd::ToggleActive {} => {
+            let was_active = state
+                .primary()
+                .and_then(|row| state.project.tasks.get(row))
+                .is_some_and(|task| task.active);
+            format!(
+                "Made {} {}",
+                tasks_phrase(rows),
+                if was_active { "inactive" } else { "active" }
+            )
+        }
+        Cmd::RespectLinks {} => format!(
+            "Released {} back to auto scheduling",
+            tasks_phrase(rows)
+        ),
+        Cmd::FillDown { field } => {
+            format!("Filled {} down {}", field.label(), rows_phrase(rows))
+        }
+        Cmd::AddResource { name } => format!("Added {name} to the resource sheet"),
+        Cmd::DeleteResource { resource_row } => {
+            let named = (resource_row.0 as usize)
+                .checked_sub(1)
+                .and_then(|index| state.project.resources.get(index))
+                .map(|resource| resource.name.clone())
+                .unwrap_or_else(|| format!("row {}", resource_row.0));
+            format!("Took {named} off the resource sheet")
+        }
+        Cmd::AssignResource {
+            row,
+            name,
+            units_percent,
+        } => format!("Booked {name} onto row {} at {units_percent:.0}%", row.0),
+        Cmd::SetAssignmentUnits {
+            row,
+            name,
+            units_percent,
+        } => format!("Changed {name} on row {} to {units_percent:.0}%", row.0),
+        Cmd::UnassignResource { row, name } => format!("Took {name} off row {}", row.0),
+        Cmd::SetResourceField {
+            resource_row,
+            field,
+            value,
+        } => format!(
+            "Set {} on resource row {} to {value}",
+            resource_field_label(*field),
+            resource_row.0
+        ),
+        Cmd::SetView { view } => format!("Switched to the {} view", view.label()),
+        Cmd::SetZoom { zoom } => format!("Zoomed to {}", zoom.label()),
+        Cmd::ZoomToFit {} => "Zoomed to fit the whole plan".to_string(),
+        Cmd::SetFilter { filter } => format!("Filtered to {}", filter.label()),
+        Cmd::GroupBy { field } => match field {
+            Some(field) => format!("Grouped by {}", field.label()),
+            None => "Took the grouping off".to_string(),
+        },
+        Cmd::SortBy { field } => format!("Sorted by {}", field.label()),
+        Cmd::ShowColumn { field, at } => {
+            format!("Showed the {} column at position {}", field.label(), at.0)
+        }
+        Cmd::HideColumn { field } => format!("Hid the {} column", field.label()),
+        Cmd::ResetColumns {} => "Put the Entry columns back".to_string(),
+        Cmd::SetViewOption { option, on } => format!(
+            "Turned {} {}",
+            view_option_label(*option),
+            if *on { "on" } else { "off" }
+        ),
+        Cmd::SetBaseline {} => "Saved the baseline".to_string(),
+        Cmd::ClearBaseline {} => "Cleared the baseline".to_string(),
+        Cmd::SetProjectStart { date } => {
+            format!("Moved the plan to start on {}", format_date(*date))
+        }
+        Cmd::Level {} => "Levelled overbooked work".to_string(),
+        Cmd::ClearLeveling {} => "Cleared the levelling delays".to_string(),
+        // Both of these are recorded through `record_as`, which knows which
+        // step was moved and says so. This is only the fallback.
+        Cmd::Undo {} => "Undid the last change".to_string(),
+        Cmd::Redo {} => "Redid the last change".to_string(),
+        Cmd::Note { message } => format!("Said: {message}"),
+    }
+}
+
+/// One sentence for a run of commands written as a single entry.
+fn describe_run(held: &[(Cmd, String)]) -> String {
+    let edits: Vec<&(Cmd, String)> = held
+        .iter()
+        .filter(|(cmd, _)| !is_selecting(cmd))
+        .collect();
+    let Some((last, summary)) = edits.last() else {
+        // Nothing but selecting, so the selecting is what it says.
+        return held
+            .last()
+            .map(|(_, summary)| summary.clone())
+            .unwrap_or_default();
+    };
+    if edits.len() == 1 {
+        return summary.clone();
+    }
+    // The same command over a run of rows is one thing the planner did, so it
+    // is named once with a count rather than listed line by line.
+    if edits.iter().all(|(cmd, _)| cmd.fn_name() == last.fn_name())
+        && let Cmd::SetField { field, .. } = last
+    {
+        return format!("Set {} on {}", field.label(), rows_phrase(edits.len()));
+    }
+    format!("{} changes in one step", edits.len())
 }
 
 fn empty_report(start: NaiveDateTime) -> ScheduleReport {
@@ -3640,6 +4323,213 @@ mod tests {
         // is gone. The behaviour is covered where it is used.
     }
 
+
+    // ---- the change log -------------------------------------------------
+
+    /// A plan with a name behind the keyboard, so the entries have an author.
+    fn worked_on_by(who: &str) -> AppState {
+        let mut state = AppState::new();
+        state.user_name = who.to_string();
+        for name in ["Phase", "Design", "Build", "Ship"] {
+            state.append_task(name);
+        }
+        state
+    }
+
+    fn log_of(state: &AppState) -> Vec<(String, String)> {
+        state
+            .project
+            .history
+            .changes()
+            .iter()
+            .map(|change| (change.summary.clone(), change.script.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn one_edit_is_one_entry_signed_by_whoever_made_it() {
+        let mut state = worked_on_by("Ada Lovelace");
+        let before = state.project.history.len();
+
+        state.select(1);
+        state.indent_selected();
+
+        let log = state.project.history.changes();
+        assert_eq!(log.len(), before + 1, "one edit, one entry");
+        let entry = log.last().expect("the edit just recorded one");
+        assert_eq!(entry.author, "Ada Lovelace");
+        assert_eq!(entry.summary, "Indented 1 task");
+        assert!(entry.script.contains("indent();"), "{}", entry.script);
+    }
+
+    #[test]
+    fn work_done_before_anybody_says_who_they_are_is_signed_honestly() {
+        // A fresh install has no name in it. "Unknown" is true; putting the
+        // machine's account name in would be a guess written into a record.
+        let mut state = AppState::new();
+        state.append_task("Phase");
+        let entry = state
+            .project
+            .history
+            .changes()
+            .last()
+            .expect("appending a task is a change");
+        assert_eq!(entry.author, "Unknown");
+    }
+
+    #[test]
+    fn a_grouped_run_is_one_entry_and_not_one_for_every_command() {
+        // A fill down over four rows is one thing the planner did. An entry per
+        // command would bury the day's real work under its own mechanics.
+        let mut state = worked_on_by("Ada");
+        let before = state.project.history.len();
+
+        state.as_one_step(|s| {
+            for row in 0..s.project.tasks.len() {
+                s.select(row);
+                s.set_percent_complete(50);
+            }
+        });
+
+        let log = state.project.history.changes();
+        assert_eq!(log.len(), before + 1, "the run is one entry");
+        let entry = log.last().expect("the run recorded one");
+        assert_eq!(
+            entry.command_count(),
+            8,
+            "and it keeps every command it stands for, so it can be replayed"
+        );
+        assert_eq!(entry.summary, "4 changes in one step");
+    }
+
+    #[test]
+    fn a_run_of_selecting_is_one_act_of_selecting() {
+        let mut state = worked_on_by("Ada");
+        let before = state.project.history.len();
+
+        state.select(1);
+        state.select(2);
+        state.select(3);
+        state.indent_selected();
+
+        let log = state.project.history.changes();
+        assert_eq!(log.len(), before + 1);
+        let entry = log.last().expect("the indent recorded one");
+        assert_eq!(
+            entry.command_count(),
+            2,
+            "row 2, then 3, then 4 is one act of selecting: {}",
+            entry.script
+        );
+        assert!(
+            entry.script.starts_with("select_row(4);"),
+            "the last of the run is the one that stands: {}",
+            entry.script
+        );
+    }
+
+    #[test]
+    fn a_summary_reads_as_a_sentence_rather_than_as_the_command_again() {
+        let mut state = worked_on_by("Ada");
+        state.select(0);
+        state.set_percent_complete(50);
+        state.add_resource("Ada");
+        state.select(2);
+        state.indent_selected();
+
+        for (summary, script) in log_of(&state) {
+            assert!(!summary.is_empty(), "{script} has nothing said about it");
+            assert!(
+                summary.starts_with(|first: char| first.is_uppercase()),
+                "{summary} does not start a sentence"
+            );
+            assert!(!summary.ends_with('.'), "{summary} carries a full stop");
+            assert!(
+                !summary.contains('('),
+                "{summary} is the command written out again"
+            );
+        }
+
+        let said: Vec<String> = log_of(&state).into_iter().map(|(what, _)| what).collect();
+        assert!(said.contains(&"Marked 1 task 50% complete".to_string()), "{said:?}");
+        assert!(said.contains(&"Added Ada to the resource sheet".to_string()), "{said:?}");
+    }
+
+    #[test]
+    fn an_undo_is_written_down_rather_than_rubbing_out_what_it_took_back() {
+        // The log rides inside the plan, and the plan is what an undo puts
+        // back, so without carrying the log across the swap an undo would
+        // delete the record of the work it undid. A trail that quietly loses
+        // entries is worse than no trail, because it still looks complete.
+        let mut state = worked_on_by("Ada");
+        state.select(1);
+        state.indent_selected();
+        let after_edit = state.project.history.len();
+
+        state.undo();
+
+        let log = state.project.history.changes();
+        assert_eq!(log.len(), after_edit + 1, "the undo is a change of its own");
+        assert_eq!(
+            log.last().map(|change| change.summary.as_str()),
+            Some("Undid: Indented 1 task"),
+            "and it names the step it took back rather than itself"
+        );
+        assert!(
+            log.iter().any(|change| change.summary == "Indented 1 task"),
+            "the work that was undone is still on the record"
+        );
+
+        state.redo();
+        assert_eq!(
+            state
+                .project
+                .history
+                .changes()
+                .last()
+                .map(|change| change.summary.as_str()),
+            Some("Redid: Indented 1 task")
+        );
+    }
+
+    #[test]
+    fn a_command_that_rolls_itself_back_does_not_record_an_undo() {
+        // Linking a loop puts the plan back by itself and says so in a dialog.
+        // Nobody pressed Undo, so nothing in the log should say they did.
+        let mut state = worked_on_by("Ada");
+        state.set_link(1, state.project.tasks[0].id, LinkType::FS, 0);
+        state.set_link(0, state.project.tasks[1].id, LinkType::FS, 0);
+
+        assert!(
+            !log_of(&state)
+                .iter()
+                .any(|(summary, _)| summary.starts_with("Undid")),
+            "a rollback is not an undo"
+        );
+    }
+
+    #[test]
+    fn a_drag_records_where_it_was_let_go_and_not_the_frames_on_the_way() {
+        // The one place this beats Project, whose recorder produces nothing at
+        // all for a drag.
+        let mut state = outlined();
+        let before = state.project.history.len();
+
+        state.begin_bar_drag(3, BarDragKind::Move, 0.0, 40.0);
+        for step in 1..=20 {
+            state.update_bar_drag(step as f64 * 10.0);
+        }
+        state.finish_bar_drag(Zoom::Days.px_per_day());
+
+        let log = state.project.history.changes();
+        assert_eq!(log.len(), before + 1, "one drag, one entry");
+        let entry = log.last().expect("the drag recorded one");
+        assert!(
+            entry.script.contains("set_field(4, Start,"),
+            "the committed result, in the vocabulary: {}",
+            entry.script
+        );
+    }
 
     #[test]
     fn a_grouped_run_is_one_undo_step_and_one_schedule() {

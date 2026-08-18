@@ -2442,6 +2442,16 @@ button { font: inherit; color: inherit; }
 .cf-chip-name { font-size: 11.5px; color: var(--ink); }
 .cf-chip-slot { font-size: 9.5px; color: var(--ink-faint); font-family: var(--mono); }
 
+/* ---------- change log ---------- */
+
+.hist-tally { display: flex; align-items: baseline; gap: 14px; font-size: 12px; color: var(--ink); }
+.hist-unsent { color: var(--accent-bright); }
+.hist-when { color: var(--ink-soft); white-space: nowrap; }
+/* The command is the stored form, so it is shown as written rather than
+   reflowed into prose. */
+.hist-cmd { font-family: var(--mono); font-size: 11px; color: var(--accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 250px; }
+.hist-more { color: var(--ink-faint); font-family: var(--font); font-size: 10.5px; }
+
 /* ---------- dictionaries ---------- */
 
 .dict-list { margin-top: 8px; }

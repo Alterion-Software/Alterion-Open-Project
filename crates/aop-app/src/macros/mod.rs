@@ -16,17 +16,17 @@
 //! * [`MacroDef`] is one named macro: what it is called, what it says it does,
 //!   what runs it, and its body as text.
 //!
-//! Phase 0 is the vocabulary on its own. Nothing calls into here until the
-//! recorder and the Developer tab are wired up, which is why the module allows
-//! dead code; the allow comes off with the first call site.
+//! The change log is the first thing to call in here: every edit is written
+//! down as the command that made it. The recorder and the Developer tab are
+//! still to come, which is why the module allows dead code; the allow comes
+//! off when the last of the vocabulary has a caller.
 #![allow(dead_code)]
 
 pub mod cmd;
 pub mod script;
 
-// The re-exports are the module's front door. Nothing walks through it until
-// the recorder and the Developer tab arrive, hence the allow alongside the one
-// on the module itself.
+// The re-exports are the module's front door. Some of it is still only walked
+// through by the tests, hence the allow alongside the one on the module itself.
 #[allow(unused_imports)]
 pub use cmd::{Cmd, ResourceField, Row, ViewOption};
 
@@ -144,19 +144,47 @@ impl MacroDef {
 ///
 /// A command that fails stops the run. What ran before it stays: the planner
 /// can read how far it got from the count and undo the lot in one keystroke.
+///
+/// The whole run is one entry in the change log, naming the macro. The
+/// commands inside it are not written down one by one: they were recorded when
+/// somebody first did them by hand, and a log that counted them again would
+/// say the work happened twice.
 pub fn run(state: &mut crate::state::AppState, script: &str) -> Result<usize, MacroError> {
     let commands = script::parse(script)?;
-    state.as_one_step(|state| {
-        let mut done = 0usize;
-        for command in &commands {
-            match command.apply(state) {
-                Ok(()) => done += 1,
-                Err(error) => return Err((done, error)),
+    let name = script::read_header(script).name;
+    let outcome = state.unrecorded(|state| {
+        state.as_one_step(|state| {
+            let mut done = 0usize;
+            for command in &commands {
+                match command.apply(state) {
+                    Ok(()) => done += 1,
+                    Err(error) => return Err((done, error)),
+                }
             }
-        }
-        Ok(done)
-    })
-    .map_err(|(done, error)| {
+            Ok(done)
+        })
+    });
+
+    // What actually ran, which is not always what was asked for. A run that
+    // stopped part way leaves its earlier commands in the plan, so the entry
+    // holds those and only those: the log has to replay to the plan that is
+    // there, not to the one the script hoped for.
+    let done = match &outcome {
+        Ok(done) => *done,
+        Err((done, _)) => *done,
+    };
+    if done > 0 {
+        state.write_change(
+            commands[..done]
+                .iter()
+                .map(Cmd::to_script)
+                .collect::<Vec<String>>()
+                .join("\n"),
+            describe_run(name.as_deref(), done, commands.len()),
+        );
+    }
+
+    outcome.map_err(|(done, error)| {
         // Saying where it stopped is the difference between a usable message
         // and one that just says something went wrong.
         MacroError::Stopped {
@@ -164,6 +192,22 @@ pub fn run(state: &mut crate::state::AppState, script: &str) -> Result<usize, Ma
             reason: Box::new(error),
         }
     })
+}
+
+/// What the change log says about a run.
+///
+/// A run that stopped part way says so, because an entry that named the macro
+/// alone would read as if the whole thing had been carried out.
+fn describe_run(name: Option<&str>, done: usize, asked: usize) -> String {
+    let named = match name {
+        Some(name) if !name.trim().is_empty() => format!("the macro {}", name.trim()),
+        _ => "a macro".to_string(),
+    };
+    if done == asked {
+        format!("Ran {named}")
+    } else {
+        format!("Ran {done} of the {asked} commands in {named}")
+    }
 }
 
 pub fn check_name(name: &str) -> Result<(), MacroError> {
@@ -455,6 +499,68 @@ mod tests {
         // Row 4 was never selected, so it is untouched.
         assert_eq!(state.project.tasks[3].outline_level, 0);
         assert_eq!(state.project.tasks[3].percent_complete, 0);
+    }
+
+    #[test]
+    fn a_replayed_script_is_one_entry_naming_the_macro() {
+        // Every command in a macro was recorded when somebody first did it by
+        // hand. Writing them down again on replay would say the plan was
+        // edited twice as often as it was.
+        let mut state = plan_of(&["Phase", "Design", "Build"]);
+        state.user_name = "Ada".to_string();
+        let before = state.project.history.len();
+        let body = script::to_script(
+            "Indent_The_Middle",
+            "Nests the middle rows.",
+            &[
+                Cmd::SelectRows {
+                    from: Row(2),
+                    to: Row(3),
+                },
+                Cmd::Indent {},
+            ],
+        );
+
+        let done = run(&mut state, &body).expect("both lines run");
+
+        assert_eq!(done, 2);
+        let log = state.project.history.changes();
+        assert_eq!(
+            log.len(),
+            before + 1,
+            "a replay is one entry, not one for every command it carried out"
+        );
+        let entry = log.last().expect("the run recorded one");
+        assert_eq!(entry.summary, "Ran the macro Indent_The_Middle");
+        assert_eq!(entry.author, "Ada");
+        assert_eq!(
+            entry.command_count(),
+            2,
+            "and it keeps what it ran, so the entry replays"
+        );
+    }
+
+    #[test]
+    fn a_run_that_stops_part_way_records_only_what_ran() {
+        // What is in the plan is the first command, so that is what the entry
+        // has to hold: a log that replayed to a plan nobody ever had is worse
+        // than one that is short.
+        let mut state = plan_of(&["Phase", "Design"]);
+        let before = state.project.history.len();
+
+        let error = run(&mut state, "select_row(1);\nselect_row(9);\n")
+            .expect_err("there is no row 9");
+        assert!(matches!(error, MacroError::Stopped { after: 1, .. }), "{error}");
+
+        let entry = state
+            .project
+            .history
+            .changes()
+            .last()
+            .expect("one command ran, so there is an entry");
+        assert_eq!(state.project.history.len(), before + 1);
+        assert_eq!(entry.command_count(), 1);
+        assert_eq!(entry.summary, "Ran 1 of the 2 commands in a macro");
     }
 
     #[test]

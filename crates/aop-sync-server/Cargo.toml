@@ -1,0 +1,37 @@
+[package]
+name = "aop-sync-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Self-hostable sync server for Alterion Open Project: authored change log, rebase sync, live edits."
+
+[[bin]]
+name = "aop-sync-server"
+path = "src/main.rs"
+
+[dependencies]
+aop-core = { version = "0.1.0-beta", path = "../aop-core" }
+
+# Framework versions MUST match the Alterion identity provider, so a self-hoster
+# running both ends up with one copy of the actix and sea-orm trees.
+actix-cors        = "0.7"
+actix-web         = "4"
+actix-ws          = "0.3"
+sea-orm           = { version = "1.1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+sea-orm-migration = "1.1"
+
+anyhow       = "1"
+async-trait  = "0.1"
+chrono.workspace = true
+configparser = "3.1"
+env_logger   = "0.11"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+log          = "0.4"
+# rustls, not native-tls: the IdP is reached over TLS and the rest of the tree is
+# already rustls through sea-orm's runtime feature.
+reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2         = "0.11"
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+uuid         = { version = "1", features = ["v4", "serde"] }

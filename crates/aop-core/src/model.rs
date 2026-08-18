@@ -646,6 +646,10 @@ pub struct Project {
     /// setting is how a planner gets the chain back.
     #[serde(default)]
     pub critical_slack_minutes: i64,
+    /// Who changed what, and when. Rides with the plan, so the trail survives
+    /// being sent to somebody else and is what a sync exchanges.
+    #[serde(default)]
+    pub history: crate::history::History,
     #[serde(default)]
     pub bar_styles: BarStyles,
     next_task_id: TaskId,
@@ -684,6 +688,7 @@ impl Project {
             currency_symbol: "$".into(),
             show_project_summary: false,
             critical_slack_minutes: 0,
+            history: crate::history::History::new(),
             bar_styles: BarStyles::default(),
             next_task_id: 1,
             next_resource_id: 1,

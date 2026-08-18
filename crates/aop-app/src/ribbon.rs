@@ -1013,6 +1013,8 @@ fn ProjectTab() -> Element {
                     on: move |_| state.write().dialog = Some(Dialog::CustomFields) }
                 SmallBtn { glyph: "links-between".to_string(), caption: "Links Between Projects".to_string(), enabled: true,
                     on: move |_| state.write().dialog = Some(Dialog::LinksBetweenProjects) }
+                SmallBtn { glyph: "history".to_string(), caption: "Change Log".to_string(), enabled: true,
+                    on: move |_| state.write().dialog = Some(Dialog::History) }
                 MenuBtn {
                     glyph: "wbs".to_string(), caption: "WBS".to_string(),
                     large: false, enabled: true,

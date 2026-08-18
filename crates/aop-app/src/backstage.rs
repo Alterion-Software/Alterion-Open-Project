@@ -1300,10 +1300,86 @@ fn OptionsPageView() -> Element {
                     OptionsPage::Schedule => rsx! { OptSchedule {} },
                     OptionsPage::Save => rsx! { OptSave {} },
                     OptionsPage::Advanced => rsx! { OptAdvanced {} },
+                    OptionsPage::Collaborate => rsx! { OptCollaborate {} },
                     OptionsPage::Keyboard => rsx! { OptKeyboard {} },
                     OptionsPage::CustomizeRibbon => rsx! { OptRibbon {} },
                     OptionsPage::QuickAccess => rsx! { OptQuickAccess {} },
                 }
+            }
+        }
+    }
+}
+
+/// Alterion Collaborate: where to sign in, and as what.
+///
+/// Only two things are settings, and neither is secret. Everything else about
+/// a provider comes from its own discovery document, so somebody running their
+/// own changes the address and nothing else. Tokens are never here: they live
+/// in whatever the platform provides for the purpose.
+#[component]
+fn OptCollaborate() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let (on, issuer, client_id) = {
+        let s = state.read();
+        (s.collaborate, s.idp_issuer.clone(), s.idp_client_id.clone())
+    };
+
+    let save = move |state: &mut AppState| {
+        let settings = state.settings();
+        settings.save();
+    };
+
+    rsx! {
+        h2 { class: "opt-head", "Alterion Collaborate" }
+        p { class: "opt-note",
+            "Sign in to keep a plan on a server, see who changed what, and work on it with other people at the same time. Everything stays on this machine until you do."
+        }
+
+        OptCheck {
+            label: "Offer signing in and syncing".to_string(),
+            on_state: on,
+            on: move |_| {
+                let mut writer = state.write();
+                writer.collaborate = !writer.collaborate;
+                save(&mut writer);
+            },
+        }
+
+        if on {
+            div { class: "sep" }
+            Setting {
+                label: "Sign in at".to_string(),
+                hint: "The identity provider to use. Alterion hosts one, and you can run your own: everything else is read from the address you give here.".to_string(),
+                input {
+                    class: "bs-input",
+                    value: "{issuer}",
+                    placeholder: "https://auth.example.com",
+                    onchange: move |event| {
+                        let value = event.value().trim().trim_end_matches('/').to_string();
+                        let mut writer = state.write();
+                        writer.idp_issuer = value;
+                        save(&mut writer);
+                    },
+                }
+            }
+            Setting {
+                label: "Application name".to_string(),
+                hint: "How this copy identifies itself when signing in. Your provider issues it. It is not a password, so it does not need hiding.".to_string(),
+                input {
+                    class: "bs-input",
+                    value: "{client_id}",
+                    onchange: move |event| {
+                        let value = event.value().trim().to_string();
+                        let mut writer = state.write();
+                        writer.idp_client_id = value;
+                        save(&mut writer);
+                    },
+                }
+            }
+
+            div { class: "sep" }
+            p { class: "opt-note",
+                "Signing in opens your browser. This copy is tied to this machine afterwards, so a stolen file is no use on another one, and signing in again is all it takes if the hardware changes."
             }
         }
     }
