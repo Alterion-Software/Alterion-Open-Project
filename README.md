@@ -13,7 +13,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange?style=flat&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Dioxus](https://img.shields.io/badge/Dioxus-0.7-blueviolet?style=flat)](https://dioxuslabs.com/)
-[![Status](https://img.shields.io/badge/status-pre--release-yellow)](#not-implemented)
+[![Status](https://img.shields.io/badge/status-Open--Beta-cyan)](#not-implemented)
 
 _A better free project scheduler. A real critical path engine behind a Microsoft Project style ribbon, reading Project's own files._
 
