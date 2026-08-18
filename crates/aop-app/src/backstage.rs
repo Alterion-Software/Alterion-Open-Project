@@ -687,6 +687,7 @@ fn PrintPage() -> Element {
     let queues = use_signal(crate::spooler::printers);
     let mut chosen = use_signal(|| None::<String>);
     let mut copies = use_signal(|| 1u16);
+    let mut shown_page = use_signal(|| 1usize);
     let mut target = use_signal(|| {
         let s = state.read();
         s.file_path
@@ -697,19 +698,42 @@ fn PrintPage() -> Element {
             .to_string()
     });
 
+    // What the whole plan makes at these settings, which is what a range has
+    // to be chosen against: "pages 2 to 4" means nothing without knowing there
+    // are seven.
+    let pages = {
+        let s = state.read();
+        aop_core::pdf::page_count(&s.project, &options())
+    };
+    // A range past the end of a shorter document is not an error, it just
+    // stops early, so the shown page is pulled back rather than left dangling.
+    let showing = shown_page().clamp(1, pages.max(1));
+    if showing != shown_page() {
+        shown_page.set(showing);
+    }
+
+    // What will actually be sent, honouring the chosen range.
     let document = {
         let s = state.read();
         aop_core::pdf::render(&s.project, &options())
     };
-    let pages = document.windows(10).filter(|w| w == b"/Type /Page").count();
     let size_kb = document.len() as f64 / 1024.0;
 
-    // The preview is the document itself, handed to the engine's own viewer, so
-    // it cannot drift from what gets printed.
-    let preview_src = format!(
-        "data:application/pdf;base64,{}",
-        crate::spooler::base64(&document)
-    );
+    // The preview shows one page at a time, the way Project's does, so it is
+    // rendered on its own rather than handing the reader a whole document to
+    // scroll. It comes from the same writer as the print, so the two cannot
+    // drift.
+    let preview_src = {
+        let s = state.read();
+        let single = aop_core::pdf::PrintOptions {
+            pages: Some((showing as u32, showing as u32)),
+            ..options()
+        };
+        format!(
+            "data:application/pdf;base64,{}",
+            crate::spooler::base64(&aop_core::pdf::render(&s.project, &single))
+        )
+    };
 
     let default_queue = queues()
         .as_ref()
@@ -731,6 +755,32 @@ fn PrintPage() -> Element {
                     data: "{preview_src}",
                     div { class: "print-fallback",
                         "{pages} page(s), {size_kb:.0} KB. Save it to look at it outside the application."
+                    }
+                }
+
+                // Paging through the document, rather than scrolling a whole
+                // one, so what is on screen is one printed sheet.
+                div { class: "print-pager",
+                    button {
+                        class: "btn", disabled: showing <= 1,
+                        onclick: move |_| shown_page.set(1),
+                        "\u{00ab}"
+                    }
+                    button {
+                        class: "btn", disabled: showing <= 1,
+                        onclick: move |_| shown_page.set(showing.saturating_sub(1).max(1)),
+                        "\u{2039}"
+                    }
+                    span { class: "print-pager-at", "Page {showing} of {pages}" }
+                    button {
+                        class: "btn", disabled: showing >= pages,
+                        onclick: move |_| shown_page.set((showing + 1).min(pages)),
+                        "\u{203a}"
+                    }
+                    button {
+                        class: "btn", disabled: showing >= pages,
+                        onclick: move |_| shown_page.set(pages.max(1)),
+                        "\u{00bb}"
                     }
                 }
             }
@@ -861,6 +911,52 @@ fn PrintPage() -> Element {
                     span { "Save PDF" }
                 }
                 }
+                }
+
+                h2 { class: "bs-sub", "Settings" }
+                Dropdown {
+                    value: (if options().pages.is_some() { "some" } else { "all" }).to_string(),
+                    options: vec![
+                        Choice::new("all", "Print the entire project"),
+                        Choice::new("some", "Print specific pages"),
+                    ],
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        let mut chosen = options();
+                        // Switching to a range starts at the whole document
+                        // rather than at whatever was typed and abandoned.
+                        chosen.pages = (picked == "some").then_some((1, pages.max(1) as u32));
+                        options.set(chosen);
+                    },
+                }
+                if let Some((from, to)) = options().pages {
+                    div { class: "print-range",
+                        label { "Pages" }
+                        input {
+                            r#type: "number", min: "1",
+                            value: "{from}",
+                            onchange: move |event| {
+                                let wanted = event.value().trim().parse::<u32>().unwrap_or(1);
+                                let mut chosen = options();
+                                chosen.pages = Some((wanted.max(1), to));
+                                options.set(chosen);
+                            },
+                        }
+                        span { class: "unit", "to" }
+                        input {
+                            r#type: "number", min: "1",
+                            value: "{to}",
+                            onchange: move |event| {
+                                let wanted = event.value().trim().parse::<u32>().unwrap_or(1);
+                                let mut chosen = options();
+                                chosen.pages = Some((from, wanted.max(1)));
+                                options.set(chosen);
+                            },
+                        }
+                    }
+                    div { class: "hint",
+                        "Out of {pages}. A range the wrong way round or past the end is read as what was meant rather than refused."
+                    }
                 }
 
                 h2 { class: "bs-sub", "Layout" }

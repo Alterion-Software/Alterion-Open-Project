@@ -73,6 +73,9 @@ pub struct PrintOptions {
     pub include_resources: bool,
     /// Draw the critical path in its own colour.
     pub show_critical: bool,
+    /// Which pages to produce, one based and inclusive. None means all of
+    /// them, which is what almost every print wants.
+    pub pages: Option<(u32, u32)>,
 }
 
 impl Default for PrintOptions {
@@ -85,6 +88,8 @@ impl Default for PrintOptions {
             include_table: true,
             include_resources: true,
             show_critical: false,
+            // Every page, which is what almost every print wants.
+            pages: None,
         }
     }
 }
@@ -252,7 +257,7 @@ pub fn render(project: &Project, options: &PrintOptions) -> Vec<u8> {
     let mut pages: Vec<Ref> = Vec::new();
     let mut bodies: Vec<(Ref, Ref, Vec<u8>)> = Vec::new();
 
-    let sheets = compose(project, options, &layout);
+    let sheets = choose_pages(compose(project, options, &layout), options.pages);
     for sheet in sheets {
         let page = Ref::new(next);
         next += 1;
@@ -294,6 +299,34 @@ pub fn render(project: &Project, options: &PrintOptions) -> Vec<u8> {
 }
 
 /// Build the content stream for every page.
+/// How many pages this plan makes at these settings.
+///
+/// The page range is deliberately ignored: a chooser offering "pages 2 to 4"
+/// has to know there are seven, not however many the current range yields.
+pub fn page_count(project: &Project, options: &PrintOptions) -> usize {
+    let layout = Layout::new(options);
+    compose(project, options, &layout).len().max(1)
+}
+
+/// Keep only the pages asked for.
+///
+/// A range running backwards, off the end, or naming page zero is corrected
+/// rather than refused: it comes from two number boxes, and printing nothing
+/// because a digit was mistyped is not a useful answer.
+fn choose_pages(sheets: Vec<Vec<u8>>, range: Option<(u32, u32)>) -> Vec<Vec<u8>> {
+    let Some((from, to)) = range else {
+        return sheets;
+    };
+    let last = sheets.len();
+    if last == 0 {
+        return sheets;
+    }
+    let (from, to) = if from <= to { (from, to) } else { (to, from) };
+    let first = (from.max(1) as usize).min(last);
+    let end = (to.max(1) as usize).min(last);
+    sheets[first - 1..end].to_vec()
+}
+
 fn compose(project: &Project, options: &PrintOptions, layout: &Layout) -> Vec<Vec<u8>> {
     let mut sheets = Vec::new();
     let rows: Vec<usize> = (0..project.tasks.len()).collect();
@@ -677,6 +710,44 @@ mod tests {
         let mut project = templates::build(templates::by_id("simple").unwrap(), start);
         crate::schedule(&mut project).unwrap();
         project
+    }
+
+    #[test]
+    fn a_page_range_keeps_exactly_the_pages_asked_for() {
+        let sheets: Vec<Vec<u8>> = (1..=7u8).map(|n| vec![n]).collect();
+
+        assert_eq!(choose_pages(sheets.clone(), None).len(), 7, "no range means all");
+        assert_eq!(
+            choose_pages(sheets.clone(), Some((2, 4))),
+            vec![vec![2], vec![3], vec![4]],
+            "one based and inclusive at both ends"
+        );
+        assert_eq!(choose_pages(sheets.clone(), Some((1, 1))), vec![vec![1]]);
+        assert_eq!(choose_pages(sheets.clone(), Some((7, 7))), vec![vec![7]]);
+    }
+
+    #[test]
+    fn a_nonsense_range_is_corrected_rather_than_refused() {
+        // The numbers come from two boxes a planner types in. Printing nothing
+        // because a digit was mistyped is not a useful answer.
+        let sheets: Vec<Vec<u8>> = (1..=5u8).map(|n| vec![n]).collect();
+
+        assert_eq!(
+            choose_pages(sheets.clone(), Some((4, 2))),
+            vec![vec![2], vec![3], vec![4]],
+            "backwards is read the way round it was meant"
+        );
+        assert_eq!(
+            choose_pages(sheets.clone(), Some((3, 99))).len(),
+            3,
+            "past the end stops at the end"
+        );
+        assert_eq!(
+            choose_pages(sheets.clone(), Some((0, 2))),
+            vec![vec![1], vec![2]],
+            "there is no page zero"
+        );
+        assert!(choose_pages(Vec::new(), Some((1, 3))).is_empty());
     }
 
     #[test]
