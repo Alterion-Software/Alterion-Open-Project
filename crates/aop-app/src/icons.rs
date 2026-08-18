@@ -469,6 +469,23 @@ fn body_for(name: &str) -> String {
         "settings" => String::from(
             "<path d='M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915' /><circle cx='12' cy='12' r='3' />",
         ),
+        // The drawing tools, one glyph per shape so the menu reads at a glance.
+        // lucide: move-up-right
+        "shape-arrow" => String::from(
+            "<path d='M13 5H19V11' /><path d='M19 5 5 19' />",
+        ),
+        // lucide: slash
+        "shape-line" => String::from("<path d='M22 2 2 22' />"),
+        // lucide: circle
+        "shape-oval" => String::from("<circle cx='12' cy='12' r='10' />"),
+        // lucide: rectangle-horizontal
+        "shape-rectangle" => String::from(
+            "<rect width='20' height='12' x='2' y='6' rx='2' />",
+        ),
+        // lucide: type
+        "shape-text" => String::from(
+            "<path d='M12 4v16' /><path d='M4 7V4h16v3' /><path d='M9 20h6' />",
+        ),
         // lucide: move-horizontal
         "slack" => String::from(
             "<path d='m18 8 4 4-4 4' /><path d='M2 12h20' /><path d='m6 8-4 4 4 4' />",

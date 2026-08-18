@@ -541,6 +541,10 @@ pub struct Project {
     /// The spare fields this plan has put to use.
     #[serde(default)]
     pub custom_fields: crate::custom::CustomFields,
+    /// Annotation shapes marked on the chart, kept in ascending `z` so the
+    /// chart can draw them in the order it finds them.
+    #[serde(default)]
+    pub drawings: Vec<crate::draw::Drawing>,
     pub currency_symbol: String,
     pub show_project_summary: bool,
     #[serde(default)]
@@ -577,6 +581,7 @@ impl Project {
             resources: Vec::new(),
             external: Vec::new(),
             custom_fields: Default::default(),
+            drawings: Vec::new(),
             currency_symbol: "$".into(),
             show_project_summary: false,
             bar_styles: BarStyles::default(),
@@ -606,6 +611,13 @@ impl Project {
     /// hand out an identifier that is already in use.
     pub fn allocate_external_id(&mut self) -> ExternalId {
         self.external.iter().map(|e| e.id).max().unwrap_or(0) + 1
+    }
+
+    /// The next free drawing identifier, taken from what is already there for
+    /// the same reason `allocate_external_id` is: a plan that has been through
+    /// an import or a merge must not hand out an identifier already in use.
+    pub fn allocate_drawing_id(&mut self) -> crate::draw::DrawingId {
+        self.drawings.iter().map(|d| d.id).max().unwrap_or(0) + 1
     }
 
     pub fn external(&self, id: ExternalId) -> Option<&ExternalDependency> {
@@ -824,6 +836,11 @@ impl Project {
         self.tasks.drain(index..end);
         self.links
             .retain(|l| !removed.contains(&l.predecessor) && !removed.contains(&l.successor));
+        // Symmetric with the links: a callout pinned to a bar that no longer
+        // exists has nothing to hang off, and left behind it would place
+        // nowhere for the rest of the plan's life.
+        self.drawings
+            .retain(|d| d.anchored_task().is_none_or(|task| !removed.contains(&task)));
     }
 
     /// Indent a row one level, carrying its children with it. A row cannot
@@ -1249,5 +1266,123 @@ mod custom_field_tests {
         assert!(!project.set_custom_value(1, slot, "Legal"));
         assert_eq!(project.custom_value(1, slot), "");
         assert!(project.set_custom_value(1, slot, "Delivery"));
+    }
+}
+
+#[cfg(test)]
+mod drawing_tests {
+    use super::*;
+    use crate::draw::{Anchor, BarPoint, Drawing, DrawingId, Extent, ShapeKind};
+
+    fn plan() -> Project {
+        let start = NaiveDate::from_ymd_opt(2026, 1, 5)
+            .and_then(|d| d.and_hms_opt(8, 0, 0))
+            .expect("a real date");
+        let mut project = Project::blank(start);
+        project.push_task("Phase", MINUTES_PER_DAY);
+        project.push_task("Child", MINUTES_PER_DAY);
+        project.push_task("Other", MINUTES_PER_DAY);
+        project.tasks[1].outline_level = 1;
+        project
+    }
+
+    fn on_task(id: DrawingId, task: TaskId) -> Drawing {
+        Drawing::new(
+            id,
+            ShapeKind::Oval,
+            Anchor::Task {
+                task,
+                point: BarPoint::Middle,
+                dx: 0.0,
+                dy: 0.0,
+            },
+            Extent::Fixed { w: 30.0, h: 12.0 },
+        )
+    }
+
+    fn on_date(id: DrawingId, at: NaiveDateTime) -> Drawing {
+        Drawing::new(
+            id,
+            ShapeKind::Line,
+            Anchor::Timescale { at, row: 0.0 },
+            Extent::Scaled {
+                minutes: 0,
+                rows: 4.0,
+            },
+        )
+    }
+
+    #[test]
+    fn identifiers_come_from_what_is_already_there() {
+        let mut project = plan();
+        assert_eq!(project.allocate_drawing_id(), 1);
+
+        // A plan that arrived by import may already hold high identifiers.
+        project.drawings.push(on_date(9, project.start_date));
+        assert_eq!(project.allocate_drawing_id(), 10);
+    }
+
+    #[test]
+    fn deleting_a_task_takes_the_shapes_pinned_to_it() {
+        let mut project = plan();
+        let (summary, child, other) = (
+            project.tasks[0].id,
+            project.tasks[1].id,
+            project.tasks[2].id,
+        );
+        project.drawings.push(on_task(1, summary));
+        project.drawings.push(on_task(2, child));
+        project.drawings.push(on_task(3, other));
+        project.drawings.push(on_date(4, project.start_date));
+
+        // Deleting the summary takes its child with it, so both shapes go.
+        project.delete_task(0);
+
+        let left: Vec<DrawingId> = project.drawings.iter().map(|d| d.id).collect();
+        assert_eq!(left, vec![3, 4], "only the surviving task and the date keep theirs");
+    }
+
+    #[test]
+    fn a_dated_shape_survives_every_task_being_deleted() {
+        // It was never about a task, so there is nothing for it to lose.
+        let mut project = plan();
+        project.drawings.push(on_date(1, project.start_date));
+        while !project.tasks.is_empty() {
+            project.delete_task(0);
+        }
+        assert_eq!(project.drawings.len(), 1);
+    }
+
+    #[test]
+    fn a_plan_saved_with_drawings_reads_back_the_same() {
+        let mut project = plan();
+        let task = project.tasks[2].id;
+        let mut shape = on_task(1, task);
+        shape.text = "Waiting on the permit".into();
+        shape.behind_bars = true;
+        shape.z = 3;
+        project.drawings.push(shape);
+        project.drawings.push(on_date(2, project.start_date));
+
+        let json = serde_json::to_string(&project).expect("a plan serialises");
+        let back: Project = serde_json::from_str(&json).expect("and reads back");
+
+        assert_eq!(back.drawings, project.drawings);
+    }
+
+    #[test]
+    fn a_plan_saved_before_drawings_existed_still_opens() {
+        // The whole point of the serde default: a file written by an earlier
+        // build has no `drawings` key at all, and must not fail to load.
+        let project = plan();
+        let mut json: serde_json::Value =
+            serde_json::to_value(&project).expect("a plan serialises");
+        json.as_object_mut()
+            .expect("a plan is an object")
+            .remove("drawings");
+
+        let back: Project = serde_json::from_value(json).expect("an older plan still opens");
+        assert!(back.drawings.is_empty());
+        assert_eq!(back.tasks.len(), project.tasks.len());
     }
 }

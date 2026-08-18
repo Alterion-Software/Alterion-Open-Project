@@ -2024,6 +2024,12 @@ button { font: inherit; color: inherit; }
 
 .bar-label { font-size: 10px; fill: var(--ink-soft); dominant-baseline: middle; }
 
+/* Annotation shapes. The group is inert as a whole and each shape opts back
+   in, so an unfilled outline is still clickable while the empty space between
+   two shapes lets the pointer through to the bars underneath. */
+.drawings { pointer-events: none; }
+.draw-text { dominant-baseline: middle; user-select: none; }
+
 /* Timeline band labels. One beside its bar reads as ordinary text; one within
    a bar sits on the bar's own colour, so it takes the dark ink instead. */
 .band-label { font-size: 10px; fill: var(--ink-soft); }

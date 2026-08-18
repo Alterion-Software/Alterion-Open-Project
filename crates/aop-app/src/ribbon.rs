@@ -8,6 +8,7 @@
 use dioxus::desktop::{use_window, WindowCloseBehaviour};
 use dioxus::prelude::*;
 
+use aop_core::draw::ShapeKind;
 use aop_core::leveling::LevelScope;
 use aop_core::textstyle::Emphasis;
 use aop_core::{TaskMode, APP_NAME};
@@ -1318,7 +1319,7 @@ fn ViewTab() -> Element {
 #[component]
 fn FormatTab() -> Element {
     let mut state = use_context::<Signal<AppState>>();
-    let (critical, slack, outline_number, summary, baseline, style, timeline) = {
+    let (critical, slack, outline_number, summary, baseline, style, timeline, drawings, tool) = {
         let s = state.read();
         (
             s.show_critical,
@@ -1328,6 +1329,8 @@ fn FormatTab() -> Element {
             s.show_baseline,
             s.gantt_style,
             s.show_timeline,
+            s.show_drawings,
+            s.draw_tool,
         )
     };
 
@@ -1460,10 +1463,32 @@ fn FormatTab() -> Element {
 
         Group { title: "Drawings".to_string(), launcher: false,
             MenuBtn {
-                glyph: "drawing".to_string(), caption: "Drawing".to_string(),
+                // The armed tool is named on the button, because a crosshair
+                // pointer over the chart is the only other sign there is one.
+                glyph: "drawing".to_string(),
+                caption: tool.map_or_else(|| "Drawing".to_string(), |kind| kind.label().to_string()),
                 large: true, enabled: true,
-                options: vec![MenuOption::new("drawing", "Drawing is not available", "none")],
-                on_pick: move |_| state.write().not_implemented("Drawing"),
+                options: vec![
+                    // Named literally rather than derived, so the test that
+                    // checks every referenced icon exists can see them.
+                    MenuOption::new("shape-line", "Line", ShapeKind::Line.key()),
+                    MenuOption::new("shape-arrow", "Arrow", ShapeKind::Arrow.key()),
+                    MenuOption::new("shape-rectangle", "Rectangle", ShapeKind::Rectangle.key()),
+                    MenuOption::new("shape-oval", "Oval", ShapeKind::Oval.key()),
+                    MenuOption::new("shape-text", "Text Box", ShapeKind::TextBox.key()),
+                ],
+                on_pick: move |value: String| {
+                    if let Some(kind) = ShapeKind::from_key(&value) {
+                        state.write().arm_draw_tool(kind);
+                    }
+                },
+            }
+            div { class: "rcol",
+                CheckItem { label: "Show Drawings".to_string(), on_state: drawings,
+                    on: move |_| {
+                        let on = state.read().show_drawings;
+                        state.write().show_drawings = !on;
+                    } }
             }
         }
     }

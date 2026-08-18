@@ -41,6 +41,7 @@ pub fn DialogHost(dialog: Dialog) -> Element {
                     Dialog::UpdateProject => rsx! { UpdateProjectDialog {} },
                     Dialog::TextStyles => rsx! { TextStylesDialog {} },
                     Dialog::Layout => rsx! { LayoutDialog {} },
+                    Dialog::FormatDrawing(id) => rsx! { FormatDrawing { id } },
                     Dialog::TemplatePreview(id) => rsx! { TemplatePreview { id } },
                     Dialog::ProjectInformation => rsx! { ProjectInformation {} },
                     Dialog::AssignResources => rsx! { AssignResources {} },
@@ -259,6 +260,159 @@ fn TaskInformation(row: usize) -> Element {
         div { class: "dlg-foot",
             button { class: "btn", onclick: move |_| state.write().dialog = None, "Cancel" }
             button { class: "btn primary", onclick: apply, "OK" }
+        }
+    }
+}
+
+// ---------------------------------------------------------- format drawing
+
+/// One annotation shape: what it says, and how it looks.
+///
+/// Everything is applied as it is changed rather than on OK, because the shape
+/// is visible behind the dialog and watching it change is the point.
+#[component]
+fn FormatDrawing(id: aop_core::draw::DrawingId) -> Element {
+    use aop_core::draw::{LineStyle, ShapeKind};
+
+    let mut state = use_context::<Signal<AppState>>();
+
+    let snapshot = state
+        .read()
+        .project
+        .drawings
+        .iter()
+        .find(|d| d.id == id)
+        .cloned();
+    let Some(drawing) = snapshot else {
+        return rsx! {
+            MessageBox {
+                title: "Format Drawing".to_string(),
+                body: "That drawing is no longer there.".to_string(),
+            }
+        };
+    };
+
+    let holds_text = drawing.kind == ShapeKind::TextBox;
+    let closed = matches!(
+        drawing.kind,
+        ShapeKind::Rectangle | ShapeKind::Oval | ShapeKind::TextBox
+    );
+
+    rsx! {
+        Head { title: format!("Format {}", drawing.kind.label()) }
+        div { class: "dlg-body", style: "min-width: 520px; min-height: 250px;",
+
+            if holds_text {
+                div { class: "form-row",
+                    label { "Text" }
+                    input {
+                        class: "grow",
+                        value: "{drawing.text}",
+                        oninput: move |event| {
+                            let text = event.value();
+                            state.write().amend_drawing(id, move |d| d.text = text.clone());
+                        },
+                    }
+                }
+                div { class: "sep" }
+            }
+
+            div { class: "form-row",
+                label { "Line colour" }
+                Dropdown {
+                    value: drawing.style.line_colour.clone(),
+                    options: STYLE_COLOURS.iter().map(|(name, token)| Choice::new(*token, *name)).collect(),
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        state.write().amend_drawing(id, move |d| d.style.line_colour = picked.clone());
+                    },
+                }
+            }
+            div { class: "form-row",
+                label { "Line style" }
+                Dropdown {
+                    value: match drawing.style.line_style {
+                        LineStyle::Solid => "solid",
+                        LineStyle::Dashed => "dashed",
+                        LineStyle::Dotted => "dotted",
+                    }.to_string(),
+                    options: vec![
+                        Choice::new("solid", "Solid"),
+                        Choice::new("dashed", "Dashed"),
+                        Choice::new("dotted", "Dotted"),
+                    ],
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        let chosen = match picked.as_str() {
+                            "dashed" => LineStyle::Dashed,
+                            "dotted" => LineStyle::Dotted,
+                            _ => LineStyle::Solid,
+                        };
+                        state.write().amend_drawing(id, move |d| d.style.line_style = chosen);
+                    },
+                }
+                label { style: "width: auto; margin-left: 12px;", "Width" }
+                input {
+                    style: "width: 70px;",
+                    value: "{drawing.style.line_width}",
+                    onchange: move |event| {
+                        if let Ok(width) = event.value().trim().parse::<f64>() {
+                            let width = width.clamp(0.0, 12.0);
+                            state.write().amend_drawing(id, move |d| d.style.line_width = width);
+                        }
+                    },
+                }
+            }
+
+            if closed {
+                div { class: "form-row",
+                    label { "Fill" }
+                    Dropdown {
+                        value: drawing.style.fill_colour.clone(),
+                        options: std::iter::once(Choice::new("", "None"))
+                            .chain(STYLE_COLOURS.iter().skip(1).map(|(name, token)| Choice::new(*token, *name)))
+                            .collect(),
+                        width: 0.0, large: true, disabled: false,
+                        on_pick: move |picked: String| {
+                            state.write().amend_drawing(id, move |d| d.style.fill_colour = picked.clone());
+                        },
+                    }
+                }
+            }
+
+            div { class: "sep" }
+            OptCheck {
+                label: "Draw behind the task bars".to_string(),
+                on_state: drawing.behind_bars,
+                on: move |_| {
+                    let now = !drawing.behind_bars;
+                    state.write().amend_drawing(id, move |d| d.behind_bars = now);
+                },
+            }
+            OptCheck {
+                label: "Lock so it cannot be dragged".to_string(),
+                on_state: drawing.locked,
+                on: move |_| {
+                    let now = !drawing.locked;
+                    state.write().amend_drawing(id, move |d| d.locked = now);
+                },
+            }
+            div { class: "hint",
+                "A shape drawn over a bar hides it. Sending it behind is how a highlight sits under the bar it is marking rather than covering it."
+            }
+        }
+        div { class: "dlg-foot",
+            button {
+                class: "btn",
+                onclick: move |_| {
+                    let mut writer = state.write();
+                    writer.selected_drawing = Some(id);
+                    writer.delete_selected_drawing();
+                    writer.dialog = None;
+                },
+                "Delete"
+            }
+            button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Close" }
         }
     }
 }

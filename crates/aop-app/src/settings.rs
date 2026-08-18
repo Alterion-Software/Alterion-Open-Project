@@ -39,6 +39,9 @@ pub struct Settings {
     pub show_links: bool,
     /// The task name written beside its bar.
     pub bar_text: bool,
+    /// Whether annotation shapes are drawn over the chart. A per view choice
+    /// in Project too, kept with the planner rather than in the plan.
+    pub show_drawings: bool,
     /// Only the bindings the user has changed. Defaults are left out so a later
     /// release can improve one and have it reach anyone who never touched it.
     pub keys: crate::keymap::Keymap,
@@ -60,6 +63,7 @@ impl Default for Settings {
             round_bars: false,
             show_links: true,
             bar_text: true,
+            show_drawings: true,
             // Marking the critical path everywhere by default turns the whole
             // plan red, which says nothing about which parts matter.
             show_critical: false,
@@ -110,6 +114,7 @@ impl Settings {
              round_bars = {}\n\
              show_links = {}\n\
              bar_text = {}\n\
+             show_drawings = {}\n\
              {}",
             self.user_name,
             self.user_initials,
@@ -125,6 +130,7 @@ impl Settings {
             self.round_bars,
             self.show_links,
             self.bar_text,
+            self.show_drawings,
             self.keyboard_section(),
         )
     }
@@ -210,6 +216,7 @@ impl Settings {
         settings.round_bars = flag("round_bars", settings.round_bars);
         settings.show_links = flag("show_links", settings.show_links);
         settings.bar_text = flag("bar_text", settings.bar_text);
+        settings.show_drawings = flag("show_drawings", settings.show_drawings);
 
         settings
     }
@@ -271,6 +278,7 @@ mod tests {
             round_bars: true,
             show_links: false,
             bar_text: false,
+            show_drawings: false,
             keys: {
                 let mut keys = crate::keymap::Keymap::default();
                 keys.bind(crate::keymap::Action::SetBaseline, "Ctrl+B");

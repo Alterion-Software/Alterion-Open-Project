@@ -10,11 +10,12 @@ use std::collections::HashMap;
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
 use dioxus::prelude::*;
 
+use aop_core::draw::{place, snap_vertical, ChartMap, Drawing, Placement, ShapeKind};
 use aop_core::grouping::GroupRow;
 use aop_core::{LinkType, Project, TaskId, WorkCalendar};
 
-use crate::viewport::{PaneScroll, RowWindow};
-use crate::state::{AppState, BarDragKind, Dialog, ViewKind, Zoom};
+use crate::viewport::{PaneScroll, RowWindow, SpanWindow};
+use crate::state::{AppState, BarDragKind, Dialog, DrawDragKind, ViewKind, Zoom};
 
 /// Row height, matched to the grid so the two panes line up.
 pub const ROW_H: f64 = 22.0;
@@ -36,10 +37,27 @@ pub struct Scale {
 }
 
 impl Scale {
+    /// Midnight on the chart's first day, which is x zero.
+    fn zero(&self) -> NaiveDateTime {
+        // Midnight exists on every date, so there is nothing here to fail.
+        self.origin.and_hms_opt(0, 0, 0).expect("valid midnight")
+    }
+
     /// Wall-clock position. Used by the timescale, where a day is a day.
     pub fn x(&self, at: NaiveDateTime) -> f64 {
-        let origin = self.origin.and_hms_opt(0, 0, 0).expect("valid midnight");
-        (at - origin).num_minutes() as f64 / 1440.0 * self.px_per_day
+        (at - self.zero()).num_minutes() as f64 / 1440.0 * self.px_per_day
+    }
+
+    /// The instant an x position falls on, the inverse of `x`.
+    ///
+    /// What a pointer landing on the canvas means, which is how a drawing gets
+    /// a date to be pinned to rather than a pixel that stops meaning anything
+    /// the moment the chart is zoomed.
+    pub fn at_x(&self, x: f64) -> NaiveDateTime {
+        if self.px_per_day <= 0.0 {
+            return self.zero();
+        }
+        self.zero() + Duration::minutes((x / self.px_per_day * 1440.0).round() as i64)
     }
 
     pub fn x_date(&self, date: NaiveDate) -> f64 {
@@ -201,10 +219,46 @@ pub fn chart_range(project: &Project) -> (NaiveDate, NaiveDate) {
         .unwrap_or(project.start_date.date())
         .max(start);
 
+    // A shape can be dated outside the plan, and one drawn past the last bar
+    // has to have canvas under it or it is clipped away at the edge.
+    let (start, finish) = project
+        .drawings
+        .iter()
+        .filter_map(|d| d.date_span())
+        .fold((start, finish), |(from, to), (at, until)| {
+            (from.min(at.date()), to.max(until.date()))
+        });
+
     (
         start_of_week(start),
         start_of_week(finish + Duration::days(PAD_DAYS_AFTER + 7)),
     )
+}
+
+/// Left and right edge of a task's bar, snapped the way the chart snaps them.
+///
+/// Shared with the drawing tools: a shape dropped on a bar has to hit-test
+/// against exactly the edges the chart drew, or it would anchor to a task the
+/// pointer was never over.
+pub fn bar_edges(
+    project: &Project,
+    scale: &Scale,
+    round_bars: bool,
+    index: usize,
+) -> Option<(f64, f64)> {
+    let task = project.tasks.get(index)?;
+    let (mut left, mut right) = (
+        scale.x_work(&project.calendar, task.scheduled.start),
+        scale.x_work(&project.calendar, task.scheduled.finish),
+    );
+    if round_bars {
+        // Snap out to whole days, so half a day of work still reads as a day
+        // wide. The picture changes, the schedule does not.
+        let day = scale.px_per_day.max(1.0);
+        left = (left / day).floor() * day;
+        right = (right / day).ceil() * day;
+    }
+    Some((left, right))
 }
 
 #[derive(PartialEq)]
@@ -286,17 +340,9 @@ pub fn GanttChart() -> Element {
         for (line, index) in rows.iter().enumerate().filter_map(task_line) {
             let task = &project.tasks[index];
             lines.insert(task.id, line);
-            let (mut left, mut right) = (
-                scale.x_work(&project.calendar, task.scheduled.start),
-                scale.x_work(&project.calendar, task.scheduled.finish),
-            );
-            if s.round_bars {
-                // Snap out to whole days, so half a day of work still reads as
-                // a day wide. The picture changes, the schedule does not.
-                let day = scale.px_per_day.max(1.0);
-                left = (left / day).floor() * day;
-                right = (right / day).ceil() * day;
-            }
+            let Some((left, right)) = bar_edges(project, &scale, s.round_bars, index) else {
+                continue;
+            };
             boxes.insert(
                 task.id,
                 BarBox {
@@ -363,6 +409,8 @@ pub fn GanttChart() -> Element {
     let px_per_day = scale.px_per_day;
     let drag = s.bar_drag;
     let styles = project.bar_styles.clone();
+    let (draw_tool, draw_drag) = (s.draw_tool, s.draw_drag);
+    let (show_drawings, selected_drawing) = (s.show_drawings, s.selected_drawing);
 
     // Only the rows inside the scrolled viewport are drawn. The body keeps its
     // full height, so every bar stays where it belongs and the pane scrolls
@@ -374,6 +422,22 @@ pub fn GanttChart() -> Element {
     // The same idea sideways: a year of day columns is thousands of pixels of
     // gridline and tick label, and the pane shows a screenful of it.
     let span = seen.span();
+
+    // The placement maths lives in the core so screen and print cannot drift.
+    // The map borrows the layout's bar geometry, so nothing here is rebuilt and
+    // the plan's drawings are never copied to be drawn.
+    let map = ChartView { scale, boxes };
+    // A shape being slid follows the pointer without the plan being touched:
+    // the move lands as one undo step on mouseup rather than one per frame.
+    let placed = |d: &Drawing| {
+        let (dx, dy) = match draw_drag {
+            Some(drag) if drag.kind == DrawDragKind::Move(d.id) => drag.delta(),
+            _ => (0.0, 0.0),
+        };
+        place(d, &map)
+            .map(|at| Placement { x: at.x + dx, y: at.y + dy, ..at })
+            .filter(|at| shape_shows(*at, &span, &window))
+    };
 
     rsx! {
         div {
@@ -388,12 +452,30 @@ pub fn GanttChart() -> Element {
                     state.write().update_bar_drag(event.client_coordinates().x);
                 }
             },
+            onmousedown: move |_| {
+                // A click on bare canvas lets go of any selected shape. A click
+                // on a shape stops before it reaches here, and one on a bar
+                // clears the selection through `select` anyway.
+                if state.read().selected_drawing.is_some() {
+                    state.write().selected_drawing = None;
+                }
+            },
             onmouseup: move |_| {
                 if state.read().bar_drag.is_some() {
                     state.write().finish_bar_drag(px_per_day);
                 }
+                // A click quick enough to finish before the overlay is laid out
+                // would otherwise leave the drag running and the overlay stuck
+                // over the chart.
+                if state.read().draw_drag.is_some() {
+                    state.write().finish_draw_drag();
+                }
             },
-            onmouseleave: move |_| state.write().cancel_bar_drag(),
+            onmouseleave: move |_| {
+                let mut s = state.write();
+                s.cancel_bar_drag();
+                s.cancel_draw_drag();
+            },
             onscroll: move |event| {
                 let data = event.data();
                 let now = PaneScroll {
@@ -516,6 +598,20 @@ pub fn GanttChart() -> Element {
                             if grid_columns {
                                 line { key: "vl{index}", x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
                                     stroke: "var(--grid-line)", stroke_width: "1" }
+                            }
+                        }
+                    }
+                }
+
+                // ---- annotations drawn under the plan --------------------
+                if show_drawings {
+                    g { class: "drawings",
+                        for d in project.drawings.iter().filter(|d| d.behind_bars) {
+                            {
+                                match placed(d) {
+                                    Some(at) => drawn_shape(d, at, selected_drawing == Some(d.id), state),
+                                    None => rsx! {},
+                                }
                             }
                         }
                     }
@@ -771,6 +867,20 @@ pub fn GanttChart() -> Element {
                     }
                 }
 
+                // ---- annotations drawn over the plan ---------------------
+                if show_drawings {
+                    g { class: "drawings",
+                        for d in project.drawings.iter().filter(|d| !d.behind_bars) {
+                            {
+                                match placed(d) {
+                                    Some(at) => drawn_shape(d, at, selected_drawing == Some(d.id), state),
+                                    None => rsx! {},
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(x) = today_x {
                     line {
                         x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
@@ -782,6 +892,45 @@ pub fn GanttChart() -> Element {
                     if let Some(x) = status_x {
                         line { x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
                             stroke: "var(--contextual)", stroke_width: "1.4" }
+                    }
+                }
+
+                {
+                    // What the shape will be, while it is still being pulled out.
+                    match draw_drag.and_then(|drag| match drag.kind {
+                        DrawDragKind::New(kind) => drag.band().map(|band| (kind, band)),
+                        DrawDragKind::Move(_) => None,
+                    }) {
+                        Some((kind, (x, y, dx, dy))) => {
+                            let (dx, dy) = if kind == ShapeKind::Line {
+                                snap_vertical(dx, dy)
+                            } else {
+                                (dx, dy)
+                            };
+                            rubber_band(kind, x, y, dx, dy)
+                        }
+                        None => rsx! {},
+                    }
+                }
+
+                // The drawing surface, and the last thing in the body so it is
+                // over everything else. This SVG carries no view box and no
+                // transform, so a pointer position measured against it already
+                // is a chart coordinate: no bounding rectangles, no eval.
+                if draw_tool.is_some() || draw_drag.is_some() {
+                    rect {
+                        x: "0", y: "0", width: "{width}", height: "{body_h}",
+                        fill: "transparent",
+                        style: if draw_tool.is_some() { "cursor: crosshair;" } else { "cursor: move;" },
+                        onmousedown: move |event| {
+                            let point = event.element_coordinates();
+                            state.write().begin_draw(point.x, point.y);
+                        },
+                        onmousemove: move |event| {
+                            let point = event.element_coordinates();
+                            state.write().update_draw_drag(point.x, point.y);
+                        },
+                        onmouseup: move |_| state.write().finish_draw_drag(),
                     }
                 }
             }
@@ -909,6 +1058,208 @@ fn arrow_head(x: f64, y: f64, downward: bool) -> Element {
         format!("{},{} {},{} {x},{y}", x - 5.0, y - 3.0, x - 5.0, y + 3.0)
     };
     rsx! { polygon { points: "{points}", fill: "var(--link-arrow)" } }
+}
+
+// ---------------------------------------------------------------- drawings
+
+/// The chart, as the placement maths in `aop_core::draw` wants to see it.
+///
+/// Borrowing the layout's bar geometry rather than rebuilding it means a shape
+/// pinned to a bar lands on exactly the bar that was drawn, snapping and all.
+struct ChartView<'a> {
+    scale: Scale,
+    boxes: &'a HashMap<TaskId, BarBox>,
+}
+
+impl ChartMap for ChartView<'_> {
+    fn px_per_day(&self) -> f64 {
+        self.scale.px_per_day
+    }
+
+    fn row_h(&self) -> f64 {
+        ROW_H
+    }
+
+    fn x_at(&self, at: NaiveDateTime) -> f64 {
+        self.scale.x(at)
+    }
+
+    fn bar(&self, task: TaskId) -> Option<(f64, f64, f64)> {
+        self.boxes
+            .get(&task)
+            .map(|b| (b.left, b.right, b.mid - ROW_H / 2.0))
+    }
+}
+
+/// Whether a placed shape falls inside what the pane is showing.
+///
+/// The same two-way test the bars get: on a drawn row, and within the stretch
+/// of timescale on screen.
+fn shape_shows(at: Placement, span: &SpanWindow, window: &RowWindow) -> bool {
+    let b = at.normalised();
+    span.overlaps(b.x, b.x + b.w)
+        && b.y + b.h >= window.first as f64 * ROW_H
+        && b.y <= window.end as f64 * ROW_H
+}
+
+/// How far a selection outline stands off the shape it is around.
+const SELECT_PAD: f64 = 3.0;
+
+/// One annotation, drawn where `place` put it.
+fn drawn_shape(d: &Drawing, at: Placement, selected: bool, mut state: Signal<AppState>) -> Element {
+    let id = d.id;
+    let outer = at.normalised();
+    let (end_x, end_y) = at.end();
+    let stroke = d.style.stroke();
+    let stroke_w = d.style.width();
+    let dash = d.style.line_style.dasharray().unwrap_or("none");
+    let fill = d.style.fill();
+    // A locked shape lets the pointer through to the bars underneath, which is
+    // the point of locking one: mark the plan up, then get back to work on it.
+    let closed_hit = if d.locked { "none" } else { "all" };
+    let stroke_hit = if d.locked { "none" } else { "stroke" };
+
+    rsx! {
+        g {
+            key: "dw{id}",
+            onmousedown: move |event| {
+                event.stop_propagation();
+                state.write().begin_drawing_move(id);
+            },
+            // Opening the shape's own settings, the way double clicking a task
+            // opens its information.
+            ondoubleclick: move |event| {
+                event.stop_propagation();
+                let mut writer = state.write();
+                writer.cancel_draw_drag();
+                writer.dialog = Some(Dialog::FormatDrawing(id));
+            },
+            oncontextmenu: move |event| {
+                event.prevent_default();
+                event.stop_propagation();
+                let mut writer = state.write();
+                writer.cancel_draw_drag();
+                writer.selected_drawing = Some(id);
+                writer.dialog = Some(Dialog::FormatDrawing(id));
+            },
+
+            match d.kind {
+                ShapeKind::Line | ShapeKind::Arrow => rsx! {
+                    line {
+                        x1: "{at.x}", y1: "{at.y}", x2: "{end_x}", y2: "{end_y}",
+                        stroke: "{stroke}", stroke_width: "{stroke_w}",
+                        stroke_dasharray: "{dash}", style: "pointer-events: none;",
+                    }
+                    // An open shape has no interior to click and a hairline is
+                    // a hard target, so an invisible fat companion carries the
+                    // pointer events for it.
+                    line {
+                        x1: "{at.x}", y1: "{at.y}", x2: "{end_x}", y2: "{end_y}",
+                        stroke: "transparent", stroke_width: "8",
+                        style: "pointer-events: {stroke_hit}; cursor: move;",
+                    }
+                    if d.kind == ShapeKind::Arrow {
+                        {arrow_tip(at.x, at.y, end_x, end_y, stroke, stroke_w)}
+                    }
+                },
+                ShapeKind::Rectangle => rsx! {
+                    rect {
+                        x: "{outer.x}", y: "{outer.y}",
+                        width: "{outer.w}", height: "{outer.h}",
+                        fill: "{fill}", stroke: "{stroke}", stroke_width: "{stroke_w}",
+                        stroke_dasharray: "{dash}",
+                        // An unfilled box is still a box: without this the
+                        // planner has to hit the one pixel of its outline.
+                        style: "pointer-events: {closed_hit}; cursor: move;",
+                    }
+                },
+                ShapeKind::Oval => rsx! {
+                    ellipse {
+                        cx: "{outer.x + outer.w / 2.0}", cy: "{outer.y + outer.h / 2.0}",
+                        rx: "{outer.w / 2.0}", ry: "{outer.h / 2.0}",
+                        fill: "{fill}", stroke: "{stroke}", stroke_width: "{stroke_w}",
+                        stroke_dasharray: "{dash}",
+                        style: "pointer-events: {closed_hit}; cursor: move;",
+                    }
+                },
+                ShapeKind::TextBox => rsx! {
+                    rect {
+                        x: "{outer.x}", y: "{outer.y}",
+                        width: "{outer.w}", height: "{outer.h}",
+                        fill: "{fill}", stroke: "{stroke}", stroke_width: "{stroke_w}",
+                        stroke_dasharray: "{dash}",
+                        style: "pointer-events: {closed_hit}; cursor: move;",
+                    }
+                    text {
+                        class: "draw-text",
+                        x: "{outer.x + 4.0}", y: "{outer.y + outer.h / 2.0}",
+                        fill: "{d.style.ink()}",
+                        font_size: "{d.style.font_size()}pt",
+                        font_weight: if d.style.bold { "600" } else { "400" },
+                        font_style: if d.style.italic { "italic" } else { "normal" },
+                        style: "pointer-events: none;",
+                        "{d.text}"
+                    }
+                },
+            }
+
+            if selected {
+                rect {
+                    x: "{outer.x - SELECT_PAD}", y: "{outer.y - SELECT_PAD}",
+                    width: "{outer.w + 2.0 * SELECT_PAD}", height: "{outer.h + 2.0 * SELECT_PAD}",
+                    fill: "none", stroke: "var(--accent-bright)", stroke_width: "1",
+                    stroke_dasharray: "3 2", style: "pointer-events: none;",
+                }
+            }
+        }
+    }
+}
+
+/// The head of an arrow, at the end it was drawn towards.
+fn arrow_tip(x1: f64, y1: f64, x2: f64, y2: f64, stroke: &str, stroke_w: f64) -> Element {
+    let (dx, dy) = (x2 - x1, y2 - y1);
+    let length = dx.hypot(dy);
+    if length < 0.001 {
+        return rsx! {};
+    }
+    let (ux, uy) = (dx / length, dy / length);
+    // The head grows with the stroke, so a heavy line does not end in a pin.
+    let size = (stroke_w * 4.0).clamp(7.0, 16.0);
+    let (base_x, base_y) = (x2 - ux * size, y2 - uy * size);
+    // The perpendicular, for the two back corners.
+    let (px, py) = (-uy * size * 0.45, ux * size * 0.45);
+    let points = format!(
+        "{x2},{y2} {},{} {},{}",
+        base_x + px,
+        base_y + py,
+        base_x - px,
+        base_y - py
+    );
+    rsx! { polygon { points: "{points}", fill: "{stroke}", style: "pointer-events: none;" } }
+}
+
+/// The outline pulled out while a new shape is being drawn.
+///
+/// Deliberately not the shape itself: a dashed box says "this is where it will
+/// go" without pretending the shape exists before the pointer is let go.
+fn rubber_band(kind: ShapeKind, x: f64, y: f64, dx: f64, dy: f64) -> Element {
+    if matches!(kind, ShapeKind::Line | ShapeKind::Arrow) {
+        return rsx! {
+            line {
+                x1: "{x}", y1: "{y}", x2: "{x + dx}", y2: "{y + dy}",
+                stroke: "var(--accent-bright)", stroke_width: "1.5",
+                stroke_dasharray: "4 3", style: "pointer-events: none;",
+            }
+        };
+    }
+    let band = Placement { x, y, w: dx, h: dy }.normalised();
+    rsx! {
+        rect {
+            x: "{band.x}", y: "{band.y}", width: "{band.w}", height: "{band.h}",
+            fill: "none", stroke: "var(--accent-bright)", stroke_width: "1",
+            stroke_dasharray: "4 3", style: "pointer-events: none;",
+        }
+    }
 }
 
 // ---------------------------------------------------------------- timeline

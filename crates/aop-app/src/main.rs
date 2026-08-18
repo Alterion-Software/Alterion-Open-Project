@@ -16,6 +16,7 @@ mod gantt;
 mod grid;
 mod keymap;
 mod icons;
+mod macros;
 mod popups;
 mod preview;
 mod spooler;
@@ -700,6 +701,21 @@ fn handle_shortcut(state: &mut Signal<AppState>, event: Event<KeyboardData>) {
             || s.backstage.is_some()
             || s.context_menu.is_some()
         {
+            return;
+        }
+    }
+
+    // Escape puts down whatever the chart is holding. It is not a bindable
+    // action because it never means anything else: a planner who has armed a
+    // shape by mistake should not have to find the menu again to disarm it.
+    if event.key() == Key::Escape {
+        let mut writer = state.write();
+        if writer.draw_tool.is_some() {
+            writer.arm_draw_tool_off();
+            return;
+        }
+        if writer.selected_drawing.is_some() {
+            writer.selected_drawing = None;
             return;
         }
     }

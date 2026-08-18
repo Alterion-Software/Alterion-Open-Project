@@ -6,12 +6,17 @@
 
 use std::path::PathBuf;
 
+use aop_core::draw::{
+    snap_vertical, Anchor, BarPoint, Drawing, DrawingId, Extent, ShapeKind,
+};
 use aop_core::grouping::GroupRow;
 use aop_core::{
     persist, schedule, templates, ConstraintType, Field, Link, LinkType, Project, ResourceId,
     ScheduleReport, Task, TaskId, TaskMode, WorkCalendar,
 };
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
+
+use crate::gantt::{bar_edges, chart_range, Scale, ROW_H};
 
 const UNDO_LIMIT: usize = 60;
 
@@ -434,6 +439,65 @@ impl BarDrag {
     }
 }
 
+/// What a drawing drag is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawDragKind {
+    /// Rubber-banding a new shape of this kind onto the chart.
+    New(ShapeKind),
+    /// Sliding a shape that is already there.
+    Move(DrawingId),
+}
+
+/// An in-progress drawing drag, in the chart body's own coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DrawDrag {
+    pub kind: DrawDragKind,
+    /// Where the pointer went down.
+    ///
+    /// Filled in by the first sample the chart's overlay reports rather than at
+    /// mousedown, because a move begins on the shape itself and an event on a
+    /// shape is measured against that shape, not against the canvas. Waiting
+    /// for the overlay costs nothing visible: the shape simply does not stir
+    /// until the pointer has actually moved.
+    pub origin: Option<(f64, f64)>,
+    pub at: (f64, f64),
+}
+
+impl DrawDrag {
+    /// How far the pointer has travelled since it went down.
+    pub fn delta(&self) -> (f64, f64) {
+        match self.origin {
+            Some((x, y)) => (self.at.0 - x, self.at.1 - y),
+            None => (0.0, 0.0),
+        }
+    }
+
+    /// The rubber band being pulled out, once there is one to draw.
+    pub fn band(&self) -> Option<(f64, f64, f64, f64)> {
+        let (x, y) = self.origin?;
+        Some((x, y, self.at.0 - x, self.at.1 - y))
+    }
+}
+
+/// Shortest drag that counts as one, in pixels. Below this the planner clicked.
+const MIN_DRAW: f64 = 4.0;
+
+/// What a shape gets when it was clicked rather than dragged out.
+///
+/// A zero-sized shape is invisible and has nothing to click on, so a click
+/// meant to place something would look like it had done nothing at all. Lines
+/// default to upright, because the vertical gate marker is what they are for.
+fn drawn_size(kind: ShapeKind, dx: f64, dy: f64, px_per_day: f64) -> (f64, f64) {
+    if dx.abs() >= MIN_DRAW || dy.abs() >= MIN_DRAW {
+        return (dx, dy);
+    }
+    match kind {
+        ShapeKind::Line | ShapeKind::Arrow => (0.0, 3.0 * ROW_H),
+        ShapeKind::TextBox => (110.0, ROW_H),
+        ShapeKind::Rectangle | ShapeKind::Oval => (3.0 * px_per_day.max(1.0), 2.0 * ROW_H),
+    }
+}
+
 /// An open right-click menu and the screen position it was opened at.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ContextMenu {
@@ -469,6 +533,8 @@ pub enum Dialog {
     TextStyles,
     /// How bars and links are drawn in the chart.
     Layout,
+    /// One annotation shape: its words, its colours, its line.
+    FormatDrawing(aop_core::draw::DrawingId),
     /// Everything about one person, in the same shape Project puts it.
     /// The tab says which page opens first, so Notes can go straight there.
     ResourceInformation { row: usize, tab: usize },
@@ -614,6 +680,18 @@ pub struct AppState {
     /// The column the cursor last sat in. Fill Down works down a column, so it
     /// has to know which one without the grid holding a full cell cursor.
     pub fill_field: Option<Field>,
+    /// How deep inside a running macro we are.
+    ///
+    /// Every mutating method snapshots the plan and reschedules. That is right
+    /// for a button press and ruinous for a script: a macro touching five
+    /// thousand fields would clone the whole project five thousand times, run
+    /// the critical path pass as often, and push the planner's real history
+    /// off the end of the undo stack. While this is non zero the snapshots are
+    /// suppressed and the reschedule is deferred, so a macro is one step to
+    /// undo and one pass to schedule, however much it does.
+    macro_depth: u32,
+    /// A reschedule was asked for while deferred and is still owed.
+    reschedule_owed: bool,
     /// How the rows are banded, when the planner has asked for that.
     pub group_by: Option<aop_core::grouping::GroupBy>,
     /// The look each category of row gets, before any row's own formatting.
@@ -644,6 +722,12 @@ pub struct AppState {
     pub context_menu: Option<ContextMenu>,
     /// A Gantt bar being dragged.
     pub bar_drag: Option<BarDrag>,
+    /// The drawing tool the ribbon has armed, if any. While one is armed the
+    /// chart takes a drag as a shape rather than as a bar move.
+    pub draw_tool: Option<ShapeKind>,
+    pub selected_drawing: Option<DrawingId>,
+    pub draw_drag: Option<DrawDrag>,
+    pub show_drawings: bool,
     /// The row currently being dragged, and where it would land.
     pub drag_row: Option<usize>,
     pub drop_target: Option<(usize, DropWhere)>,
@@ -716,6 +800,8 @@ impl AppState {
             cell_draft: String::new(),
             picker_edits: 0,
             fill_field: None,
+            macro_depth: 0,
+            reschedule_owed: false,
             group_by: None,
             text_styles: aop_core::textstyle::TextStyles::new(),
             painter: None,
@@ -737,6 +823,10 @@ impl AppState {
             dialog: None,
             context_menu: None,
             bar_drag: None,
+            draw_tool: None,
+            selected_drawing: None,
+            draw_drag: None,
+            show_drawings: true,
             drag_row: None,
             drop_target: None,
             backstage_message: None,
@@ -780,6 +870,12 @@ impl AppState {
 
     /// Recalculate the plan. Called after every mutation.
     pub fn reschedule(&mut self) {
+        // Deferred until the macro finishes, then run once. Scheduling after
+        // every command would be the same answer computed thousands of times.
+        if self.macro_depth > 0 {
+            self.reschedule_owed = true;
+            return;
+        }
         self.report = schedule(&mut self.project).map_err(|e| e.to_string());
         if let Err(message) = &self.report {
             self.status = message.clone();
@@ -812,8 +908,40 @@ impl AppState {
 
     // ---- undo -----------------------------------------------------------
 
+    /// Run something as a single undoable step.
+    ///
+    /// Mirrors what Microsoft Project calls an undo transaction, and like that
+    /// one it does not nest: an inner call adds to the step already open
+    /// rather than starting another.
+    pub fn as_one_step<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> T {
+        self.begin_macro();
+        let out = work(self);
+        self.end_macro();
+        out
+    }
+
+    fn begin_macro(&mut self) {
+        if self.macro_depth == 0 {
+            self.checkpoint();
+        }
+        self.macro_depth += 1;
+    }
+
+    fn end_macro(&mut self) {
+        self.macro_depth = self.macro_depth.saturating_sub(1);
+        if self.macro_depth == 0 && std::mem::take(&mut self.reschedule_owed) {
+            self.reschedule();
+        }
+    }
+
     /// Snapshot the plan before changing it. Every mutating command calls this.
     pub fn checkpoint(&mut self) {
+        // Inside a macro the step is already open, so this would only add an
+        // identical snapshot and evict a real one.
+        if self.macro_depth > 0 {
+            self.dirty = true;
+            return;
+        }
         self.undo.push(self.project.clone());
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
@@ -853,6 +981,7 @@ impl AppState {
     // ---- selection ------------------------------------------------------
 
     pub fn select(&mut self, index: usize) {
+        self.selected_drawing = None;
         // Selecting a different row abandons any edit in progress; staying on
         // the same row does not, so clicking about inside a cell is safe.
         if self.editing.map(|(row, _)| row) != Some(index) {
@@ -1069,6 +1198,7 @@ impl AppState {
         self.round_bars = settings.round_bars;
         self.show_links = settings.show_links;
         self.bar_text = settings.bar_text;
+        self.show_drawings = settings.show_drawings;
         self.keys = settings.keys;
     }
 
@@ -1089,6 +1219,7 @@ impl AppState {
             round_bars: self.round_bars,
             show_links: self.show_links,
             bar_text: self.bar_text,
+            show_drawings: self.show_drawings,
             keys: self.keys.clone(),
         }
     }
@@ -1547,6 +1678,11 @@ impl AppState {
     }
 
     pub fn delete_selected(&mut self) {
+        // Delete acts on whatever is selected, and a shape on the chart is as
+        // selectable as a row is.
+        if self.delete_selected_drawing() {
+            return;
+        }
         if self.selection.is_empty() {
             return;
         }
@@ -2466,6 +2602,12 @@ impl AppState {
         origin_x: f64,
         bar_width: f64,
     ) {
+        // A drag with a tool armed is a shape being drawn, not a bar being
+        // moved. Without this the two contend and the plan is edited by
+        // accident while the planner is marking it up.
+        if self.draw_tool.is_some() {
+            return;
+        }
         let Some(task) = self.project.tasks.get(row) else {
             return;
         };
@@ -2585,6 +2727,209 @@ impl AppState {
                 }
             }
         }
+    }
+
+    // ---- drawings --------------------------------------------------------
+
+    /// Arm a drawing tool, or put it away when it was already armed.
+    pub fn arm_draw_tool(&mut self, kind: ShapeKind) {
+        self.draw_tool = (self.draw_tool != Some(kind)).then_some(kind);
+        // Drawing with the shapes hidden would be drawing into the dark.
+        self.show_drawings = true;
+        self.status = match self.draw_tool {
+            Some(kind) => format!("{}: drag on the chart to draw", kind.label()),
+            None => "Ready".into(),
+        };
+    }
+
+    /// Put down whatever shape tool is armed.
+    ///
+    /// Separate from `arm_draw_tool` because that one toggles: calling it to
+    /// disarm would mean naming the tool you are trying to forget.
+    pub fn arm_draw_tool_off(&mut self) {
+        self.draw_tool = None;
+        self.cancel_draw_drag();
+        self.status = "Ready".into();
+    }
+
+    /// The scale the chart is drawn at.
+    ///
+    /// The drawing tools have to hit-test and place against exactly what the
+    /// chart drew, so both take the scale from here rather than each working
+    /// one out.
+    pub fn chart_scale(&self) -> Scale {
+        Scale {
+            origin: chart_range(&self.project).0,
+            px_per_day: self.zoom.px_per_day(),
+        }
+    }
+
+    /// What a point on the chart is about: the bar under it, or the date it
+    /// sits at when it is over bare canvas.
+    ///
+    /// This is the whole difference between an annotation that follows its task
+    /// through a reschedule and one that stays where the plan used to be.
+    pub fn chart_anchor(&self, x: f64, y: f64) -> Anchor {
+        let scale = self.chart_scale();
+        let row = y / ROW_H;
+        if row >= 0.0
+            && let Some(&GroupRow::Task(index)) = self.layout_rows().get(row.floor() as usize)
+            && let Some((left, right)) = bar_edges(&self.project, &scale, self.round_bars, index)
+            && x >= left
+            && x <= right
+            && let Some(task) = self.project.tasks.get(index).map(|t| t.id)
+        {
+            // Which end of the bar the shape rides with. The nearest one wins,
+            // so a note dropped by a finish date stays by the finish date when
+            // the bar later grows out from its start.
+            let (mut point, mut px) = (BarPoint::Start, left);
+            for (candidate, at) in [
+                (BarPoint::Middle, (left + right) / 2.0),
+                (BarPoint::Finish, right),
+            ] {
+                if (x - at).abs() < (x - px).abs() {
+                    (point, px) = (candidate, at);
+                }
+            }
+            return Anchor::Task {
+                task,
+                point,
+                dx: x - px,
+                dy: y - row.floor() * ROW_H,
+            };
+        }
+
+        Anchor::Timescale {
+            at: scale.at_x(x),
+            row,
+        }
+    }
+
+    /// Start pulling a new shape out, from a point in chart coordinates.
+    pub fn begin_draw(&mut self, x: f64, y: f64) {
+        let Some(kind) = self.draw_tool else { return };
+        self.selected_drawing = None;
+        self.draw_drag = Some(DrawDrag {
+            kind: DrawDragKind::New(kind),
+            origin: Some((x, y)),
+            at: (x, y),
+        });
+    }
+
+    /// Select a shape, and be ready to slide it if the pointer moves.
+    pub fn begin_drawing_move(&mut self, id: DrawingId) {
+        self.selected_drawing = Some(id);
+        self.selection.clear();
+        // A locked shape is still selectable, so it can be unlocked again; it
+        // simply does not follow the pointer.
+        if self.project.drawings.iter().any(|d| d.id == id && d.locked) {
+            return;
+        }
+        self.draw_drag = Some(DrawDrag {
+            kind: DrawDragKind::Move(id),
+            origin: None,
+            at: (0.0, 0.0),
+        });
+    }
+
+    pub fn update_draw_drag(&mut self, x: f64, y: f64) {
+        if let Some(drag) = &mut self.draw_drag {
+            drag.origin.get_or_insert((x, y));
+            drag.at = (x, y);
+        }
+    }
+
+    pub fn cancel_draw_drag(&mut self) {
+        self.draw_drag = None;
+    }
+
+    /// Commit whatever the drag was doing, in one undo step.
+    ///
+    /// Nothing here is checkpointed while the pointer moves: a drag across the
+    /// chart would otherwise fill the undo stack with a hundred snapshots of a
+    /// shape on its way somewhere.
+    pub fn finish_draw_drag(&mut self) {
+        let Some(drag) = self.draw_drag.take() else {
+            return;
+        };
+        let px_per_day = self.zoom.px_per_day();
+        let (dx, dy) = drag.delta();
+
+        match drag.kind {
+            DrawDragKind::New(kind) => {
+                let Some((x, y)) = drag.origin else { return };
+                let (dx, dy) = if kind == ShapeKind::Line {
+                    snap_vertical(dx, dy)
+                } else {
+                    (dx, dy)
+                };
+                let (dx, dy) = drawn_size(kind, dx, dy, px_per_day);
+                let anchor = self.chart_anchor(x, y);
+                // A caption keeps its size on screen; everything else keeps the
+                // stretch of plan it was drawn over.
+                let extent = if kind == ShapeKind::TextBox {
+                    Extent::Fixed { w: dx, h: dy }
+                } else {
+                    Extent::Scaled {
+                        minutes: (dx / px_per_day.max(0.001) * 1440.0).round() as i64,
+                        rows: dy / ROW_H,
+                    }
+                };
+
+                self.checkpoint();
+                let id = self.project.allocate_drawing_id();
+                let mut shape = Drawing::new(id, kind, anchor, extent);
+                shape.z = self.project.drawings.last().map_or(0, |last| last.z + 1);
+                if kind == ShapeKind::TextBox {
+                    shape.text = "Text".into();
+                }
+                self.project.drawings.push(shape);
+                self.selected_drawing = Some(id);
+                // One shape per arming, the way Project's drawing tools behave.
+                self.draw_tool = None;
+                self.status = format!("{} drawn", kind.label());
+            }
+            DrawDragKind::Move(id) => {
+                if dx == 0.0 && dy == 0.0 {
+                    return;
+                }
+                self.checkpoint();
+                if let Some(shape) = self.project.drawings.iter_mut().find(|d| d.id == id) {
+                    shape.nudge(dx, dy, px_per_day, ROW_H);
+                }
+                self.status = "Drawing moved".into();
+            }
+        }
+    }
+
+    /// Remove the selected shape.
+    ///
+    /// Says whether it did, so Delete can go to the shape when one is selected
+    /// and to the selected rows otherwise.
+    /// Change one shape, taking a checkpoint so the edit can be undone.
+    ///
+    /// The whole edit is one step: a planner who has retyped a caption and
+    /// picked two colours means that as one change, not four.
+    pub fn amend_drawing(&mut self, id: DrawingId, edit: impl FnOnce(&mut aop_core::draw::Drawing)) {
+        let Some(at) = self.project.drawings.iter().position(|d| d.id == id) else {
+            return;
+        };
+        self.checkpoint();
+        edit(&mut self.project.drawings[at]);
+        self.dirty = true;
+    }
+
+    pub fn delete_selected_drawing(&mut self) -> bool {
+        let Some(id) = self.selected_drawing.take() else {
+            return false;
+        };
+        if !self.project.drawings.iter().any(|d| d.id == id) {
+            return false;
+        }
+        self.checkpoint();
+        self.project.drawings.retain(|d| d.id != id);
+        self.status = "Drawing deleted".into();
+        true
     }
 
     // ---- menus ----------------------------------------------------------
@@ -3218,6 +3563,201 @@ mod tests {
 
     fn levels(state: &AppState) -> Vec<u16> {
         state.project.tasks.iter().map(|t| t.outline_level).collect()
+    }
+
+    // ---- drawings -------------------------------------------------------
+
+    /// Where the first task's bar sits on the chart, in body coordinates.
+    fn first_bar(state: &AppState) -> (f64, f64) {
+        let scale = state.chart_scale();
+        let (left, right) =
+            bar_edges(&state.project, &scale, state.round_bars, 0).expect("row zero has a bar");
+        ((left + right) / 2.0, ROW_H / 2.0)
+    }
+
+    #[test]
+    fn a_grouped_run_is_one_undo_step_and_one_schedule() {
+        // Without this, a macro over a large plan clones the whole project
+        // once per command and pushes the planner's real history off the end
+        // of the undo stack, then runs the critical path pass just as often.
+        let mut state = AppState::new();
+        for name in ["One", "Two", "Three", "Four"] {
+            state.append_task(name);
+        }
+        let before = state.project.clone();
+        let depth = state.undo.len();
+
+        state.as_one_step(|s| {
+            for row in 0..s.project.tasks.len() {
+                s.select(row);
+                s.set_percent_complete(50);
+            }
+        });
+
+        assert_eq!(
+            state.undo.len(),
+            depth + 1,
+            "a grouped run has to cost exactly one undo step"
+        );
+        assert!(
+            state.project.tasks.iter().all(|t| t.percent_complete == 50),
+            "the work still has to happen"
+        );
+
+        state.undo();
+        assert_eq!(
+            state.project.tasks.iter().map(|t| t.percent_complete).collect::<Vec<_>>(),
+            before.tasks.iter().map(|t| t.percent_complete).collect::<Vec<_>>(),
+            "one undo has to put everything back"
+        );
+    }
+
+    #[test]
+    fn a_drag_that_starts_on_a_bar_anchors_to_that_task() {
+        // Which is what makes an annotation follow its task through a
+        // reschedule instead of staying where the plan used to be.
+        let state = outlined();
+        let (x, y) = first_bar(&state);
+        let task = state.project.tasks[0].id;
+
+        assert!(matches!(
+            state.chart_anchor(x, y),
+            Anchor::Task { task: on, .. } if on == task
+        ));
+    }
+
+    #[test]
+    fn a_drag_that_starts_on_bare_canvas_anchors_to_the_date() {
+        let state = outlined();
+        let scale = state.chart_scale();
+        // Well past the end of every bar.
+        let x = scale.px_per_day * 400.0;
+
+        let Anchor::Timescale { at, row } = state.chart_anchor(x, ROW_H * 1.5) else {
+            unreachable!("nothing is drawn out there to anchor to");
+        };
+        assert_eq!(at, scale.at_x(x), "the date under the pointer");
+        assert_eq!(row, 1.5);
+    }
+
+    #[test]
+    fn drawing_a_shape_costs_one_undo_step() {
+        let mut state = outlined();
+        state.arm_draw_tool(ShapeKind::Rectangle);
+        let before = state.project.clone();
+
+        state.begin_draw(200.0, ROW_H * 1.5);
+        // Several samples on the way, as a real drag delivers them.
+        for step in 1..=8 {
+            state.update_draw_drag(200.0 + step as f64 * 12.0, ROW_H * 1.5 + step as f64 * 2.0);
+        }
+        state.finish_draw_drag();
+
+        assert_eq!(state.project.drawings.len(), 1);
+        assert!(state.draw_tool.is_none(), "the tool disarms once it has drawn");
+        state.undo();
+        assert_eq!(state.project.drawings, before.drawings, "one step undoes it");
+    }
+
+    #[test]
+    fn a_line_dragged_near_upright_is_stored_upright() {
+        // The vertical gate marker, which is what a drawn line is mostly for.
+        let mut state = outlined();
+        state.arm_draw_tool(ShapeKind::Line);
+        state.begin_draw(300.0, 0.0);
+        state.update_draw_drag(306.0, 200.0);
+        state.finish_draw_drag();
+
+        let shape = state.project.drawings.first().expect("a line was drawn");
+        assert_eq!(
+            shape.extent,
+            Extent::Scaled {
+                minutes: 0,
+                rows: 200.0 / ROW_H
+            },
+            "the lean is given away, the drop is kept"
+        );
+    }
+
+    #[test]
+    fn a_bar_will_not_drag_while_a_drawing_tool_is_armed() {
+        // Otherwise marking a plan up quietly reschedules it.
+        let mut state = outlined();
+        state.arm_draw_tool(ShapeKind::Oval);
+        state.begin_bar_drag(3, BarDragKind::Move, 100.0, 26.0);
+        assert!(state.bar_drag.is_none());
+    }
+
+    #[test]
+    fn delete_takes_the_selected_shape_rather_than_the_selected_rows() {
+        let mut state = outlined();
+        state.arm_draw_tool(ShapeKind::Oval);
+        state.begin_draw(300.0, ROW_H * 1.5);
+        state.finish_draw_drag();
+        let rows = state.project.tasks.len();
+
+        state.delete_selected();
+
+        assert!(state.project.drawings.is_empty());
+        assert_eq!(state.project.tasks.len(), rows, "no row was touched");
+    }
+
+    #[test]
+    fn a_click_that_did_not_drag_still_leaves_something_visible() {
+        // A zero-sized shape has nothing to see and nothing to click, so a
+        // click that meant to place one would look like it had done nothing.
+        let mut state = outlined();
+        state.arm_draw_tool(ShapeKind::Rectangle);
+        state.begin_draw(300.0, ROW_H * 1.5);
+        state.finish_draw_drag();
+
+        let shape = state.project.drawings.first().expect("a box was placed");
+        let Extent::Scaled { minutes, rows } = shape.extent else {
+            unreachable!("a box keeps the stretch of plan it covers");
+        };
+        assert!(minutes > 0 && rows > 0.0);
+    }
+
+    #[test]
+    fn moving_a_shape_is_one_step_however_far_the_pointer_travels() {
+        let mut state = outlined();
+        state.arm_draw_tool(ShapeKind::Rectangle);
+        state.begin_draw(300.0, ROW_H * 1.5);
+        state.update_draw_drag(400.0, ROW_H * 2.5);
+        state.finish_draw_drag();
+        let id = state.selected_drawing.expect("the new shape is selected");
+        let before = state.project.drawings.clone();
+
+        state.begin_drawing_move(id);
+        for step in 1..=10 {
+            state.update_draw_drag(400.0 + step as f64 * 10.0, ROW_H * 2.5);
+        }
+        state.finish_draw_drag();
+
+        assert_ne!(state.project.drawings, before, "it moved");
+        state.undo();
+        assert_eq!(state.project.drawings, before, "and one undo puts it back");
+    }
+
+    #[test]
+    fn a_locked_shape_is_selectable_but_does_not_follow_the_pointer() {
+        let mut state = outlined();
+        state.arm_draw_tool(ShapeKind::Rectangle);
+        state.begin_draw(300.0, ROW_H * 1.5);
+        state.finish_draw_drag();
+        let id = state.selected_drawing.expect("the new shape is selected");
+        if let Some(shape) = state.project.drawings.iter_mut().find(|d| d.id == id) {
+            shape.locked = true;
+        }
+        let before = state.project.drawings.clone();
+
+        state.begin_drawing_move(id);
+        assert_eq!(state.selected_drawing, Some(id));
+        assert!(state.draw_drag.is_none(), "nothing is dragging");
+
+        state.update_draw_drag(900.0, 900.0);
+        state.finish_draw_drag();
+        assert_eq!(state.project.drawings, before);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 pub mod agile;
 pub mod calendar;
 pub mod custom;
+pub mod draw;
 pub mod duration;
 pub mod excel;
 pub mod fields;
