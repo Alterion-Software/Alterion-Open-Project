@@ -680,6 +680,12 @@ pub struct AppState {
     /// The column the cursor last sat in. Fill Down works down a column, so it
     /// has to know which one without the grid holding a full cell cursor.
     pub fill_field: Option<Field>,
+    /// The task the pointer is over, wherever it is being pointed at.
+    ///
+    /// Shared rather than per pane, because that is the whole point: a report
+    /// and the chart beside it are two views of one row, and pointing at
+    /// either should light up both.
+    pub hovered_task: Option<usize>,
     /// How deep inside a running macro we are.
     ///
     /// Every mutating method snapshots the plan and reschedules. That is right
@@ -800,6 +806,7 @@ impl AppState {
             cell_draft: String::new(),
             picker_edits: 0,
             fill_field: None,
+            hovered_task: None,
             macro_depth: 0,
             reschedule_owed: false,
             group_by: None,
@@ -3573,6 +3580,23 @@ mod tests {
         let (left, right) =
             bar_edges(&state.project, &scale, state.round_bars, 0).expect("row zero has a bar");
         ((left + right) / 2.0, ROW_H / 2.0)
+    }
+
+    #[test]
+    fn pointing_at_something_is_shared_between_the_panes() {
+        // The report and the chart beside it are two views of one row, so the
+        // hover has to live in one place. Held per pane, pointing at a row
+        // would light up nothing in the other.
+        let mut state = AppState::new();
+        state.append_task("One");
+        state.append_task("Two");
+
+        assert_eq!(state.hovered_task, None);
+        state.hovered_task = Some(1);
+        assert_eq!(state.hovered_task, Some(1), "whichever pane set it, both read it");
+
+        state.hovered_task = None;
+        assert_eq!(state.hovered_task, None, "and leaving clears it");
     }
 
     #[test]

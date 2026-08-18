@@ -415,6 +415,124 @@ fn SyncPaneScroll() -> Element {
     rsx! {}
 }
 
+/// Two internal windows side by side: a tab bar, a draggable splitter, and
+/// each pane able to take the whole frame.
+///
+/// Every split view in the application is this same shape, so it lives once.
+/// The plan puts its table and chart in it; the critical path report puts its
+/// figures and the same chart. Copying the scaffolding instead would mean a
+/// splitter that works in one view and not the other, which is exactly the
+/// drift this exists to prevent.
+#[component]
+fn SplitPanes(
+    left_name: String,
+    left_subtitle: String,
+    right_name: String,
+    left: Element,
+    right: Element,
+) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    // The grip stays under the pointer however the panes are scrolled, so the
+    // drag is tracked from where it started rather than from the grip itself.
+    let mut resize_from = use_signal(|| None::<(f64, f64)>);
+
+    let (grid_width, focus) = {
+        let s = state.read();
+        (s.table_view_width(), s.pane_focus)
+    };
+
+    let mut split_class = String::from("split");
+    match focus {
+        PaneFocus::TableOnly => split_class.push_str(" hide-chart"),
+        PaneFocus::ChartOnly => split_class.push_str(" hide-table"),
+        PaneFocus::Both => {}
+    }
+    if resize_from().is_some() {
+        split_class.push_str(" resizing");
+    }
+
+    rsx! {
+        // The splitter drag listens on the whole window, so a fast pointer
+        // cannot outrun the 5 pixel grip and drop the drag.
+        if resize_from().is_some() {
+            div {
+                class: "drag-shield col-resize",
+                onmousemove: move |event| {
+                    if let Some((from_x, from_width)) = resize_from() {
+                        let moved = event.client_coordinates().x - from_x;
+                        state.write().set_table_width(from_width + moved);
+                    }
+                },
+                onmouseup: move |_| resize_from.set(None),
+            }
+        }
+
+        div { class: "panes",
+            // The two panes scroll sideways on their own, but their rows have
+            // to stay level, so their vertical scroll is tied together.
+            SyncPaneScroll {}
+            div { class: "pane-bar",
+                if focus != PaneFocus::ChartOnly {
+                    // flex: none, or the bar would shrink this tab and it
+                    // would stop lining up with the pane below it.
+                    div { style: "width: {grid_width}px; flex: none; display: flex;",
+                        PaneTab {
+                            name: left_name,
+                            subtitle: left_subtitle,
+                            active: true,
+                            grow: true,
+                            maximised: focus == PaneFocus::TableOnly,
+                            fills: "layout-left".to_string(),
+                            splittable: true,
+                            on_toggle: move |_| state.write().toggle_pane(PaneFocus::TableOnly),
+                        }
+                    }
+                }
+                // The right tab goes with the right pane. Leaving it behind is
+                // a header for a pane that is not there.
+                if focus != PaneFocus::TableOnly {
+                    PaneTab {
+                        name: right_name,
+                        subtitle: String::new(),
+                        active: true,
+                        grow: true,
+                        maximised: focus == PaneFocus::ChartOnly,
+                        fills: "layout-right".to_string(),
+                        splittable: true,
+                        on_toggle: move |_| state.write().toggle_pane(PaneFocus::ChartOnly),
+                    }
+                }
+            }
+
+            div { class: "pane-frame",
+                div {
+                    class: "{split_class}",
+                    onmouseup: move |_| {
+                        // A row drag can end anywhere in the pane.
+                        if state.read().drag_row.is_some() {
+                            state.write().finish_drag();
+                        }
+                    },
+
+                    div { class: "pane-left",
+                        {left}
+                        div {
+                            class: "splitter",
+                            onmousedown: move |event| {
+                                event.prevent_default();
+                                event.stop_propagation();
+                                let width = state.read().table_view_width();
+                                resize_from.set(Some((event.client_coordinates().x, width)));
+                            },
+                        }
+                    }
+                    {right}
+                }
+            }
+        }
+    }
+}
+
 /// One internal window: a title tab plus whatever it frames.
 #[component]
 fn PaneTab(
@@ -466,13 +584,11 @@ fn PaneTab(
 #[component]
 fn Workspace(view: ViewKind) -> Element {
     let mut state = use_context::<Signal<AppState>>();
-    // Where the splitter drag started, and how wide the table was then, so the
-    // grip stays exactly under the pointer however the panes are scrolled.
-    let mut resize_from = use_signal(|| None::<(f64, f64)>);
-
-    let (grid_width, focus, rows, filter) = {
+    // The splitter and the pane widths belong to SplitPanes now; what is left
+    // here is only what the single window views need.
+    let (rows, filter) = {
         let s = state.read();
-        (s.table_view_width(), s.pane_focus, s.visible_rows().len(), s.filter)
+        (s.visible_rows().len(), s.filter)
     };
     let filter_note = if filter == crate::state::TaskFilter::All {
         format!("{rows} rows")
@@ -483,96 +599,45 @@ fn Workspace(view: ViewKind) -> Element {
     match view {
         // The table and the chart are two internal windows sharing one scroll,
         // so their rows stay aligned however far down you go.
-        ViewKind::GanttChart | ViewKind::TrackingGantt => {
-            let mut split_class = String::from("split");
-            match focus {
-                PaneFocus::TableOnly => split_class.push_str(" hide-chart"),
-                PaneFocus::ChartOnly => split_class.push_str(" hide-table"),
-                PaneFocus::Both => {}
+        // The table and the chart are two internal windows sharing one
+        // scroll, so their rows stay aligned however far down you go.
+        ViewKind::GanttChart | ViewKind::TrackingGantt => rsx! {
+            SplitPanes {
+                left_name: "Entry Table".to_string(),
+                left_subtitle: filter_note.clone(),
+                right_name: view.label().to_string(),
+                left: rsx! { grid::TaskGrid {} },
+                right: rsx! { gantt::GanttChart { rows: None, interactive: true } },
             }
-            if resize_from().is_some() {
-                split_class.push_str(" resizing");
-            }
+        },
+
+        // The critical path is two windows for the same reason the plan is:
+        // the report says which tasks are on the chain, the chart says when,
+        // and either on its own is half the answer.
+        ViewKind::CriticalPath => {
+            let chain: Vec<usize> = {
+                let s = state.read();
+                aop_core::critical_path(&s.project)
+                    .into_iter()
+                    .map(|step| step.index)
+                    .collect()
+            };
+            let steps = chain.len();
+            let width = state.read().table_view_width();
 
             rsx! {
-                // The splitter drag listens on the whole window, so a fast
-                // pointer cannot outrun the 5 pixel grip and drop the drag.
-                if resize_from().is_some() {
-                    div {
-                        class: "drag-shield col-resize",
-                        onmousemove: move |event| {
-                            if let Some((from_x, from_width)) = resize_from() {
-                                let moved = event.client_coordinates().x - from_x;
-                                state.write().set_table_width(from_width + moved);
-                            }
-                        },
-                        onmouseup: move |_| resize_from.set(None),
-                    }
-                }
-
-                div { class: "panes",
-                    // The table and the chart scroll sideways on their own, but
-                    // their rows have to stay level, so their vertical scroll is
-                    // tied together.
-                    SyncPaneScroll {}
-                    div { class: "pane-bar",
-                        if focus != PaneFocus::ChartOnly {
-                            // flex: none, or the bar would shrink this tab and
-                            // it would stop lining up with the table below it.
-                            div { style: "width: {grid_width}px; flex: none; display: flex;",
-                                PaneTab {
-                                    name: "Entry Table".to_string(),
-                                    subtitle: filter_note.clone(),
-                                    active: true,
-                                    grow: true,
-                                    maximised: focus == PaneFocus::TableOnly,
-                                    fills: "layout-left".to_string(),
-                                    splittable: true,
-                                    on_toggle: move |_| state.write().toggle_pane(PaneFocus::TableOnly),
-                                }
-                            }
+                SplitPanes {
+                    left_name: "Critical Path".to_string(),
+                    left_subtitle: format!("{steps} on the chain"),
+                    right_name: "Chart".to_string(),
+                    left: rsx! {
+                        div { class: "grid-pane cp-report", style: "width: {width}px;",
+                            views::ReportPage { kind: view }
                         }
-                        // The chart's own tab goes with the chart. Leaving it
-                        // behind is a header for a pane that is not there.
-                        if focus != PaneFocus::TableOnly {
-                            PaneTab {
-                                name: view.label().to_string(),
-                                subtitle: String::new(),
-                                active: true,
-                                grow: true,
-                                maximised: focus == PaneFocus::ChartOnly,
-                                fills: "layout-right".to_string(),
-                                splittable: true,
-                                on_toggle: move |_| state.write().toggle_pane(PaneFocus::ChartOnly),
-                            }
-                        }
-                    }
-
-                    div { class: "pane-frame",
-                        div {
-                            class: "{split_class}",
-                            onmouseup: move |_| {
-                                // A row drag can end anywhere in the pane.
-                                if state.read().drag_row.is_some() {
-                                    state.write().finish_drag();
-                                }
-                            },
-
-                            div { class: "pane-left",
-                                grid::TaskGrid {}
-                                div {
-                                    class: "splitter",
-                                    onmousedown: move |event| {
-                                        event.prevent_default();
-                                        event.stop_propagation();
-                                        let width = state.read().table_view_width();
-                                        resize_from.set(Some((event.client_coordinates().x, width)));
-                                    },
-                                }
-                            }
-                            gantt::GanttChart { rows: None, interactive: true }
-                        }
-                    }
+                    },
+                    right: rsx! {
+                        gantt::GanttChart { rows: Some(chain), interactive: false }
+                    },
                 }
             }
         }

@@ -416,9 +416,9 @@ pub fn GanttChart(
     let mut state = use_context::<Signal<AppState>>();
     let s = state.read();
 
-    let project = &s.project;
-    let scale = Scale { origin: chart_range(project).0, px_per_day: s.zoom.px_per_day() };
     let (grid_rows, grid_columns) = (s.grid_rows, s.grid_columns);
+    let hovered_task = s.hovered_task;
+    let px_per_day = s.zoom.px_per_day();
     drop(s);
 
     // A report's rows come from the caller and can change from one render to
@@ -450,6 +450,7 @@ pub fn GanttChart(
     let Some(layout) = inline_layout.as_ref().or((*memo_layout).as_ref()) else {
         return rsx! {};
     };
+    let scale = Scale { origin: layout.from, px_per_day };
     let ChartLayout {
         rows,
         width,
@@ -798,6 +799,7 @@ pub fn GanttChart(
                             _ => (0.0, bar_w, task.percent_complete),
                         };
                         let dragging_this = drag.is_some_and(|d| d.row == index);
+                        let hovered = hovered_task == Some(index);
                         let done_w = ghost_w * ghost_pct as f64 / 100.0;
                         let tip = format!(
                             "{}\n{} \u{2192} {}\n{} \u{00b7} {}% complete{}",
@@ -814,8 +816,19 @@ pub fn GanttChart(
                                 key: "bar{index}",
 
                                 onmouseenter: move |_| {
+                                    let mut writer = state.write();
+                                    // Pointing at something is reading, not
+                                    // editing, so it works in a report too:
+                                    // the row it belongs to lights up beside it.
+                                    writer.hovered_task = Some(index);
                                     if interactive {
-                                        state.write().set_bar_hover(index);
+                                        writer.set_bar_hover(index);
+                                    }
+                                },
+                                onmouseleave: move |_| {
+                                    let mut writer = state.write();
+                                    if writer.hovered_task == Some(index) {
+                                        writer.hovered_task = None;
                                     }
                                 },
                                 onclick: move |_| {
@@ -859,6 +872,17 @@ pub fn GanttChart(
                                     }
                                 }
 
+                                // A band across the whole row, so a milestone,
+                                // which has no bar edge to outline, still says
+                                // it is the one being pointed at.
+                                if hovered {
+                                    rect {
+                                        x: "0", y: "{y}", width: "{width}", height: "{ROW_H}",
+                                        fill: "var(--selection)",
+                                        style: "pointer-events: none;",
+                                    }
+                                }
+
                                 if project.is_marker(index) {
                                     g {
                                         onmousedown: move |event| {
@@ -888,8 +912,8 @@ pub fn GanttChart(
                                             x: "{left + ghost_dx}", y: "{bar_y}",
                                             width: "{ghost_w}", height: "{BAR_H}",
                                             rx: "1.5", fill: "{fill}",
-                                            stroke: if dragging_this { "var(--accent-bright)" } else { "var(--bar-edge)" },
-                                            stroke_width: if dragging_this { "1.2" } else { "0.6" },
+                                            stroke: if dragging_this || hovered { "var(--accent-bright)" } else { "var(--bar-edge)" },
+                                            stroke_width: if dragging_this || hovered { "1.4" } else { "0.6" },
                                             opacity: if dragging_this { "0.85" } else { "1" },
                                         }
                                         if done_w > 0.5 {
@@ -1744,6 +1768,43 @@ mod tests {
     /// passes no rows of its own, and when it does the chart has to draw
     /// exactly the lines the plan lays out, bands included: one line more or
     /// fewer here slides every bar off its row in the grid beside it.
+    #[test]
+    fn a_bar_is_placed_at_the_same_origin_the_layout_used() {
+        // The render body used to build its own scale from the whole plan
+        // while the layout positioned bars from the range it actually chose.
+        // For a report those are different dates, so every bar landed
+        // thousands of pixels off the canvas and only the dependency arrows,
+        // which read the layout's own geometry, appeared.
+        let mut state = AppState::new();
+        for name in ["A", "B", "C", "D"] {
+            state.append_task(name);
+        }
+        state.reschedule();
+
+        // A report over the last two rows, whose range starts later than the
+        // plan's does.
+        let picked: Vec<usize> = vec![2, 3];
+        let lines = chart_rows(&state, Some(&picked));
+        let layout = build_layout(&state, lines, Some(&picked));
+
+        let scale = Scale { origin: layout.from, px_per_day: 26.0 };
+        for &index in &picked {
+            let task = &state.project.tasks[index];
+            let drawn = scale.x_work(&state.project.calendar, task.scheduled.start);
+            let geometry = layout
+                .boxes
+                .get(&task.id)
+                .map(|b| b.left)
+                .expect("every reported row has geometry");
+            assert!(
+                (drawn - geometry).abs() < 0.001,
+                "{} draws at {drawn} but its geometry says {geometry}",
+                task.name
+            );
+            assert!(drawn >= 0.0, "{} would be off the left of the canvas", task.name);
+        }
+    }
+
     #[test]
     fn a_report_actually_has_bars_to_draw() {
         // The chart came out with dependency arrows and no bars at all, which

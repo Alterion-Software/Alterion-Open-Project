@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 
 use aop_core::{format_duration, format_work, ResourceKind, TaskId};
 
-use crate::gantt::{chart_range, GanttChart, Scale};
+use crate::gantt::{chart_range, Scale};
 use crate::state::{format_date, AppState, Dialog, ViewKind};
 
 // -------------------------------------------------------- resource sheet
@@ -1221,9 +1221,10 @@ fn IterationTable(metrics: aop_core::agile::Metrics) -> Element {
 /// The critical path as a page: the chain, then every task on it.
 #[component]
 fn CriticalPathPage() -> Element {
-    let state = use_context::<Signal<AppState>>();
+    let mut state = use_context::<Signal<AppState>>();
     let s = state.read();
     let project = &s.project;
+    let hovered = s.hovered_task;
 
     let path = aop_core::critical_path(project);
     let minutes = aop_core::critical_path_minutes(project, &path);
@@ -1251,51 +1252,12 @@ fn CriticalPathPage() -> Element {
             div { class: "empty-state", style: "height: 160px;",
                 "Nothing is critical: every task has slack." }
         } else {
-            h2 { class: "rep-section", "The chain" }
-            // Names beside the chart, the way the plan itself is laid out. A
-            // chart on its own says when things happen but not what they are,
-            // and the whole point of the report is to be read.
-            //
-            // The two line up because the heading matches the timescale's
-            // height and every name row matches a chart row, both taken from
-            // the chart's own constants rather than guessed at.
-            div { class: "cp-split",
-                div { class: "cp-names",
-                    div { class: "cp-names-head" }
-                    for (number, step) in path.iter().enumerate() {
-                        {
-                            let name = project
-                                .tasks
-                                .get(step.index)
-                                .map(|task| task.name.clone())
-                                .unwrap_or_default();
-                            let joint = step
-                                .link_from_previous
-                                .map(|kind| kind.code().to_string())
-                                .unwrap_or_else(|| "start".into());
-                            rsx! {
-                                div { class: "cp-names-row", key: "cn{number}",
-                                    span { class: "cp-names-num", "{number + 1}" }
-                                    span { class: "cp-names-name", title: "{name}", "{name}" }
-                                    span { class: "cp-names-joint", "{joint}" }
-                                }
-                            }
-                        }
-                    }
-                }
-                // The same renderer the plan is drawn with, handed just the
-                // chain, so a report and the view it reports on cannot drift.
-                GanttChart {
-                    rows: Some(path.iter().map(|step| step.index).collect::<Vec<_>>()),
-                    interactive: false,
-                }
-            }
             div { class: "cp-legend",
-                // The chart draws the chain in the plan's own critical bar
-                // colour, so the swatch takes it too rather than naming a
-                // colour the reader may not be looking at.
+                // The chart beside this draws the chain in the plan's own
+                // critical bar colour, so the swatch takes it from there
+                // rather than naming a colour the reader is not looking at.
                 span { class: "cp-swatch", style: "background: {project.bar_styles.critical};" }
-                "These bars are the critical path. Every task here has zero slack, so delaying any one of them moves the project finish."
+                "The chart beside this is the chain, in order. Every task on it has zero slack, so delaying any one of them moves the project finish."
             }
 
             h2 { class: "rep-section", "Task by task" }
@@ -1313,8 +1275,22 @@ fn CriticalPathPage() -> Element {
                             let joint = step.link_from_previous
                                 .map(|kind| kind.label().to_string())
                                 .unwrap_or_else(|| "starts the path".into());
+                            let row = step.index;
+                            let hot = if hovered == Some(row) { "hot" } else { "" };
                             rsx! {
-                                tr { key: "c{step.index}",
+                                // Pointing at a row lights up its bar in the
+                                // chart beside this, and the other way round.
+                                // The two panes are one answer read two ways.
+                                tr {
+                                    key: "c{step.index}",
+                                    class: "{hot}",
+                                    onmouseenter: move |_| state.write().hovered_task = Some(row),
+                                    onmouseleave: move |_| {
+                                        let mut writer = state.write();
+                                        if writer.hovered_task == Some(row) {
+                                            writer.hovered_task = None;
+                                        }
+                                    },
                                     td { "{number + 1}" }
                                     td { "{task.name}" }
                                     td { class: "muted", "{joint}" }

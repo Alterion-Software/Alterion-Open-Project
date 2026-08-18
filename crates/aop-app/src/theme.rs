@@ -2003,40 +2003,26 @@ button { font: inherit; color: inherit; }
 /* The chart standing in for a report figure. A report is a picture of one
    chain rather than a pane you scroll, so it is sized by the chart inside it
    and the whole thing is there at once. */
-/* Names beside the chart, lined up row for row. The heading height and the
-   row height are the chart's own, so the two panes cannot slide apart. */
-.cp-split {
-  display: flex;
-  align-items: flex-start;
-  border: 1px solid var(--grid-line);
-  border-radius: 4px;
-  overflow-x: auto;
-  background: var(--surface);
+/* The critical path's left window: the report itself, scrolling on its own
+   beside the chart, the way the entry table sits beside the plan. */
+.cp-report {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 14px;
 }
-.cp-names { flex: none; width: 280px; border-right: 1px solid var(--grid-line); }
-.cp-names-head { height: 38px; border-bottom: 1px solid var(--grid-line); background: var(--grid-header); }
-.cp-names-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 22px;
-  padding: 0 8px;
-  font-size: 11px;
-  color: var(--ink);
-  box-sizing: border-box;
-}
-.cp-names-row:nth-child(even) { background: var(--hover); }
-.cp-names-num  { flex: none; width: 18px; color: var(--ink-soft); text-align: right; }
-.cp-names-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cp-names-joint { flex: none; font-size: 9px; color: var(--ink-soft); }
+.cp-report .rep-head { margin-top: 0; }
 
-.chart-pane.report {
-  flex: none;
-  align-self: flex-start;
-  width: max-content;
-  overflow: visible;
-  margin-bottom: 4px;
+/* Pointing at a row here outlines its bar in the chart, and pointing at a bar
+   outlines the row. Two panes, one answer. */
+.rep-table tr.hot td {
+  background: var(--selection);
+  box-shadow: inset 0 0 0 1px var(--accent-bright);
 }
+.rep-table tbody tr { cursor: default; }
+
+/* A report's chart sits in the same split the plan does, so it needs no
+   overrides of its own: the window gives it a height, and it scrolls sideways
+   exactly as the main one does. */
 
 /* Holds the chart's own width so the pane above can scroll to it. */
 .chart-canvas { display: block; }
