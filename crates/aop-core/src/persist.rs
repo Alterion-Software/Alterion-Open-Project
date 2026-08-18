@@ -267,7 +267,9 @@ pub fn print_body(project: &Project) -> String {
     let mut out = String::new();
 
     let critical = (0..project.tasks.len())
-        .filter(|&i| !project.is_summary(i) && crate::issues::shows_as_critical(project, i))
+        // A count of what the schedule says, not of what the warning list is
+        // currently showing.
+        .filter(|&i| !project.is_summary(i) && project.tasks[i].scheduled.critical)
         .count();
     let duration = format_duration(
         project

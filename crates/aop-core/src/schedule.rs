@@ -996,6 +996,52 @@ mod tests {
     }
 
     #[test]
+    fn ignoring_a_warning_does_not_take_a_task_off_the_critical_path() {
+        // The path was selected with `shows_as_critical`, which is a
+        // presentation rule: it hides tasks whose critical warning the planner
+        // has dismissed. Dismissing a warning is a statement about the warning
+        // list, not about the schedule, and letting it reach the algorithm
+        // broke the chain in half wherever it was used.
+        let mut project = Project::blank(
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 2)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        );
+        let mut ids = Vec::new();
+        for name in ["First", "Second", "Third"] {
+            let id = project.allocate_task_id();
+            project.tasks.push(crate::model::Task::new(id, name, 480));
+            ids.push(id);
+        }
+        for pair in ids.windows(2) {
+            project.links.push(Link {
+                predecessor: pair[0],
+                successor: pair[1],
+                kind: LinkType::FS,
+                lag_minutes: 0,
+            });
+        }
+        schedule(&mut project).expect("a straight chain schedules");
+
+        let whole = critical_path(&project);
+        assert_eq!(whole.len(), 3, "a straight chain of three is the path");
+
+        // The planner dismisses the middle task's critical warning.
+        project.tasks[1]
+            .ignored_issues
+            .push(crate::model::IssueKind::Critical);
+
+        let after = critical_path(&project);
+        assert_eq!(
+            after.len(),
+            3,
+            "dismissing a warning must not remove the task from the chain, got {:?}",
+            after.iter().map(|s| project.tasks[s.index].name.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn a_loop_is_reported_as_the_loop_and_not_everything_leading_into_it() {
         // Walking to a cycle from an arbitrary task passes through everything
         // upstream of it. Naming all of that buries the two or three tasks the
@@ -1618,11 +1664,16 @@ pub struct CriticalStep {
 /// Summary rows are left out: their span is rolled up from their children, so
 /// including them would put the same time on the path twice.
 pub fn critical_path(project: &Project) -> Vec<CriticalStep> {
+    // What the scheduler worked out, not what the warning list chooses to
+    // show. `shows_as_critical` also hides tasks whose critical warning the
+    // planner has dismissed, and dismissing a warning says nothing about the
+    // schedule: letting it reach the algorithm broke the chain wherever one
+    // had been dismissed, and the report then drew a fragment of the path.
     let candidates: Vec<usize> = (0..project.tasks.len())
         .filter(|&index| {
             !project.is_summary(index)
                 && project.tasks[index].active
-                && crate::issues::shows_as_critical(project, index)
+                && project.tasks[index].scheduled.critical
         })
         .collect();
 
@@ -1802,15 +1853,28 @@ mod critical_path_tests {
     }
 
     #[test]
-    fn an_acknowledged_task_drops_off_the_path() {
-        // Consistent with everywhere else: ignoring criticality demotes it.
+    fn an_acknowledged_task_stays_on_the_path() {
+        // Dismissing a critical warning is about the warning list and the
+        // colour a bar is drawn in. It is not a statement about the schedule,
+        // so the path itself must not change: a chain with a piece missing is
+        // not a shorter critical path, it is a wrong one.
         let mut project = chain(&[480, 480]);
         crate::schedule(&mut project).unwrap();
         assert_eq!(critical_path(&project).len(), 2);
 
         crate::issues::ignore(&mut project, 1, crate::model::IssueKind::Critical);
         let path = critical_path(&project);
-        assert!(path.iter().all(|s| s.index != 1));
+        assert_eq!(path.len(), 2, "the chain is unchanged");
+        assert!(
+            path.iter().any(|s| s.index == 1),
+            "the dismissed task is still on the path it is on"
+        );
+
+        // The colouring is where it does take effect, and still does.
+        assert!(
+            !crate::issues::shows_as_critical(&project, 1),
+            "the bar stops being drawn as critical, which is the whole effect"
+        );
     }
 
     #[test]

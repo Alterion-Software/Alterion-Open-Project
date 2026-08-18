@@ -1745,6 +1745,50 @@ mod tests {
     /// exactly the lines the plan lays out, bands included: one line more or
     /// fewer here slides every bar off its row in the grid beside it.
     #[test]
+    fn a_report_actually_has_bars_to_draw() {
+        // The chart came out with dependency arrows and no bars at all, which
+        // means the geometry existed but the bar loop's own filter rejected
+        // every row. Arrows read the layout; bars are filtered again against
+        // the window and the span, so those are what this pins.
+        let mut state = AppState::new();
+        for name in ["A", "B", "C"] {
+            state.append_task(name);
+        }
+        state.reschedule();
+
+        let picked: Vec<usize> = vec![0, 1, 2];
+        let lines = chart_rows(&state, Some(&picked));
+        let layout = build_layout(&state, lines, Some(&picked));
+
+        assert_eq!(layout.rows.len(), 3, "every asked for row has to be a line");
+        assert_eq!(layout.boxes.len(), 3, "every line needs bar geometry");
+
+        let rows_len = layout.rows.len();
+        let window = RowWindow { first: 0, end: rows_len, above: 0.0, below: 0.0 };
+        let span = SpanWindow { left: f64::NEG_INFINITY, right: f64::INFINITY };
+
+        let drawn = layout
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(task_line)
+            .filter(|(line, index)| {
+                window.holds(*line) && {
+                    // The geometry the layout already worked out, which is
+                    // the same span the bar loop tests against.
+                    let id = state.project.tasks[*index].id;
+                    match layout.boxes.get(&id) {
+                        Some(box_) => span.overlaps(box_.left, box_.right),
+                        None => false,
+                    }
+                }
+            })
+            .count();
+
+        assert_eq!(drawn, 3, "all three bars have to survive the filter");
+    }
+
+    #[test]
     fn a_report_is_scaled_to_the_rows_it_draws_not_the_whole_plan() {
         // A short chain inside a long plan would otherwise be a small cluster
         // of bars in a mostly empty chart, which defeats the point of the

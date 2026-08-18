@@ -1227,8 +1227,11 @@ fn CriticalPathPage() -> Element {
 
     let path = aop_core::critical_path(project);
     let minutes = aop_core::critical_path_minutes(project, &path);
+    // The scheduler's own answer, not the warning list's. Dismissing a
+    // critical warning changes the colour a bar is drawn in; it does not give
+    // the task slack, so it must not change the count either.
     let zero_slack = (0..project.tasks.len())
-        .filter(|&i| !project.is_summary(i) && aop_core::issues::shows_as_critical(project, i))
+        .filter(|&i| !project.is_summary(i) && project.tasks[i].scheduled.critical)
         .count();
 
     rsx! {
@@ -1249,11 +1252,43 @@ fn CriticalPathPage() -> Element {
                 "Nothing is critical: every task has slack." }
         } else {
             h2 { class: "rep-section", "The chain" }
-            // The same renderer the plan is drawn with, handed just the chain,
-            // so a report and the view it reports on cannot drift apart.
-            GanttChart {
-                rows: Some(path.iter().map(|step| step.index).collect::<Vec<_>>()),
-                interactive: false,
+            // Names beside the chart, the way the plan itself is laid out. A
+            // chart on its own says when things happen but not what they are,
+            // and the whole point of the report is to be read.
+            //
+            // The two line up because the heading matches the timescale's
+            // height and every name row matches a chart row, both taken from
+            // the chart's own constants rather than guessed at.
+            div { class: "cp-split",
+                div { class: "cp-names",
+                    div { class: "cp-names-head" }
+                    for (number, step) in path.iter().enumerate() {
+                        {
+                            let name = project
+                                .tasks
+                                .get(step.index)
+                                .map(|task| task.name.clone())
+                                .unwrap_or_default();
+                            let joint = step
+                                .link_from_previous
+                                .map(|kind| kind.code().to_string())
+                                .unwrap_or_else(|| "start".into());
+                            rsx! {
+                                div { class: "cp-names-row", key: "cn{number}",
+                                    span { class: "cp-names-num", "{number + 1}" }
+                                    span { class: "cp-names-name", title: "{name}", "{name}" }
+                                    span { class: "cp-names-joint", "{joint}" }
+                                }
+                            }
+                        }
+                    }
+                }
+                // The same renderer the plan is drawn with, handed just the
+                // chain, so a report and the view it reports on cannot drift.
+                GanttChart {
+                    rows: Some(path.iter().map(|step| step.index).collect::<Vec<_>>()),
+                    interactive: false,
+                }
             }
             div { class: "cp-legend",
                 // The chart draws the chain in the plan's own critical bar
