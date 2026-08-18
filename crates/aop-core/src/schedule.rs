@@ -167,6 +167,9 @@ fn build_graph(project: &Project) -> Result<Graph, ScheduleError> {
     let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut indegree: HashMap<usize, usize> = leaves.iter().map(|&i| (i, 0)).collect();
 
+    // A link onto a summary applies to each of its leaves, so every link is
+    // first flattened to the pairs of real tasks it actually joins.
+    let mut edges: Vec<(usize, usize, Link)> = Vec::new();
     for link in &project.links {
         let (Some(pred_leaves), Some(succ_leaves)) = (
             leaves_of.get(&link.predecessor),
@@ -174,29 +177,69 @@ fn build_graph(project: &Project) -> Result<Graph, ScheduleError> {
         ) else {
             continue;
         };
-        if pred_leaves.is_empty() || succ_leaves.is_empty() {
-            continue;
-        }
-        // A link onto a summary applies to each of its leaves.
-        for &succ in succ_leaves {
-            if pred_leaves.contains(&succ) {
-                continue;
-            }
-            incoming.entry(succ).or_default().push(*link);
-        }
         for &pred in pred_leaves {
-            if succ_leaves.contains(&pred) {
-                continue;
-            }
-            outgoing.entry(pred).or_default().push(*link);
             for &succ in succ_leaves {
-                if pred == succ {
-                    continue;
+                if pred != succ {
+                    edges.push((pred, succ, *link));
                 }
-                adjacency.entry(pred).or_default().push(succ);
-                *indegree.entry(succ).or_insert(0) += 1;
             }
         }
+    }
+
+    // A task that has been switched off takes no part in the schedule: it does
+    // not push its successors and it does not wait on its predecessors. What it
+    // must not do is break the chain it sits in, so the logic either side of it
+    // is joined up, which is what Project has done since 2013.
+    //
+    // The lag of the link into the inactive task is dropped and the link type
+    // of the one leaving it is kept, because that second link is the one that
+    // still describes how the surviving pair meet.
+    let inactive: HashSet<usize> = leaves
+        .iter()
+        .copied()
+        .filter(|&i| !project.tasks[i].active)
+        .collect();
+
+    if !inactive.is_empty() {
+        // A run of switched off tasks in a row has to be stepped over in one
+        // go, so short cuts are added until no new one appears. Nothing is
+        // removed until then: dropping an edge as soon as it touches a
+        // switched off task severs the chain before the far side has been
+        // reached, which leaves the successor with no predecessor at all.
+        //
+        // Each pass can only add a pair that is not already there, and there
+        // are finitely many pairs, so this settles. The bound is belt and
+        // braces against a plan whose links form a cycle, which is caught
+        // later rather than here.
+        for _ in 0..=inactive.len() {
+            let mut bridged: Vec<(usize, usize, Link)> = Vec::new();
+            for (pred, gap, _) in edges.iter().filter(|(_, succ, _)| inactive.contains(succ)) {
+                for (_, succ, onward) in edges.iter().filter(|(from, _, _)| from == gap) {
+                    let already = edges
+                        .iter()
+                        .any(|(a, b, _)| a == pred && b == succ)
+                        || bridged.iter().any(|(a, b, _)| a == pred && b == succ);
+                    if pred != succ && !already {
+                        bridged.push((*pred, *succ, *onward));
+                    }
+                }
+            }
+            if bridged.is_empty() {
+                break;
+            }
+            edges.extend(bridged);
+        }
+
+        // Now that every surviving pair has been joined up, the switched off
+        // tasks themselves drop out of the network.
+        edges.retain(|(pred, succ, _)| !inactive.contains(pred) && !inactive.contains(succ));
+    }
+
+    for (pred, succ, link) in edges {
+        incoming.entry(succ).or_default().push(link);
+        outgoing.entry(pred).or_default().push(link);
+        adjacency.entry(pred).or_default().push(succ);
+        *indegree.entry(succ).or_insert(0) += 1;
     }
 
     // Kahn's algorithm, seeded in row order so an unlinked plan keeps its
@@ -993,6 +1036,86 @@ mod tests {
             project.push_task(format!("Task {}", n + 1), duration);
         }
         project
+    }
+
+    #[test]
+    fn a_switched_off_task_neither_delays_nor_breaks_the_chain() {
+        // Microsoft's rule is that an inactive task "does not affect resource
+        // availability, the project schedule, or how other tasks are
+        // scheduled", and from 2013 the logic either side of it is joined so
+        // the chain stays whole. Ours used to leave it holding its successor
+        // back while contributing nothing.
+        let mut project = Project::blank(
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 5)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        );
+        let mut ids = Vec::new();
+        for name in ["P", "Q", "R"] {
+            let id = project.allocate_task_id();
+            project.tasks.push(crate::model::Task::new(id, name, 960));
+            ids.push(id);
+        }
+        for pair in ids.windows(2) {
+            project.links.push(Link {
+                predecessor: pair[0],
+                successor: pair[1],
+                kind: LinkType::FS,
+                lag_minutes: 0,
+            });
+        }
+
+        schedule(&mut project).expect("schedules");
+        let with_all = project.tasks[2].scheduled.start;
+
+        project.tasks[1].active = false;
+        schedule(&mut project).expect("still schedules");
+
+        assert!(
+            project.tasks[2].scheduled.start < with_all,
+            "R must move earlier once Q is switched off, but it stayed at {}",
+            project.tasks[2].scheduled.start
+        );
+        assert_eq!(
+            project.tasks[2].scheduled.start,
+            project.calendar.next_working_instant(project.tasks[0].scheduled.finish),
+            "R has to follow P directly, since the logic is bridged over Q"
+        );
+    }
+
+    #[test]
+    fn a_run_of_switched_off_tasks_is_stepped_over_in_one_go() {
+        let mut project = Project::blank(
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 5)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        );
+        let mut ids = Vec::new();
+        for name in ["A", "B", "C", "D"] {
+            let id = project.allocate_task_id();
+            project.tasks.push(crate::model::Task::new(id, name, 480));
+            ids.push(id);
+        }
+        for pair in ids.windows(2) {
+            project.links.push(Link {
+                predecessor: pair[0],
+                successor: pair[1],
+                kind: LinkType::FS,
+                lag_minutes: 0,
+            });
+        }
+        // Two in a row, so one pass of bridging is not enough.
+        project.tasks[1].active = false;
+        project.tasks[2].active = false;
+
+        schedule(&mut project).expect("schedules");
+        assert_eq!(
+            project.tasks[3].scheduled.start,
+            project.calendar.next_working_instant(project.tasks[0].scheduled.finish),
+            "D has to follow A across both switched off tasks"
+        );
     }
 
     #[test]
