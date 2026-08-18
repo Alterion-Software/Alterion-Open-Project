@@ -107,7 +107,7 @@ unsafe extern "C" fn rename_me(argc: c_int, argv: *mut *mut c_char, _envp: *mut 
                 break;
             }
             block[at..at + arg.len()].copy_from_slice(arg);
-            *argv.offset((index + 1) as isize) = first.add(at);
+            *argv.add(index + 1) = first.add(at);
             at += arg.len();
         }
     }

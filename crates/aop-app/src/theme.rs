@@ -1897,6 +1897,9 @@ button { font: inherit; color: inherit; }
 .dlg .picker .ctxheader { display: none; }
 .dlg .picker .pred-list { max-height: 300px; }
 
+.picker-cell { display: block; width: 100%; height: 100%; }
+.picker-cell .cell-input { width: 100%; }
+
 .pred-type { display: flex; align-items: center; gap: 8px; padding: 8px 10px 0; }
 .pred-type label { color: var(--ink-soft); font-size: 11px; flex: none; }
 .pred-type .bs-input { flex: 1; min-width: 0; }

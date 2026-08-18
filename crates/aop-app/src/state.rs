@@ -598,6 +598,14 @@ pub struct AppState {
     /// How levelling should behave, kept between runs like Project keeps it.
     pub leveling: aop_core::leveling::LevelingOptions,
     pub editing: Option<(usize, Column)>,
+    /// The text in the cell being edited, when that cell is one the picker
+    /// also writes to.
+    ///
+    /// Held here rather than inside the editor because two things edit a
+    /// predecessor cell at once: the planner typing, and the picker ticking
+    /// boxes. A draft owned by the input would go stale the moment a box was
+    /// ticked, and blur would then write the stale text back over the change.
+    pub cell_draft: String,
     /// The column the cursor last sat in. Fill Down works down a column, so it
     /// has to know which one without the grid holding a full cell cursor.
     pub fill_field: Option<Field>,
@@ -700,6 +708,7 @@ impl AppState {
             dirty: false,
             selection: Vec::new(),
             selected_resource: None,
+            cell_draft: String::new(),
             fill_field: None,
             group_by: None,
             text_styles: aop_core::textstyle::TextStyles::new(),
@@ -2579,6 +2588,27 @@ impl AppState {
         self.editing = Some((row, column));
         self.popup_at = (x, y);
         self.context_menu = None;
+        self.cell_draft = self.cell_text(row, column);
+    }
+
+    /// What a cell currently reads, as the planner would type it.
+    pub fn cell_text(&self, row: usize, column: Column) -> String {
+        let Some(task) = self.project.tasks.get(row) else {
+            return String::new();
+        };
+        match column {
+            Column::Predecessors => self.project.predecessor_text(task.id),
+            Column::Resources => self.project.resource_text(task),
+            _ => String::new(),
+        }
+    }
+
+    /// Put the typed text back in step with the plan after the picker has
+    /// changed something.
+    pub fn refresh_cell_draft(&mut self) {
+        if let Some((row, column)) = self.editing {
+            self.cell_draft = self.cell_text(row, column);
+        }
     }
 
     pub fn open_task_menu(&mut self, row: usize, x: f64, y: f64) {

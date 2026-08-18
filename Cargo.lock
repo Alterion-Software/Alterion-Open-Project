@@ -156,6 +156,8 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "alterion-mpp-parser"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "418aca0cc5a91527f6cb99d65e1e0c71c5d457390e1e910af5202c5bd09dbd7b"
 dependencies = [
  "cfb 0.14.0",
  "chrono",
@@ -259,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "aop-app"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "aop-core",
  "chrono",
@@ -274,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "aop-core"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "alterion-mpp-parser",
  "calamine",
@@ -290,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "aop-procname"
-version = "0.1.0"
+version = "0.1.0-beta"
 
 [[package]]
 name = "app_units"

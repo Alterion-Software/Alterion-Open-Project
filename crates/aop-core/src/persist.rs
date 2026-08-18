@@ -188,13 +188,25 @@ pub fn open_any(path: &Path) -> Result<Project, String> {
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
 
-    if matches!(extension.as_str(), "xlsx" | "xlsm" | "xls" | "ods") {
-        crate::excel::open(path).map_err(|e| e.to_string())
+    let mut project = if matches!(extension.as_str(), "xlsx" | "xlsm" | "xls" | "ods") {
+        crate::excel::open(path).map_err(|e| e.to_string())?
     } else if IMPORTED_EXTENSIONS.contains(&extension.as_str()) {
-        crate::mspdi::open(path).map_err(|e| e.to_string())
+        crate::mspdi::open(path).map_err(|e| e.to_string())?
     } else {
-        open(path).map_err(|e| e.to_string())
-    }
+        open(path).map_err(|e| e.to_string())?
+    };
+
+    // Everything derived comes from the scheduler: dates, slack, the critical
+    // path, rolled up summary durations, cost. A plan handed back before that
+    // has run carries whatever the file happened to hold, which for an import
+    // is mostly nothing, so anything reading it straight away sees zeros. The
+    // window reschedules after opening and so looked right; an export did not
+    // and wrote a duration of zero for every task.
+    //
+    // A plan that will not schedule is still returned: the caller shows the
+    // error and lets the planner fix it, which they cannot do if opening fails.
+    let _ = crate::schedule(&mut project);
+    Ok(project)
 }
 
 /// Export the task table as CSV, for the Export command.
@@ -615,6 +627,39 @@ th:nth-child(3), td:nth-child(3) { width: 34%; }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_plan_comes_back_from_open_already_scheduled() {
+        // Everything derived hangs off the scheduler. Handing a plan back
+        // before it has run left every task with a scheduled duration of
+        // zero, which the window hid by rescheduling itself and an export
+        // did not.
+        let mut project = Project::blank(
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 2)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        );
+        for name in ["One", "Two"] {
+            let id = project.allocate_task_id();
+            project.tasks.push(crate::model::Task::new(id, name, 480));
+        }
+        let dir = std::env::temp_dir().join(format!("aop-open-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("plan.aprj");
+        save(&path, &project).expect("written");
+
+        let back = open_any(&path).expect("read");
+        for task in &back.tasks {
+            assert_eq!(
+                task.duration_minutes, task.scheduled.duration_minutes,
+                "{} came back unscheduled",
+                task.name
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+
     use super::*;
     use crate::templates;
     use chrono::NaiveDate;

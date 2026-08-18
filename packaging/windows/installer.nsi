@@ -14,6 +14,12 @@ Unicode true
   !define VERSION "0.1.0"
 !endif
 
+; The display version can carry a pre-release suffix; this one cannot, because
+; a Windows version resource is four numbers and nothing else.
+!ifndef FILEVERSION
+  !define FILEVERSION "0.1.0.0"
+!endif
+
 !define APPNAME    "Alterion Open Project"
 !define COMPANY    "Alterion"
 !define EXENAME    "alterion-open-project.exe"
@@ -28,7 +34,7 @@ InstallDirRegKey HKLM "Software\${COMPANY}\${APPNAME}" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${FILEVERSION}"
 VIAddVersionKey "ProductName"     "${APPNAME}"
 VIAddVersionKey "CompanyName"     "${COMPANY}"
 VIAddVersionKey "FileDescription" "${APPNAME} installer"
@@ -61,6 +67,13 @@ Section "${APPNAME} (required)" SecCore
   File "README.md"
   File "app.ico"
 
+  ; Present only when the build script found them. A MinGW built binary can
+  ; need a few runtime libraries beside it, and the WebView2 bootstrapper is
+  ; fetched at build time; both are optional so the installer still builds
+  ; without a network connection.
+  File /nonfatal "*.dll"
+  File /nonfatal "MicrosoftEdgeWebview2Setup.exe"
+
   WriteRegStr HKLM "Software\${COMPANY}\${APPNAME}" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "Software\${COMPANY}\${APPNAME}" "Version" "${VERSION}"
 
@@ -79,7 +92,64 @@ Section "${APPNAME} (required)" SecCore
   WriteRegDWORD HKLM "${REGKEY}" "EstimatedSize" "$0"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
+
+  ; The window is a WebView2 control, so without the runtime the application
+  ; starts and then shows nothing at all. Windows 11 ships it and most updated
+  ; Windows 10 machines have it through Edge, but neither is a guarantee, so it
+  ; is checked rather than assumed.
+  ;
+  ; The version string is written under one of three keys depending on whether
+  ; the runtime was installed per machine, per user, or on a 32 bit view of the
+  ; registry, and all three have to be tried before concluding it is missing.
+  Call EnsureWebView2
 SectionEnd
+
+Function EnsureWebView2
+  ; The Evergreen runtime's product code. Fixed by Microsoft, not by us.
+  !define WV2KEY "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+
+  ReadRegStr $0 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\${WV2KEY}" "pv"
+  ${If} $0 != ""
+  ${AndIf} $0 != "0.0.0.0"
+    Return
+  ${EndIf}
+
+  ReadRegStr $0 HKLM "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WV2KEY}" "pv"
+  ${If} $0 != ""
+  ${AndIf} $0 != "0.0.0.0"
+    Return
+  ${EndIf}
+
+  ReadRegStr $0 HKCU "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WV2KEY}" "pv"
+  ${If} $0 != ""
+  ${AndIf} $0 != "0.0.0.0"
+    Return
+  ${EndIf}
+
+  ; Missing. The bootstrapper is about two megabytes and fetches the runtime
+  ; itself, which is why it is bundled rather than the full redistributable.
+  IfFileExists "$INSTDIR\MicrosoftEdgeWebview2Setup.exe" 0 NoBootstrapper
+
+  DetailPrint "Installing the WebView2 runtime, which ${APPNAME} needs to draw its window."
+  ExecWait '"$INSTDIR\MicrosoftEdgeWebview2Setup.exe" /silent /install' $1
+  Delete "$INSTDIR\MicrosoftEdgeWebview2Setup.exe"
+  ${If} $1 != 0
+    MessageBox MB_ICONEXCLAMATION|MB_OK \
+      "The WebView2 runtime could not be installed (code $1).$\r$\n$\r$\n\
+       ${APPNAME} is installed, but it will not open a window until the runtime \
+       is present. It can be installed by hand from:$\r$\n\
+       https://developer.microsoft.com/microsoft-edge/webview2/"
+  ${EndIf}
+  Return
+
+  NoBootstrapper:
+  MessageBox MB_ICONEXCLAMATION|MB_OK \
+    "${APPNAME} needs the Microsoft WebView2 runtime, which is not installed \
+     on this machine.$\r$\n$\r$\n\
+     The application is installed, but it will not open a window until the \
+     runtime is present. It can be installed from:$\r$\n\
+     https://developer.microsoft.com/microsoft-edge/webview2/"
+FunctionEnd
 
 Section "Start Menu shortcut" SecStartMenu
   CreateDirectory "$SMPROGRAMS\${COMPANY}"
@@ -116,6 +186,8 @@ Section "Uninstall"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\app.ico"
   Delete "$INSTDIR\uninstall.exe"
+  Delete "$INSTDIR\MicrosoftEdgeWebview2Setup.exe"
+  Delete "$INSTDIR\*.dll"
   RMDir "$INSTDIR"
   RMDir "$PROGRAMFILES64\${COMPANY}"
 

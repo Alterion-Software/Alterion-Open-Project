@@ -6,11 +6,13 @@ pkgdesc="Project scheduler with a critical path engine, Gantt chart and Microsof
 arch=('x86_64' 'aarch64')
 url="https://gitlab.com/alterion-software/alterion-open-project"
 license=('Apache-2.0')
-depends=('gtk3' 'webkit2gtk-4.1' 'libxdo' 'gcc-libs' 'glibc')
+depends=('gtk3' 'webkit2gtk-4.1' 'xdotool' 'gcc-libs' 'glibc')
 makedepends=('cargo' 'pkgconf')
 options=('!lto')
 
-# Map the Arch-compliant pkgver back to the upstream GitLab tag (betav0.1.0)
+# An Arch pkgver may not contain a hyphen, so the pre-release suffix is dropped
+# here and put back when building the upstream tag. Cargo.toml says
+# 0.1.0-beta, this says 0.1.0, and the tag below reunites them.
 _tag="v${pkgver}-beta"
 source=("$pkgname-$pkgver.tar.gz::$url/-/archive/$_tag/$pkgname-$_tag.tar.gz")
 sha256sums=('SKIP')

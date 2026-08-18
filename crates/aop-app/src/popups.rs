@@ -20,7 +20,20 @@ fn Anchored(width: f64, children: Element) -> Element {
     rsx! {
         div {
             class: "ctx-scrim",
-            onclick: move |_| state.write().editing = None,
+            onclick: move |_| {
+                // Blur does not commit here, so dismissing is what banks any
+                // text the planner typed but did not press Enter on.
+                let pending = {
+                    let s = state.read();
+                    s.editing.map(|(row, column)| (row, column, s.cell_draft.clone()))
+                };
+                match pending {
+                    Some((row, column, text)) if text != state.read().cell_text(row, column) => {
+                        state.write().commit_cell(row, column, &text);
+                    }
+                    _ => state.write().editing = None,
+                }
+            },
             oncontextmenu: move |event| {
                 event.prevent_default();
                 state.write().editing = None;
@@ -30,6 +43,9 @@ fn Anchored(width: f64, children: Element) -> Element {
             class: "ctxmenu",
             style: "left: {left}px; top: {top}px; width: {width}px; max-height: 70vh; overflow-y: auto; padding: 10px;",
             onclick: move |event| event.stop_propagation(),
+            // Keeps the caret in the cell's own text box while boxes are
+            // ticked, so typing and picking are one continuous edit.
+            onmousedown: move |event| event.prevent_default(),
             {children}
         }
     }
@@ -160,9 +176,13 @@ pub fn PredecessorPicker(row: usize) -> Element {
                                         style: "padding-left: {indent}px;",
                                         onclick: move |_| {
                                             if checked {
-                                                state.write().remove_link(row, id);
+                                                let mut w = state.write();
+                                                w.remove_link(row, id);
+                                                w.refresh_cell_draft();
                                             } else {
-                                                state.write().set_link(row, id, LinkType::FS, 0);
+                                                let mut w = state.write();
+                                                w.set_link(row, id, LinkType::FS, 0);
+                                                w.refresh_cell_draft();
                                             }
                                         },
                                         span { class: "{box_class}", if checked { "\u{2713}" } }
@@ -181,7 +201,9 @@ pub fn PredecessorPicker(row: usize) -> Element {
                                                 width: 62.0, large: false, disabled: false,
                                                 on_pick: move |picked: String| {
                                                     let chosen = LinkType::parse(&picked).unwrap_or(LinkType::FS);
-                                                    state.write().set_link(row, id, chosen, lag);
+                                                    let mut w = state.write();
+                                                    w.set_link(row, id, chosen, lag);
+                                                    w.refresh_cell_draft();
                                                 },
                                             }
                                             input {

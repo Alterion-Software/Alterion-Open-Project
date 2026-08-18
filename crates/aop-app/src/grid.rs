@@ -60,6 +60,42 @@ fn align_class(align: Align) -> &'static str {
 
 /// An input that replaces a cell while it is being edited.
 #[component]
+/// The editor for a cell that a picker also writes to.
+///
+/// Two things edit a predecessor cell: this box, and the tick list floating
+/// under it. Both read and write `AppState::cell_draft`, so whichever moves
+/// last is what the cell says. Committing happens on Enter or when the picker
+/// is dismissed, never on blur, since clicking a tick box blurs this input.
+#[component]
+fn PickerCellEditor(row: usize, column: Column) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let draft = state.read().cell_draft.clone();
+
+    rsx! {
+        div { class: "picker-cell",
+            input {
+                class: "cell-input",
+                autofocus: true,
+                value: "{draft}",
+                onclick: move |event| event.stop_propagation(),
+                onmousedown: move |event| event.stop_propagation(),
+                ondoubleclick: move |event| event.stop_propagation(),
+                onmouseup: move |event| event.stop_propagation(),
+                oninput: move |event| state.write().cell_draft = event.value(),
+                onkeydown: move |event| match event.key() {
+                    Key::Enter => {
+                        let text = state.read().cell_draft.clone();
+                        state.write().commit_cell(row, column, &text);
+                    }
+                    Key::Escape => state.write().editing = None,
+                    _ => {}
+                },
+            }
+        }
+    }
+}
+
+#[component]
 fn CellEditor(row: usize, column: Column, initial: String) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let mut draft = use_signal(|| initial.clone());
@@ -518,11 +554,21 @@ fn cell_body(
     let mut state = use_context::<Signal<AppState>>();
     let task = &project.tasks[index];
 
-    // While a cell is being edited it is replaced by an input, unless the
-    // field is one the picker owns: those keep showing their value, and the
-    // picker floats over the grid beside them.
+    // A cell the picker also writes to gets its own editor: the text lives in
+    // shared state so ticking a box in the picker and typing here cannot
+    // disagree, and it does not commit on blur, because clicking the picker
+    // blurs it.
+    if is_editing && edits_in_a_popup(field) {
+        let column = if field == Field::Predecessors {
+            Column::Predecessors
+        } else {
+            Column::Resources
+        };
+        return rsx! { PickerCellEditor { row: index, column } };
+    }
+
+    // Every other cell is replaced by a plain text box.
     if is_editing
-        && !edits_in_a_popup(field)
         && let Some(column) = editor {
             let initial = match field {
                 // Dates are edited in an unambiguous form, whatever the display

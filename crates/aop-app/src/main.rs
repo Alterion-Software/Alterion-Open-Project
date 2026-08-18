@@ -1,6 +1,11 @@
 //! Alterion Open Project: a project scheduler with a critical path engine,
 //! a Gantt chart, and a ribbon that follows Microsoft Project's layout.
 
+// Windows gives a program a console unless it is told otherwise, so a release
+// build would open a black terminal behind the window. Kept in debug builds,
+// where printing to a console is how anything gets diagnosed.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod backstage;
 mod brand;
 mod contextmenu;
