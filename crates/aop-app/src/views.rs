@@ -1221,10 +1221,11 @@ fn IterationTable(metrics: aop_core::agile::Metrics) -> Element {
 /// The critical path as a page: the chain, then every task on it.
 #[component]
 fn CriticalPathPage() -> Element {
-    let mut state = use_context::<Signal<AppState>>();
+    let state = use_context::<Signal<AppState>>();
     let s = state.read();
     let project = &s.project;
-    let hovered = s.hovered_task;
+    let mut hover = use_context::<crate::state::Hovered>().0;
+    let hovered = hover();
 
     let path = aop_core::critical_path(project);
     let minutes = aop_core::critical_path_minutes(project, &path);
@@ -1284,11 +1285,10 @@ fn CriticalPathPage() -> Element {
                                 tr {
                                     key: "c{step.index}",
                                     class: "{hot}",
-                                    onmouseenter: move |_| state.write().hovered_task = Some(row),
+                                    onmouseenter: move |_| hover.set(Some(row)),
                                     onmouseleave: move |_| {
-                                        let mut writer = state.write();
-                                        if writer.hovered_task == Some(row) {
-                                            writer.hovered_task = None;
+                                        if hover() == Some(row) {
+                                            hover.set(None);
                                         }
                                     },
                                     td { "{number + 1}" }

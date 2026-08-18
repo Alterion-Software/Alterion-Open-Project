@@ -2012,6 +2012,30 @@ button { font: inherit; color: inherit; }
 }
 .cp-report .rep-head { margin-top: 0; }
 
+/* The print page leads with the command and the copy count, the way Project
+   does, so the first thing in reach is the thing you came to do. */
+.print-action {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+.print-action .print-go { flex: none; }
+.print-copies { display: flex; align-items: center; gap: 8px; }
+.print-copies label { color: var(--ink-soft); font-size: 11px; }
+.print-copies input {
+  width: 58px;
+  height: 30px;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  color: var(--ink);
+  background: var(--surface-3);
+  font: inherit;
+}
+.print-go[disabled] { opacity: 0.45; cursor: default; }
+
 /* Pointing at a row here outlines its bar in the chart, and pointing at a bar
    outlines the row. Two panes, one answer. */
 .rep-table tr.hot td {

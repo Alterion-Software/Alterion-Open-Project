@@ -78,10 +78,16 @@ fn PickerCellEditor(row: usize, column: Column) -> Element {
     // The picker writes to the plan directly, so when a box is ticked the text
     // here has to catch up. The counter is what says a change came from the
     // picker rather than from anywhere else in the application.
-    let stamp = state.read().picker_edits;
+    //
+    // The counter is read through a memo and the text through `peek`, and both
+    // halves of that matter. Reading the state directly inside the effect
+    // subscribes it to every field, so any unrelated change anywhere, a hover
+    // being the easiest one to trip over, would re-run this and overwrite
+    // whatever was being typed with what the plan last said.
+    let stamp = use_memo(move || state.read().picker_edits);
     use_effect(move || {
-        let _ = stamp;
-        draft.set(state.read().cell_draft.clone());
+        let _ = stamp();
+        draft.set(state.peek().cell_draft.clone());
     });
 
     let mut commit = move || {

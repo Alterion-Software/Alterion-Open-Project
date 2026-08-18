@@ -228,6 +228,19 @@ pub struct ColumnSpec {
     pub width: f64,
 }
 
+/// The task the pointer is over, shared by every pane that draws it.
+///
+/// Deliberately its own signal rather than a field on `AppState`. Pointing at
+/// something is not a change to the plan, and putting it in the plan's state
+/// invalidated the chart's layout memo on every bar the pointer crossed, which
+/// meant rebuilding a tick per day of the plan just to move a highlight.
+///
+/// Shared rather than per pane, because that is the point: a report and the
+/// chart beside it are two views of one row, and pointing at either should
+/// light up both.
+#[derive(Clone, Copy)]
+pub struct Hovered(pub dioxus::prelude::Signal<Option<usize>>);
+
 impl ColumnSpec {
     pub fn new(field: Field) -> Self {
         Self {
@@ -680,12 +693,6 @@ pub struct AppState {
     /// The column the cursor last sat in. Fill Down works down a column, so it
     /// has to know which one without the grid holding a full cell cursor.
     pub fill_field: Option<Field>,
-    /// The task the pointer is over, wherever it is being pointed at.
-    ///
-    /// Shared rather than per pane, because that is the whole point: a report
-    /// and the chart beside it are two views of one row, and pointing at
-    /// either should light up both.
-    pub hovered_task: Option<usize>,
     /// How deep inside a running macro we are.
     ///
     /// Every mutating method snapshots the plan and reschedules. That is right
@@ -806,7 +813,6 @@ impl AppState {
             cell_draft: String::new(),
             picker_edits: 0,
             fill_field: None,
-            hovered_task: None,
             macro_depth: 0,
             reschedule_owed: false,
             group_by: None,
@@ -3583,21 +3589,16 @@ mod tests {
     }
 
     #[test]
-    fn pointing_at_something_is_shared_between_the_panes() {
-        // The report and the chart beside it are two views of one row, so the
-        // hover has to live in one place. Held per pane, pointing at a row
-        // would light up nothing in the other.
-        let mut state = AppState::new();
-        state.append_task("One");
-        state.append_task("Two");
-
-        assert_eq!(state.hovered_task, None);
-        state.hovered_task = Some(1);
-        assert_eq!(state.hovered_task, Some(1), "whichever pane set it, both read it");
-
-        state.hovered_task = None;
-        assert_eq!(state.hovered_task, None, "and leaving clears it");
+    fn hover_is_not_part_of_the_plans_state() {
+        // It lives in its own signal on purpose. Held on AppState, moving the
+        // pointer across the chart invalidated the layout memo per bar, which
+        // rebuilds a tick for every day of the plan to move a highlight.
+        let state = AppState::new();
+        let _ = state;
+        // Nothing to assert on AppState itself, which is the point: the field
+        // is gone. The behaviour is covered where it is used.
     }
+
 
     #[test]
     fn a_grouped_run_is_one_undo_step_and_one_schedule() {

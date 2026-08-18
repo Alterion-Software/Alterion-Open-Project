@@ -686,6 +686,7 @@ fn PrintPage() -> Element {
     // the list does not change while a page is being set up.
     let queues = use_signal(crate::spooler::printers);
     let mut chosen = use_signal(|| None::<String>);
+    let mut copies = use_signal(|| 1u16);
     let mut target = use_signal(|| {
         let s = state.read();
         s.file_path
@@ -736,7 +737,55 @@ fn PrintPage() -> Element {
 
             // ---- where it is going ----------------------------------------
             div { class: "print-settings",
-                h2 { class: "bs-sub", style: "margin-top: 0;", "Destination" }
+
+                // The command comes first, with the copy count beside it, the
+                // way Project puts them. Everything under it is what the
+                // command will do, read top to bottom.
+                div { class: "print-action",
+                    {
+                        let to_print = document.clone();
+                        let queue = selected.clone();
+                        rsx! {
+                            button {
+                                class: "btn primary print-go",
+                                disabled: queue.is_none(),
+                                onclick: move |_| {
+                                    let Some(queue) = queue.clone() else { return };
+                                    let title = state.read().project.name.clone();
+                                    let outcome =
+                                        crate::spooler::spool(&queue, &title, &to_print, copies());
+                                    let mut writer = state.write();
+                                    match outcome {
+                                        Ok(said) => writer.status = said,
+                                        Err(complaint) => {
+                                            writer.dialog = Some(Dialog::Message {
+                                                title: "Could not print".into(),
+                                                body: complaint,
+                                            })
+                                        }
+                                    }
+                                },
+                                span { class: "glyph", {icon("printer", 17)} }
+                                span { "Print" }
+                            }
+                        }
+                    }
+                    div { class: "print-copies",
+                        label { "Copies" }
+                        input {
+                            r#type: "number",
+                            min: "1",
+                            max: "99",
+                            value: "{copies}",
+                            onchange: move |event| {
+                                let wanted = event.value().trim().parse::<u16>().unwrap_or(1);
+                                copies.set(wanted.clamp(1, 99));
+                            },
+                        }
+                    }
+                }
+
+                h2 { class: "bs-sub", "Printer" }
 
                 match queues().as_ref() {
                     Ok(list) => rsx! {
@@ -773,30 +822,9 @@ fn PrintPage() -> Element {
                     }
                 }
 
-                if let Some(queue) = selected.clone() {
+                if false {
                     {
-                    let to_print = document.clone();
-                    rsx! {
-                    button {
-                        class: "btn primary print-go",
-                        onclick: move |_| {
-                            let title = state.read().project.name.clone();
-                            let outcome = crate::spooler::spool(&queue, &title, &to_print);
-                            let mut writer = state.write();
-                            match outcome {
-                                Ok(said) => writer.status = said,
-                                Err(complaint) => {
-                                    writer.dialog = Some(Dialog::Message {
-                                        title: "Could not print".into(),
-                                        body: complaint,
-                                    })
-                                }
-                            }
-                        },
-                        span { class: "glyph", {icon("printer", 17)} }
-                        span { "Print" }
-                    }
-                    }
+                    rsx! {}
                     }
                 }
 

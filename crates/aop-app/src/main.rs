@@ -219,6 +219,10 @@ fn App() -> Element {
     // The window size is kept apart from the plan. It changes for reasons that
     // have nothing to do with the document, and anything sharing a signal with
     // it would be re-rendered every time the window moved a pixel.
+    // Which task the pointer is over. Its own signal rather than a field on
+    // the plan's state, so moving the pointer over the chart does not
+    // invalidate the layout memo and rebuild every tick to move a highlight.
+    use_context_provider(|| crate::state::Hovered(Signal::new(None)));
     let mut viewport = use_context_provider(|| Signal::new(crate::state::Viewport::default()));
 
     // Snapshot the plan on a timer so that a crash, a kill, or a power cut

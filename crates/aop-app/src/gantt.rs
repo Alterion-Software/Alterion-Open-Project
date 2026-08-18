@@ -417,7 +417,9 @@ pub fn GanttChart(
     let s = state.read();
 
     let (grid_rows, grid_columns) = (s.grid_rows, s.grid_columns);
-    let hovered_task = s.hovered_task;
+    // Its own signal, so pointing at a bar does not invalidate the layout.
+    let mut hover = use_context::<crate::state::Hovered>().0;
+    let hovered_task = hover();
     let px_per_day = s.zoom.px_per_day();
     drop(s);
 
@@ -816,19 +818,17 @@ pub fn GanttChart(
                                 key: "bar{index}",
 
                                 onmouseenter: move |_| {
-                                    let mut writer = state.write();
                                     // Pointing at something is reading, not
                                     // editing, so it works in a report too:
                                     // the row it belongs to lights up beside it.
-                                    writer.hovered_task = Some(index);
+                                    hover.set(Some(index));
                                     if interactive {
-                                        writer.set_bar_hover(index);
+                                        state.write().set_bar_hover(index);
                                     }
                                 },
                                 onmouseleave: move |_| {
-                                    let mut writer = state.write();
-                                    if writer.hovered_task == Some(index) {
-                                        writer.hovered_task = None;
+                                    if hover() == Some(index) {
+                                        hover.set(None);
                                     }
                                 },
                                 onclick: move |_| {

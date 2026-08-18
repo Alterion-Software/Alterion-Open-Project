@@ -5,6 +5,11 @@
 //! showed. Printers come from CUPS, which is what actually knows about them on
 //! this platform.
 //!
+//! Windows has no CUPS, so there the queues come from PowerShell and the
+//! document is handed to whatever the machine has registered for PDF. That is
+//! less precise than `lp`, and the difference is stated rather than hidden:
+//! see `spool_windows`.
+//!
 //! Saving to PDF is always offered and never depends on CUPS. It is the one
 //! destination that works on a machine with no printers configured at all, and
 //! on this platform it is also the honest fallback when the CUPS client tools
@@ -59,6 +64,60 @@ impl NoPrinters {
 /// The distinction between "no tools", "not running" and "none set up" is kept
 /// because only one of them means the user has nothing to do.
 pub fn printers() -> Result<Vec<Printer>, NoPrinters> {
+    #[cfg(target_os = "windows")]
+    return printers_windows();
+
+    #[cfg(not(target_os = "windows"))]
+    printers_cups()
+}
+
+/// Ask Windows what printers are installed.
+///
+/// `Get-Printer` is the supported way and reports the queue's own state, which
+/// is what the destination list wants to show.
+#[cfg(target_os = "windows")]
+fn printers_windows() -> Result<Vec<Printer>, NoPrinters> {
+    let listing = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-Printer | ForEach-Object { \"$($_.Name)|$($_.PrinterStatus)\" }",
+        ])
+        .output()
+        .map_err(|_| NoPrinters::NotInstalled)?;
+
+    let text = String::from_utf8_lossy(&listing.stdout);
+    let default = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-CimInstance Win32_Printer | Where-Object Default -eq $true).Name",
+        ])
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let found: Vec<Printer> = text
+        .lines()
+        .filter_map(|line| line.split_once('|'))
+        .map(|(name, status)| Printer {
+            name: name.trim().to_string(),
+            status: tidy_status(status.trim()),
+            default: !default.is_empty() && name.trim() == default,
+        })
+        .collect();
+
+    if found.is_empty() {
+        return Err(NoPrinters::NoneConfigured);
+    }
+    Ok(found)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn printers_cups() -> Result<Vec<Printer>, NoPrinters> {
     let listing = Command::new("lpstat").arg("-p").arg("-d").output();
 
     let output = match listing {
@@ -127,10 +186,81 @@ fn tidy_status(raw: &str) -> String {
 /// The bytes go in over standard input rather than through a temporary file, so
 /// nothing is left behind on disk and there is no window in which a half
 /// written file could be picked up.
-pub fn spool(printer: &str, title: &str, document: &[u8]) -> Result<String, String> {
+pub fn spool(printer: &str, title: &str, document: &[u8], copies: u16) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    return spool_windows(printer, title, document, copies);
+
+    #[cfg(not(target_os = "windows"))]
+    spool_cups(printer, title, document, copies)
+}
+
+/// Hand the document to Windows.
+///
+/// Windows has no equivalent of piping a PDF into `lp`. The document is
+/// written out and opened with the shell's print verb, which sends it through
+/// whatever the machine has registered for PDF.
+///
+/// Two honest limits come with that, and the caller is told about them rather
+/// than left to wonder. The chosen queue is a request, not a guarantee: the
+/// handler may use the default printer instead. And the copy count is applied
+/// by repeating the job, because there is nowhere to pass it.
+#[cfg(target_os = "windows")]
+fn spool_windows(
+    printer: &str,
+    title: &str,
+    document: &[u8],
+    copies: u16,
+) -> Result<String, String> {
+    let mut path = std::env::temp_dir();
+    let safe: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    path.push(format!("{safe}.pdf"));
+    std::fs::write(&path, document)
+        .map_err(|error| format!("Could not write the document to print: {error}"))?;
+
+    let target = path.display().to_string();
+    for _ in 0..copies.max(1) {
+        let sent = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "Start-Process -FilePath '{}' -Verb PrintTo -ArgumentList '{}' -PassThru | Out-Null",
+                    target.replace('\'', "''"),
+                    printer.replace('\'', "''")
+                ),
+            ])
+            .output()
+            .map_err(|error| format!("Could not start the print command: {error}"))?;
+
+        if !sent.status.success() {
+            let complaint = String::from_utf8_lossy(&sent.stderr).trim().to_string();
+            return Err(if complaint.is_empty() {
+                format!("{printer} refused the document.")
+            } else {
+                complaint
+            });
+        }
+    }
+
+    Ok(format!("Sent to {printer}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spool_cups(
+    printer: &str,
+    title: &str,
+    document: &[u8],
+    copies: u16,
+) -> Result<String, String> {
     let mut child = Command::new("lp")
         .arg("-d")
         .arg(printer)
+        .arg("-n")
+        .arg(copies.max(1).to_string())
         .arg("-t")
         .arg(title)
         .stdin(Stdio::piped())
