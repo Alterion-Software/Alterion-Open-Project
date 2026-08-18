@@ -5,6 +5,7 @@
 
 pub mod agile;
 pub mod calendar;
+pub mod compare;
 pub mod custom;
 pub mod draw;
 pub mod duration;

@@ -279,35 +279,8 @@ fn base64url(bytes: &[u8]) -> String {
 /// The verifier and the state are the whole security of this flow, so they come
 /// from the system generator and nowhere else. There is no fallback to a weaker
 /// source: a sign in that cannot be made unguessable does not happen at all.
-#[cfg(unix)]
 fn random_bytes(count: usize) -> Result<Vec<u8>, SignInError> {
-    use std::fs::File;
-
-    let mut bytes = vec![0u8; count];
-    File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|_| SignInError::NoRandomness)?;
-    Ok(bytes)
-}
-
-#[cfg(windows)]
-fn random_bytes(count: usize) -> Result<Vec<u8>, SignInError> {
-    // RtlGenRandom, which Windows exports under this name for historical
-    // reasons. It is the system generator and needs no crypto context set up.
-    #[link(name = "advapi32")]
-    unsafe extern "system" {
-        #[link_name = "SystemFunction036"]
-        fn rtl_gen_random(buffer: *mut u8, length: u32) -> u8;
-    }
-
-    let mut bytes = vec![0u8; count];
-    let length = u32::try_from(count).map_err(|_| SignInError::NoRandomness)?;
-    // Safe: the pointer and length describe the vector just allocated above.
-    let filled = unsafe { rtl_gen_random(bytes.as_mut_ptr(), length) };
-    if filled == 0 {
-        return Err(SignInError::NoRandomness);
-    }
-    Ok(bytes)
+    crate::cloud::tokens::random_bytes(count).ok_or(SignInError::NoRandomness)
 }
 
 // ------------------------------------------------------- percent encoding
@@ -672,6 +645,7 @@ pub fn exchange_code(
             ("client_id", client_id),
             ("code_verifier", verifier),
         ],
+        SignInError::CodeRefused,
     )
 }
 
@@ -693,17 +667,48 @@ pub fn refresh(
             ("refresh_token", refresh_token),
             ("client_id", client_id),
         ],
+        SignInError::SessionEnded,
     )
+}
+
+/// The header the sign in server binds a session to a machine with.
+///
+/// Hex, because that is what the server decodes, and a digest rather than the
+/// components themselves, because the server only needs something that is the
+/// same on this machine and different on another: there is no reason to put a
+/// hardware inventory on the wire.
+///
+/// Left off entirely rather than sent empty when the machine cannot identify
+/// itself. The server treats an empty fingerprint as a hard reject on purpose,
+/// and sending one anyway would be asking for that answer while pretending to
+/// have asked a different question. Nothing gets this far without an identity
+/// in any case: [`crate::cloud::sign_in`] stops before the browser opens.
+pub const FINGERPRINT_HEADER: &str = "X-Device-Fingerprint";
+
+fn fingerprint() -> Option<String> {
+    crate::cloud::device::fingerprint_hex().ok()
 }
 
 /// Post a form to the token endpoint and read what comes back.
 ///
-/// Form encoded, not JSON: RFC 6749 says so and the server enforces it.
-fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<Tokens, SignInError> {
+/// Form encoded, not JSON: RFC 6749 says so and this server enforces it with a
+/// 415 rather than a hint. `refused` is what a 400 or a 401 means for the grant
+/// being asked for, which is not the same thing for a first sign in as it is
+/// for a renewal.
+fn post_form(
+    url: &str,
+    fields: &[(&str, &str)],
+    refused: SignInError,
+) -> Result<Tokens, SignInError> {
+    let mut request = ureq::post(url);
+    if let Some(fingerprint) = fingerprint() {
+        request = request.header(FINGERPRINT_HEADER, fingerprint);
+    }
+
     // Status codes are handled here rather than turned into errors by the
-    // client, because the body of a refusal is the only place the server says
-    // which refusal it was.
-    let mut response = ureq::post(url)
+    // client, because a refusal and a server having fallen over need different
+    // things said about them.
+    let mut response = request
         .config()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(REQUEST_TIMEOUT_SECONDS)))
@@ -718,9 +723,7 @@ fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<Tokens, SignInError> 
         .map_err(|_| SignInError::NoTokens("the reply did not finish arriving".into()))?;
 
     if status == 400 || status == 401 {
-        // A refused grant is the one case a person can act on: the stored
-        // permission is gone and signing in again is what fixes it.
-        return Err(SignInError::SignedOutElsewhere);
+        return Err(refused);
     }
     if !(200..300).contains(&status) {
         return Err(SignInError::NoTokens(format!(
@@ -746,7 +749,12 @@ pub fn revoke(endpoints: &Endpoints, token: &str) -> Result<(), SignInError> {
         return Ok(());
     };
 
-    ureq::post(url)
+    let mut request = ureq::post(url);
+    if let Some(fingerprint) = fingerprint() {
+        request = request.header(FINGERPRINT_HEADER, fingerprint);
+    }
+
+    request
         .config()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(REQUEST_TIMEOUT_SECONDS)))
@@ -775,8 +783,13 @@ pub struct Claims {
 
 /// Ask who the access token belongs to.
 pub fn userinfo(endpoints: &Endpoints, access_token: &str) -> Result<Claims, SignInError> {
-    let body = ureq::get(&endpoints.userinfo)
-        .header("Authorization", format!("Bearer {access_token}"))
+    let mut request = ureq::get(&endpoints.userinfo)
+        .header("Authorization", format!("Bearer {access_token}"));
+    if let Some(fingerprint) = fingerprint() {
+        request = request.header(FINGERPRINT_HEADER, fingerprint);
+    }
+
+    let body = request
         .config()
         .timeout_global(Some(Duration::from_secs(REQUEST_TIMEOUT_SECONDS)))
         .build()
@@ -953,6 +966,39 @@ mod tests {
     fn a_reply_that_is_not_a_discovery_document_says_so() {
         let outcome = parse_discovery("https://auth.coraldune.cloud", "<html>not found</html>");
         assert!(matches!(outcome, Err(SignInError::NoDiscovery { .. })));
+    }
+
+    /// Actually reaches the network, so it only runs when asked for:
+    /// `cargo test -p aop-app -- --ignored discovers`.
+    #[test]
+    #[ignore = "reaches the network"]
+    fn discovers_the_real_server() {
+        // The one thing the offline tests cannot check: that the document this
+        // parser was written against is the document the server sends.
+        let endpoints = discover(DEFAULT_ISSUER).expect("the default issuer");
+        assert_eq!(endpoints.issuer, DEFAULT_ISSUER);
+        assert!(endpoints.authorize.starts_with(DEFAULT_ISSUER));
+        assert!(endpoints.token.starts_with("https://"));
+        assert!(endpoints.revoke.is_some(), "signing out needs this");
+    }
+
+    #[test]
+    #[ignore = "reaches the network"]
+    fn a_token_request_with_nothing_behind_it_is_refused_rather_than_accepted() {
+        // Proves the request is shaped the way the server expects: a wrongly
+        // encoded one comes back as an unsupported media type, not a refusal.
+        let endpoints = discover(DEFAULT_ISSUER).expect("the default issuer");
+        let outcome = exchange_code(
+            &endpoints,
+            "not-a-real-client",
+            "not-a-real-code",
+            "http://127.0.0.1:49152/callback",
+            "not-a-real-verifier",
+        );
+        assert!(
+            matches!(outcome, Err(SignInError::CodeRefused)),
+            "got {outcome:?}"
+        );
     }
 
     #[test]

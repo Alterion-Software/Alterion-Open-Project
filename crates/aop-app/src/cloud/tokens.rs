@@ -386,7 +386,7 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 #[cfg(any(target_os = "macos", windows, test))]
 fn from_hex(text: &str) -> Option<Vec<u8>> {
     let text = text.trim();
-    if text.is_empty() || text.len() % 2 != 0 {
+    if text.is_empty() || !text.len().is_multiple_of(2) {
         return None;
     }
     (0..text.len())
@@ -913,27 +913,37 @@ fn key_material() -> Result<Vec<u8>, StoreError> {
         .map_err(|absent| StoreError::NoDeviceIdentity(absent.to_string()))
 }
 
-/// Keep a session.
-pub fn save_session(session: &Stored) -> Result<(), StoreError> {
+/// Keep a session, sealing it to this machine on the way in.
+pub fn save_into(store: &dyn TokenStore, session: &Stored) -> Result<(), StoreError> {
     let material = key_material()?;
     let plaintext = serde_json::to_vec(session)
         .map_err(|_| StoreError::NotWritten("it could not be prepared".into()))?;
     let sealed = seal(&material, &plaintext).ok_or_else(|| {
         StoreError::NotWritten("the system random number generator could not be read".into())
     })?;
-    store().save(&sealed)
+    store.save(&sealed)
 }
 
-/// The session from last time, if this machine can still open it.
+/// The session from a store, if this machine can still open it.
 ///
-/// Every way this can fail means the same thing: nobody is signed in. A machine
-/// whose hardware changed, a store that has nothing in it, a blob somebody
-/// edited. None of them is worth a dialog.
-pub fn load_session() -> Option<Stored> {
+/// Every way this can come to nothing means the same thing: nobody is signed
+/// in. A machine whose hardware changed, a store that has nothing in it, a blob
+/// somebody edited. None of them is worth a dialog.
+pub fn load_from(store: &dyn TokenStore) -> Option<Stored> {
     let material = key_material().ok()?;
-    let sealed = store().load().ok().flatten()?;
+    let sealed = store.load().ok().flatten()?;
     let plaintext = unseal(&material, &sealed)?;
     serde_json::from_slice(&plaintext).ok()
+}
+
+/// Keep a session, in the store this platform uses.
+pub fn save_session(session: &Stored) -> Result<(), StoreError> {
+    save_into(store(), session)
+}
+
+/// The session from last time.
+pub fn load_session() -> Option<Stored> {
+    load_from(store())
 }
 
 /// Forget it.
@@ -1271,28 +1281,30 @@ mod tests {
 
     #[test]
     fn a_session_survives_being_written_and_read_back() {
-        // Through whichever store this platform uses, sealing and all.
-        let _ = clear_session();
-        assert!(load_session().is_none(), "nothing there to begin with");
+        // Against a store of its own rather than the process wide one: these
+        // run in parallel, and two of them sharing the real store would be two
+        // of them overwriting each other's session.
+        let store = MemoryStore::new();
+        assert!(load_from(&store).is_none(), "nothing there to begin with");
 
-        save_session(&sample()).expect("save");
-        let back = load_session().expect("a session");
+        save_into(&store, &sample()).expect("save");
+        let back = load_from(&store).expect("a session");
         assert_eq!(back.refresh_token, "a-refresh-token");
         assert_eq!(back.subject, sample().subject);
         assert_eq!(back.expires_at, sample().expires_at);
 
-        clear_session().expect("clear");
-        assert!(load_session().is_none(), "signing out forgets it");
+        store.clear().expect("clear");
+        assert!(load_from(&store).is_none(), "signing out forgets it");
     }
 
     #[test]
     fn what_reaches_the_store_holds_no_token_in_the_clear() {
         // The point of the whole module. A backup or a support bundle carrying
         // this must not be carrying the session.
-        let _ = clear_session();
-        save_session(&sample()).expect("save");
+        let store = MemoryStore::new();
+        save_into(&store, &sample()).expect("save");
 
-        let kept = store().load().expect("the store").expect("something in it");
+        let kept = store.load().expect("the store").expect("something in it");
         for secret in ["a-refresh-token", "an-access-token", "ada@example.org"] {
             assert!(
                 !kept
@@ -1301,33 +1313,29 @@ mod tests {
                 "{secret} is in there in the clear"
             );
         }
-        let _ = clear_session();
     }
 
     #[test]
     fn saving_twice_keeps_the_newer_one() {
         // Which matters more than it looks: the server spends a refresh token
         // on use, so the replacement has to land over the top of the old one.
-        let _ = clear_session();
-        save_session(&sample()).expect("save");
+        let store = MemoryStore::new();
+        save_into(&store, &sample()).expect("save");
 
         let mut rotated = sample();
         rotated.refresh_token = "the-next-refresh-token".into();
-        save_session(&rotated).expect("save again");
+        save_into(&store, &rotated).expect("save again");
 
         assert_eq!(
-            load_session().expect("a session").refresh_token,
+            load_from(&store).expect("a session").refresh_token,
             "the-next-refresh-token"
         );
-        let _ = clear_session();
     }
 
     #[test]
     fn a_session_from_another_machine_reads_as_nobody_being_signed_in() {
         // Not an error to show. A person whose motherboard was replaced signs
         // in again; they do not get a stack trace about a MAC tag.
-        let _ = clear_session();
-
         let mut elsewhere = machine();
         elsewhere.anchor = "somebody else's machine".into();
         let foreign = seal(
@@ -1336,9 +1344,26 @@ mod tests {
         )
         .expect("seal");
 
-        store().save(&foreign).expect("save");
-        assert!(load_session().is_none(), "it is not this machine's session");
+        let store = MemoryStore::new();
+        store.save(&foreign).expect("save");
+        assert!(
+            load_from(&store).is_none(),
+            "it is not this machine's session"
+        );
+    }
+
+    #[test]
+    fn the_whole_round_trip_works_against_this_platform_s_own_store() {
+        // The one that touches the real file, Keychain or registry, so the
+        // platform specific half is not left to the unit tests above.
         let _ = clear_session();
+        save_session(&sample()).expect("save");
+        assert_eq!(
+            load_session().expect("a session").subject,
+            sample().subject
+        );
+        clear_session().expect("clear");
+        assert!(load_session().is_none(), "signing out forgets it");
     }
 
     // -------------------------------------------------------- expiry maths
@@ -1374,7 +1399,7 @@ mod tests {
         // refresh token as single use.
         let issued = at(0);
         assert!(!needs_refresh(issued, expires_at(issued, 3600)));
-        assert!(EARLY_REFRESH_SECONDS < 3600);
+        const { assert!(EARLY_REFRESH_SECONDS < 3600) };
     }
 
     #[test]

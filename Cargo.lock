@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "aop-app"
-version = "0.1.0-beta"
+version = "1.0.0-beta"
 dependencies = [
  "aop-core",
  "chrono",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "aop-collaborate"
-version = "0.1.0-beta"
+version = "1.0.0-beta"
 dependencies = [
  "actix-cors",
  "actix-web",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "aop-core"
-version = "0.1.0-beta"
+version = "1.0.0-beta"
 dependencies = [
  "alterion-mpp-parser",
  "calamine",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "aop-procname"
-version = "0.1.0-beta"
+version = "1.0.0-beta"
 
 [[package]]
 name = "app_units"

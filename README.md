@@ -144,13 +144,27 @@ Windows `.ico` is generated from), and the MIME definition that registers
 
 ## Not implemented
 
-The ribbon is drawn in full, but these report on the status bar rather than
-doing anything: Format Painter, font and colour controls, Text Styles,
-Gridlines, Layout, Insert Column, Custom Fields, resource levelling, Group by,
-Macros, Spelling and Subproject.
+Honest list, kept current.
 
-Print writes a print-ready HTML page rather than talking to a printer.
-Resource Usage shows the Resource Sheet.
+**Macros** record and replay, and the command vocabulary is complete, but there
+is no editor for a recorded macro and no way to bind one to a key yet.
+
+**Drawing** offers Line, Arrow, Rectangle, Oval and Text Box. Polygon and Arc
+are deliberately absent: twenty years of forum traffic turned up nobody using
+either, so they were not worth the vertex editor they need.
+
+**Earned value** computes every measure and exposes them as columns, but there
+is no Earned Value report page yet, and no Cash Flow. The timephasing they need
+is built.
+
+**Live collaborate** streams over a websocket and recovers a dropped
+connection, but the server keeps its room in memory, so two instances behind a
+load balancer each only reach their own clients. They converge on reconnect
+because the database is the truth, but real multi instance live editing wants a
+shared bus.
+
+**Sharing a plan with somebody** has a table and a role model, and no endpoint
+to grant with yet. Only whoever created a plan can open it.
 
 ## Settings and recovery
 

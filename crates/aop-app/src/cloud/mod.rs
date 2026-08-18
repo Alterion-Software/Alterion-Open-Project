@@ -33,13 +33,22 @@
 //! because without that check anyone who can get the browser to visit a URL can
 //! sign this application in as themselves.
 
+// Nothing in the application calls into this module yet: the ribbon, the
+// dialogs and the options page that will are being built alongside it. In a
+// binary crate that makes every item here dead code, and a hundred warnings
+// about it is how a real one gets missed. Delete this line once the interface
+// is wired up.
+#![allow(dead_code, unused_imports)]
+
+pub mod device;
 pub mod oauth;
 pub mod tokens;
 
 use chrono::{DateTime, Utc};
 
+pub use device::DeviceComponents;
 pub use oauth::{DEFAULT_ISSUER, Endpoints};
-pub use tokens::{KEYRING_ENTRY, KEYRING_SERVICE, MemoryStore, Stored, TokenStore, use_store};
+pub use tokens::{MemoryStore, Stored, StoreError, TokenStore, use_store};
 
 /// The client id this application is registered under.
 ///
@@ -66,6 +75,11 @@ pub struct Account {
 pub enum SignInError {
     /// The issuer could not be read, or is not an identity provider.
     NoDiscovery { issuer: String, why: String },
+    /// This machine cannot say which machine it is, so a session cannot be
+    /// bound to it and nothing can be sealed to it. Fatal on purpose: an empty
+    /// identity is one every machine shares, and a made up one changes every
+    /// launch.
+    NoDeviceIdentity(String),
     /// The system random generator could not be read.
     NoRandomness,
     /// Nothing could listen for the browser's reply.
@@ -104,6 +118,8 @@ impl std::fmt::Display for SignInError {
                 "The sign in page could not be reached: {why}. \
                  Check the server address in Options; it is currently {issuer}."
             ),
+            // The one from `device`, which already names what it looked at.
+            SignInError::NoDeviceIdentity(why) => write!(f, "{why}"),
             SignInError::NoRandomness => write!(
                 f,
                 "Sign in needs the system random number generator and could not read it, \
@@ -113,8 +129,8 @@ impl std::fmt::Display for SignInError {
             SignInError::NoLoopback(why) => write!(
                 f,
                 "Sign in listens on this machine for the browser's reply, and could not: {why}. \
-                 A firewall or security tool blocking connections within the machine is the \
-                 usual cause."
+                 Check any firewall or security tool that blocks connections within the \
+                 machine, then try again."
             ),
             SignInError::NoBrowser(url) => write!(
                 f,
@@ -274,11 +290,12 @@ impl Session {
         self.take(fresh);
 
         // The old refresh token has just been spent, and the server treats a
-        // second use of it as theft. So the replacement is written down
-        // straight away, and if it cannot be, the stale record is thrown away
-        // rather than left to lock the account out on the next start.
-        if tokens::store().save(&self.stored()).is_err() {
-            let _ = tokens::store().clear();
+        // second use of it as theft against the whole account. So the
+        // replacement is written down straight away, and if it cannot be, the
+        // stale record is thrown away rather than left to present a spent token
+        // on the next start.
+        if tokens::save_session(&self.stored()).is_err() {
+            let _ = tokens::clear_session();
         }
         Ok(())
     }
@@ -323,6 +340,14 @@ impl Session {
 /// Blocking, and slow by nature: it opens a browser and waits for a person. The
 /// caller runs it off the interface thread and shows what came back.
 pub fn sign_in(issuer: &str, client_id: &str) -> Result<Session, SignInError> {
+    // Before anything else, and before a browser is opened at anybody. A
+    // session is bound to the machine it was issued to, and a machine that
+    // cannot say which one it is has nothing to bind to. Stopping here costs a
+    // message; carrying on would mean either an empty identity, which every
+    // machine shares, or an invented one, which changes every launch and signs
+    // the user out on every start.
+    device::components().map_err(|absent| SignInError::NoDeviceIdentity(absent.to_string()))?;
+
     let endpoints = oauth::discover(issuer)?;
 
     // The verifier stays in this process. Only its digest goes through the
@@ -367,7 +392,7 @@ pub fn sign_in(issuer: &str, client_id: &str) -> Result<Session, SignInError> {
     // A sign in that is not written down is one the user has to do again on the
     // next start. A failure to write it is not a failure to sign in, though, so
     // the session is returned either way.
-    let _ = tokens::store().save(&session.stored());
+    let _ = tokens::save_session(&session.stored());
 
     Ok(session)
 }
@@ -459,7 +484,7 @@ pub fn sign_out(session: &Session) -> Result<(), SignInError> {
         ));
     }
 
-    let _ = tokens::store().clear();
+    let _ = tokens::clear_session();
     outcome
 }
 
@@ -469,15 +494,21 @@ pub fn sign_out(session: &Session) -> Result<(), SignInError> {
 /// server that is slow or absent. The token is renewed on first use, which is
 /// where a session that has since been ended shows up as needing a fresh sign
 /// in.
+///
+/// `None` for every way this can come to nothing, and they all mean the same
+/// thing to whoever draws the interface: nobody is signed in. A machine that
+/// changed, a store with nothing in it, a blob somebody edited. None of them is
+/// worth a dialog, and a person whose motherboard was replaced simply signs in
+/// again.
 pub fn restore() -> Option<Session> {
-    let stored = tokens::store().load()?;
+    let stored = tokens::load_session()?;
     let expires_at = DateTime::from_timestamp(stored.expires_at, 0).unwrap_or_else(Utc::now);
 
     // Nothing to renew with and nothing left to use: this is not a session, it
     // is a leftover, and offering it would show somebody as signed in until the
     // first thing they tried failed.
     if stored.refresh_token.is_empty() && tokens::needs_refresh(Utc::now(), expires_at) {
-        let _ = tokens::store().clear();
+        let _ = tokens::clear_session();
         return None;
     }
 
@@ -612,6 +643,12 @@ mod tests {
                 issuer: "https://auth.example.org".into(),
                 why: "nothing is answering at that address".into(),
             },
+            SignInError::NoDeviceIdentity(
+                device::NoAnchor {
+                    looked_at: vec!["/etc/machine-id".into()],
+                }
+                .to_string(),
+            ),
             SignInError::NoRandomness,
             SignInError::NoLoopback("permission denied".into()),
             SignInError::NoBrowser("https://auth.example.org/authorize?x=1".into()),

@@ -59,6 +59,27 @@ impl Change {
     }
 }
 
+/// A point in the log somebody saved at.
+///
+/// A single command is too fine grained to put in front of a person: nobody
+/// decides about `indent()`. A whole file is too coarse to merge, because it
+/// can only ever be last writer wins. A save is the unit in between, the batch
+/// of commands since the last one, and it is the thing somebody actually
+/// decides about when a sync asks them what to take.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Save {
+    /// The last change this save covers. Everything after the marker before
+    /// it, up to and including this, is the batch.
+    pub change_id: u64,
+    pub at: NaiveDateTime,
+    pub author: String,
+    /// What they called it. Like a commit message, but never required: a
+    /// planner pressing Ctrl+S will not write one, and demanding one would
+    /// only produce a log full of "wip".
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 /// How much history a plan keeps.
 ///
 /// A long editing session produces thousands of entries, and a plan file that
@@ -82,6 +103,21 @@ pub struct History {
     /// what a rebase replays on top of whatever came back.
     #[serde(default)]
     pushed_through: Option<u64>,
+    /// Where the saves fall in the log, oldest first.
+    ///
+    /// A list of its own rather than a flag on `Change`, for two reasons. A
+    /// flag would be read far more often than it is set, since a save marks
+    /// one change in a few hundred and every enumeration of saves would have
+    /// to walk the whole log to find them. And a save carries its own author,
+    /// moment and note, which are not the author, moment and note of the
+    /// command it happens to land on: pressing Ctrl+S is not the edit before
+    /// it, and a plan that has been merged can easily have somebody else's
+    /// command sitting under your save.
+    ///
+    /// The cost of a separate list is that it points into the log by id, so
+    /// trimming has to be careful. `trim` says how.
+    #[serde(default)]
+    saves: Vec<Save>,
 }
 
 impl History {
@@ -126,13 +162,31 @@ impl History {
             summary: summary.into(),
         });
 
-        // Dropping from the front keeps the newest, which is what anybody
-        // looking at a history panel wants, and what a sync still needs.
+        self.trim();
+        id
+    }
+
+    /// Drop the oldest entries once the limit is passed, and any marker left
+    /// with nothing under it.
+    ///
+    /// Dropping from the front keeps the newest, which is what anybody looking
+    /// at a history panel wants, and what a sync still needs.
+    ///
+    /// A marker survives for as long as any of the commands it covers do. Once
+    /// the last of them has gone it goes too, because a marker pointing at an
+    /// id the log no longer holds is a dangling reference, and `changes_in`
+    /// would answer it with somebody else's batch. Dropping it cannot move any
+    /// surviving save's boundary either: the commands between it and the next
+    /// marker have gone with it, so the next marker's batch is the same slice
+    /// whether the older marker is there or not.
+    fn trim(&mut self) {
         if self.changes.len() > KEEP {
             let excess = self.changes.len() - KEEP;
             self.changes.drain(..excess);
         }
-        id
+        if let Some(oldest) = self.changes.first().map(|change| change.id) {
+            self.saves.retain(|save| save.change_id >= oldest);
+        }
     }
 
     /// Everything recorded after `cursor`, which is what a sync asks for.
@@ -200,11 +254,89 @@ impl History {
             self.changes.insert(at, change);
             added += 1;
         }
-        if self.changes.len() > KEEP {
-            let excess = self.changes.len() - KEEP;
-            self.changes.drain(..excess);
-        }
+        self.trim();
         added
+    }
+
+    // ---- saves ----------------------------------------------------------
+
+    /// Mark the newest entry as a save.
+    ///
+    /// Returns the change the marker landed on, or `None` when there is
+    /// nothing to mark: an empty log, or a second Ctrl+S with no edit in
+    /// between. Two markers over the same nothing would put an empty batch in
+    /// front of somebody deciding what to take.
+    pub fn mark_saved(
+        &mut self,
+        author: impl Into<String>,
+        at: NaiveDateTime,
+        note: Option<String>,
+    ) -> Option<u64> {
+        let newest = self.changes.last().map(|change| change.id)?;
+        if self.saves.last().is_some_and(|save| save.change_id >= newest) {
+            return None;
+        }
+        self.saves.push(Save {
+            change_id: newest,
+            at,
+            author: author.into(),
+            note,
+        });
+        Some(newest)
+    }
+
+    /// Every save, oldest first.
+    pub fn saves(&self) -> &[Save] {
+        &self.saves
+    }
+
+    pub fn last_save(&self) -> Option<&Save> {
+        self.saves.last()
+    }
+
+    /// The marker before the one at `change_id`, which is where its batch
+    /// starts.
+    fn marker_before(&self, change_id: u64) -> Option<u64> {
+        self.saves
+            .iter()
+            .rev()
+            .find(|save| save.change_id < change_id)
+            .map(|save| save.change_id)
+    }
+
+    /// The commands one save covers: everything after the marker before it, up
+    /// to and including its own change.
+    ///
+    /// Sliced by id against what is actually held, so a marker whose oldest
+    /// commands have been trimmed away gives back the part that survives
+    /// rather than reaching into the batch before it. `save_is_complete` is
+    /// how a caller finds out that is what happened.
+    pub fn changes_in(&self, change_id: u64) -> &[Change] {
+        let from = match self.marker_before(change_id) {
+            Some(previous) => self.changes.partition_point(|change| change.id <= previous),
+            None => 0,
+        };
+        let to = self.changes.partition_point(|change| change.id <= change_id);
+        &self.changes[from..to.max(from)]
+    }
+
+    /// Whether every command a save covers is still held.
+    ///
+    /// False means the log was trimmed part way through it, so showing the
+    /// batch would show part of one while looking like the whole. Same
+    /// distinction `has_gap_since` draws for a sync, and for the same reason.
+    pub fn save_is_complete(&self, save: &Save) -> bool {
+        match self.marker_before(save.change_id) {
+            Some(previous) => !self.has_gap_since(previous),
+            // Nothing before it, so its batch runs from the very first command
+            // this plan ever recorded. Complete only while that is still here.
+            None => self.changes.first().is_some_and(|change| change.id == 0),
+        }
+    }
+
+    /// The commands since the last save, which is the work that would be lost.
+    pub fn unsaved(&self) -> &[Change] {
+        self.since(self.saves.last().map(|save| save.change_id))
     }
 }
 
@@ -342,6 +474,149 @@ mod tests {
         };
         assert_eq!(change.command_count(), 2);
         assert_eq!(change.first_line(), "// filled down");
+    }
+
+    #[test]
+    fn a_save_covers_exactly_what_came_after_the_one_before_it() {
+        let mut history = log();
+        history.mark_saved("Ada", at(2), None);
+        for day in 6..=8 {
+            history.record("Ada", "outdent();", "Outdented", at(day));
+        }
+        let second = history
+            .mark_saved("Ada", at(3), Some("ready for review".into()))
+            .expect("there is work to mark");
+
+        assert_eq!(history.saves().len(), 2);
+        assert_eq!(second, 7);
+
+        let first = history.saves()[0].change_id;
+        let ids: Vec<u64> = history.changes_in(first).iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4], "the first save is everything up to it");
+
+        let ids: Vec<u64> = history.changes_in(second).iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![5, 6, 7], "and the second only what followed");
+
+        assert_eq!(
+            history.saves()[1].note.as_deref(),
+            Some("ready for review"),
+            "a note rides with the marker, not with the command"
+        );
+    }
+
+    #[test]
+    fn unsaved_is_what_came_after_the_last_marker() {
+        let mut history = log();
+        assert_eq!(history.unsaved().len(), 5, "nothing saved yet");
+
+        history.mark_saved("Ada", at(2), None);
+        assert!(history.unsaved().is_empty());
+
+        history.record("Ada", "link();", "Linked two tasks", at(6));
+        let ids: Vec<u64> = history.unsaved().iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![5]);
+    }
+
+    #[test]
+    fn pressing_save_twice_over_nothing_does_not_add_a_second_marker() {
+        let mut history = log();
+        assert!(history.mark_saved("Ada", at(2), None).is_some());
+        assert!(
+            history.mark_saved("Ada", at(2), None).is_none(),
+            "an empty batch is not a save"
+        );
+        assert_eq!(history.saves().len(), 1);
+
+        let mut empty = History::new();
+        assert!(empty.mark_saved("Ada", at(1), None).is_none());
+    }
+
+    #[test]
+    fn save_markers_survive_a_trim_and_none_of_them_dangles() {
+        // The marker points into the log by id, so a trim has to leave every
+        // surviving marker naming its own batch and no marker naming a batch
+        // that has gone.
+        let mut history = History::new();
+        for _ in 0..100 {
+            history.record("Ada", "indent();", "Indented", at(1));
+        }
+        let early = history
+            .mark_saved("Ada", at(1), None)
+            .expect("there is work to mark");
+        for _ in 0..KEEP - 100 {
+            history.record("Ada", "outdent();", "Outdented", at(2));
+        }
+        let middle = history
+            .mark_saved("Ada", at(2), None)
+            .expect("there is work to mark");
+        for _ in 0..300 {
+            history.record("Ada", "link();", "Linked", at(3));
+        }
+        let late = history
+            .mark_saved("Ada", at(3), None)
+            .expect("there is work to mark");
+
+        assert_eq!(history.len(), KEEP, "the log was trimmed");
+        let oldest = history.changes().first().map(|c| c.id).expect("kept work");
+        assert!(oldest > early, "the early save's whole batch went with it");
+
+        let kept: Vec<u64> = history.saves().iter().map(|save| save.change_id).collect();
+        assert_eq!(
+            kept,
+            vec![middle, late],
+            "a marker survives a trim for as long as any of its work does"
+        );
+        assert!(
+            history.saves().iter().all(|save| save.change_id >= oldest),
+            "and no marker is left pointing at a change the log has dropped"
+        );
+
+        let batch: Vec<u64> = history.changes_in(late).iter().map(|c| c.id).collect();
+        assert_eq!(batch.len(), 300, "the last save still covers its own work");
+        assert_eq!(batch.first(), Some(&(middle + 1)));
+        assert!(history.save_is_complete(&history.saves()[1]));
+
+        let cut = history.saves()[0].clone();
+        assert!(
+            !history.save_is_complete(&cut),
+            "the middle save lost its oldest commands with the early marker"
+        );
+    }
+
+    #[test]
+    fn a_save_cut_in_half_by_a_trim_says_so() {
+        let mut history = History::new();
+        for _ in 0..KEEP + 200 {
+            history.record("Ada", "indent();", "Indented", at(1));
+        }
+        let id = history
+            .mark_saved("Ada", at(1), None)
+            .expect("there is work to mark");
+        let save = history.saves()[0].clone();
+
+        assert!(
+            !history.save_is_complete(&save),
+            "its oldest commands were trimmed, so it is only part of a save"
+        );
+        assert!(!history.changes_in(id).is_empty(), "and the rest is still there");
+
+        let mut whole = History::new();
+        whole.record("Ada", "indent();", "Indented", at(1));
+        whole.mark_saved("Ada", at(1), None);
+        assert!(whole.save_is_complete(&whole.saves()[0]));
+    }
+
+    #[test]
+    fn a_plan_saved_before_markers_existed_still_opens() {
+        // Every new field is defaulted, so a file written before any of this
+        // has to read back as a log with no saves rather than fail.
+        let older = r#"{"changes":[{"id":0,"at":"2026-01-01T09:00:00","author":"Ada",
+            "script":"indent();","summary":"Indented"}],"next_id":1}"#;
+        let history: History = serde_json::from_str(older).expect("an older plan opens");
+
+        assert_eq!(history.len(), 1);
+        assert!(history.saves().is_empty());
+        assert_eq!(history.unsaved().len(), 1, "none of it has been saved");
     }
 
     #[test]

@@ -95,8 +95,9 @@ impl std::fmt::Display for NoAnchor {
         write!(
             f,
             "This machine could not be identified, so signing in has stopped rather than \
-             carry on without the protection that identity provides. \
-             Nothing could be read from: {}.",
+             carry on without the protection that identity gives. \
+             Nothing could be read from: {}. \
+             Check that it exists and that your account can read it, then try again.",
             self.looked_at.join(", ")
         )
     }
