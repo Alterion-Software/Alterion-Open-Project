@@ -570,7 +570,7 @@ fn Workspace(view: ViewKind) -> Element {
                                     },
                                 }
                             }
-                            gantt::GanttChart {}
+                            gantt::GanttChart { rows: None, interactive: true }
                         }
                     }
                 }

@@ -39,9 +39,28 @@ die()  { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 # Where things go. A user install needs no root and is undone by deleting a
 # handful of files; a system install is the one to use when several people
 # share the machine.
+# Run one command as root, but only when it is actually needed.
+#
+# The whole script is deliberately not re-run under sudo: it would build as
+# root and leave root owned files scattered through the user's checkout. The
+# binary is produced as the person running it, and only the placement of files
+# under /usr asks for a password.
+as_root() {
+  # A user install writes only inside the home directory, so asking for a
+  # password there would be both pointless and alarming.
+  if [ "$mode" != system ] || [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif command -v sudo >/dev/null; then
+    sudo -- "$@"
+  elif command -v pkexec >/dev/null; then
+    pkexec "$@"
+  else
+    die "installing for all users needs root, and neither sudo nor pkexec is installed"
+  fi
+}
+
 if [ "$mode" = system ]; then
   prefix=/usr/local
-  [ "$(id -u)" -eq 0 ] || die "--system needs root; rerun with sudo"
 else
   prefix="${XDG_DATA_HOME:-$HOME/.local}"
   prefix="${prefix%/share}"
@@ -54,12 +73,12 @@ sharedir="$prefix/share"
 
 if [ "$action" = uninstall ]; then
   step "Removing $pretty"
-  rm -fv "$bindir/$name" \
+  as_root rm -fv "$bindir/$name" \
          "$sharedir/applications/$name.desktop" \
          "$sharedir/icons/hicolor/scalable/apps/$name.svg" \
          "$sharedir/mime/packages/$name.xml" 2>/dev/null || true
-  command -v update-desktop-database >/dev/null && update-desktop-database "$sharedir/applications" 2>/dev/null || true
-  command -v update-mime-database    >/dev/null && update-mime-database "$sharedir/mime" 2>/dev/null || true
+  command -v update-desktop-database >/dev/null && as_root update-desktop-database "$sharedir/applications" 2>/dev/null || true
+  command -v update-mime-database    >/dev/null && as_root update-mime-database "$sharedir/mime" 2>/dev/null || true
   echo
   echo "Removed. Your plans and settings were left alone:"
   echo "  ${XDG_CONFIG_HOME:-$HOME/.config}/$name/"
@@ -118,7 +137,8 @@ fi
 
 # ------------------------------------------------------------------- binary
 
-mkdir -p "$bindir" "$sharedir/applications" \
+place() { as_root install -Dm"$1" "$2" "$3"; }
+as_root mkdir -p "$bindir" "$sharedir/applications" \
          "$sharedir/icons/hicolor/scalable/apps" "$sharedir/mime/packages"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -127,7 +147,7 @@ if [ "$from_source" -eq 1 ]; then
   step "Building from source"
   command -v cargo >/dev/null || die "cargo not found; install Rust from https://rustup.rs"
   ( cd "$here" && cargo build --release --package aop-app )
-  install -Dm755 "$here/target/release/$name" "$bindir/$name"
+  place 755 "$here/target/release/$name" "$bindir/$name"
 else
   step "Downloading the binary"
   arch="$(uname -m)"
@@ -145,7 +165,7 @@ else
   # A truncated download would otherwise be installed and fail confusingly.
   [ -s "$tmp/$name" ] || die "the download was empty"
   head -c 4 "$tmp/$name" | grep -q "ELF" || die "that is not a Linux binary; the download may have failed"
-  install -Dm755 "$tmp/$name" "$bindir/$name"
+  place 755 "$tmp/$name" "$bindir/$name"
 fi
 echo "  installed $bindir/$name"
 
@@ -153,18 +173,21 @@ echo "  installed $bindir/$name"
 
 step "Registering with the desktop"
 if [ -d "$here/packaging/linux" ]; then
-  install -Dm644 "$here/packaging/linux/$name.desktop" "$sharedir/applications/$name.desktop"
-  install -Dm644 "$here/packaging/linux/$name.svg"     "$sharedir/icons/hicolor/scalable/apps/$name.svg"
-  install -Dm644 "$here/packaging/linux/$name.xml"     "$sharedir/mime/packages/$name.xml"
+  place 644 "$here/packaging/linux/$name.desktop" "$sharedir/applications/$name.desktop"
+  place 644 "$here/packaging/linux/$name.svg"     "$sharedir/icons/hicolor/scalable/apps/$name.svg"
+  place 644 "$here/packaging/linux/$name.xml"     "$sharedir/mime/packages/$name.xml"
   echo "  desktop entry, icon and .aprj association installed"
 else
   warn "packaging/linux was not found beside this script, so only the binary was installed"
   warn "the application will still run; it just will not appear in your menu"
 fi
 
-command -v update-desktop-database >/dev/null && update-desktop-database "$sharedir/applications" 2>/dev/null || true
-command -v update-mime-database    >/dev/null && update-mime-database "$sharedir/mime" 2>/dev/null || true
-command -v gtk-update-icon-cache   >/dev/null && gtk-update-icon-cache -qtf "$sharedir/icons/hicolor" 2>/dev/null || true
+# These are what put the application in the menu, give .aprj its icon and make
+# a double click open it here. Without them the files are on disk and the
+# desktop does not know about any of them.
+command -v update-desktop-database >/dev/null && as_root update-desktop-database "$sharedir/applications" 2>/dev/null || true
+command -v update-mime-database    >/dev/null && as_root update-mime-database "$sharedir/mime" 2>/dev/null || true
+command -v gtk-update-icon-cache   >/dev/null && as_root gtk-update-icon-cache -qtf "$sharedir/icons/hicolor" 2>/dev/null || true
 
 # ------------------------------------------------------------------- finish
 

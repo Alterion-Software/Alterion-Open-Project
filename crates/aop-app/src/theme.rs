@@ -1914,20 +1914,7 @@ button { font: inherit; color: inherit; }
 }
 .picker-caret:hover { color: var(--accent-bright); }
 
-/* ---------- critical path chart ---------- */
-
-.cp-chart {
-  border: 1px solid var(--grid-line);
-  border-radius: 4px;
-  overflow-x: auto;
-  margin-bottom: 10px;
-  background: var(--surface);
-}
-.cp-chart svg { display: block; min-width: 720px; }
-.cp-name  { font-size: 11px; fill: var(--ink); }
-.cp-span  { font-size: 10px; fill: var(--ink-soft); }
-.cp-tick  { font-size: 10px; fill: var(--ink-soft); }
-.cp-joint { font-size: 9px;  fill: var(--danger); }
+/* ---------- critical path report ---------- */
 
 .cp-legend {
   display: flex;
@@ -2011,6 +1998,17 @@ button { font: inherit; color: inherit; }
   background: var(--surface);
   overflow: auto;
   min-width: 0;
+}
+
+/* The chart standing in for a report figure. A report is a picture of one
+   chain rather than a pane you scroll, so it is sized by the chart inside it
+   and the whole thing is there at once. */
+.chart-pane.report {
+  flex: none;
+  align-self: flex-start;
+  width: max-content;
+  overflow: visible;
+  margin-bottom: 4px;
 }
 
 /* Holds the chart's own width so the pane above can scroll to it. */

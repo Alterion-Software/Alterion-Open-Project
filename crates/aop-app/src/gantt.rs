@@ -235,6 +235,31 @@ pub fn chart_range(project: &Project) -> (NaiveDate, NaiveDate) {
     )
 }
 
+/// The span a given set of rows covers, padded the way `chart_range` pads.
+///
+/// A report drawing one chain out of a long plan should be as wide as that
+/// chain. Using the whole plan's range leaves a short path as a small cluster
+/// of bars in a mostly empty chart, which is exactly what the report is meant
+/// to show clearly.
+fn rows_range(project: &Project, rows: &[usize]) -> Option<(NaiveDate, NaiveDate)> {
+    let start = rows
+        .iter()
+        .filter_map(|&index| project.tasks.get(index))
+        .map(|task| task.scheduled.start.date())
+        .min()?;
+    let finish = rows
+        .iter()
+        .filter_map(|&index| project.tasks.get(index))
+        .map(|task| task.scheduled.finish.date())
+        .max()?
+        .max(start);
+
+    Some((
+        start_of_week(start),
+        start_of_week(finish + Duration::days(PAD_DAYS_AFTER)),
+    ))
+}
+
 /// Left and right edge of a task's bar, snapped the way the chart snaps them.
 ///
 /// Shared with the drawing tools: a shape dropped on a bar has to hit-test
@@ -291,8 +316,103 @@ struct ChartLayout {
     band_lines: Vec<usize>,
 }
 
+/// The lines the chart draws.
+///
+/// `None` is the plan's own visible rows, bands and all, which is what the
+/// main view wants. `Some` is exactly those tasks in exactly that order, which
+/// is how a report shows one chain rather than a plan.
+fn chart_rows(state: &AppState, rows: Option<&[usize]>) -> Vec<GroupRow> {
+    match rows {
+        Some(rows) => rows.iter().copied().map(GroupRow::Task).collect(),
+        None => state.layout_rows(),
+    }
+}
+
+/// Work the layout out for one set of rows.
+fn build_layout(s: &AppState, rows: Vec<GroupRow>, only: Option<&[usize]>) -> ChartLayout {
+    let project = &s.project;
+    // A report showing a subset is scaled to that subset; the main view, which
+    // shows everything, is scaled to the plan.
+    let (from, to) = only
+        .and_then(|rows| rows_range(project, rows))
+        .unwrap_or_else(|| chart_range(project));
+    let scale = Scale { origin: from, px_per_day: s.zoom.px_per_day() };
+
+    let width = ((to - from).num_days() as f64 * scale.px_per_day).max(600.0);
+    let body_h = (rows.len().max(1) as f64 * ROW_H) + 40.0;
+
+    let major = major_ticks(s.zoom, from, to);
+    let minor = minor_ticks(s.zoom, from, to);
+
+    // Non-working days are shaded, but only when a day is wide enough to see.
+    let mut nonworking: Vec<f64> = Vec::new();
+    if scale.px_per_day >= 4.0 {
+        let mut cursor = from;
+        while cursor < to {
+            if !project.calendar.is_working_day(cursor) {
+                nonworking.push(scale.x_date(cursor));
+            }
+            cursor += Duration::days(1);
+        }
+    }
+
+    let today = Local::now().naive_local().date();
+    let today_x = (today >= from && today < to).then(|| scale.x_date(today));
+
+    // Bar geometry, keyed by task so the arrows can find their endpoints.
+    let mut boxes: HashMap<TaskId, BarBox> = HashMap::new();
+    // Which line each task sits on, so an arrow can be skipped without first
+    // working out the path it would have taken.
+    let mut lines: HashMap<TaskId, usize> = HashMap::new();
+    for (line, index) in rows.iter().enumerate().filter_map(task_line) {
+        let task = &project.tasks[index];
+        lines.insert(task.id, line);
+        let Some((left, right)) = bar_edges(project, &scale, s.round_bars, index) else {
+            continue;
+        };
+        boxes.insert(
+            task.id,
+            BarBox {
+                left,
+                right,
+                mid: line as f64 * ROW_H + ROW_H / 2.0,
+            },
+        );
+    }
+
+    // A band draws nothing but the strip that holds its line open, so the
+    // rows below it sit where the grid put them.
+    let band_lines: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(line, row)| matches!(row, GroupRow::Band { .. }).then_some(line))
+        .collect();
+
+    ChartLayout {
+        rows,
+        from,
+        to,
+        width,
+        body_h,
+        major,
+        minor,
+        nonworking,
+        today_x,
+        boxes,
+        lines,
+        band_lines,
+    }
+}
+
 #[component]
-pub fn GanttChart() -> Element {
+pub fn GanttChart(
+    /// The rows to draw. None means the plan's own visible rows, which is what
+    /// the main view wants. Some means draw exactly these, in this order,
+    /// which is how a report shows one chain.
+    rows: Option<Vec<usize>>,
+    /// Whether the chart can be edited. A report is a picture.
+    interactive: bool,
+) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let s = state.read();
 
@@ -301,83 +421,35 @@ pub fn GanttChart() -> Element {
     let (grid_rows, grid_columns) = (s.grid_rows, s.grid_columns);
     drop(s);
 
+    // A report's rows come from the caller and can change from one render to
+    // the next, which a memo closure, built once, would never see. So the memo
+    // keeps to the plan's own rows and a report bypasses it and lays out
+    // inline: a handful of rows costs nothing, and the interactive path, the
+    // one that has to stay fast, is left exactly as it was.
+    let report = rows.is_some();
+
     // Worked out once per change to the plan, not once per scroll step. The
     // memo reads `state` and nothing else, so moving the viewport leaves it
     // alone and scrolling costs only the windowing below.
     let layout = use_memo(move || {
+        if report {
+            return None;
+        }
         let s = state.read();
-        let project = &s.project;
-        let rows = s.layout_rows();
-        let (from, to) = chart_range(project);
-        let scale = Scale { origin: from, px_per_day: s.zoom.px_per_day() };
-
-        let width = ((to - from).num_days() as f64 * scale.px_per_day).max(600.0);
-        let body_h = (rows.len().max(1) as f64 * ROW_H) + 40.0;
-
-        let major = major_ticks(s.zoom, from, to);
-        let minor = minor_ticks(s.zoom, from, to);
-
-        // Non-working days are shaded, but only when a day is wide enough to see.
-        let mut nonworking: Vec<f64> = Vec::new();
-        if scale.px_per_day >= 4.0 {
-            let mut cursor = from;
-            while cursor < to {
-                if !project.calendar.is_working_day(cursor) {
-                    nonworking.push(scale.x_date(cursor));
-                }
-                cursor += Duration::days(1);
-            }
-        }
-
-        let today = Local::now().naive_local().date();
-        let today_x = (today >= from && today < to).then(|| scale.x_date(today));
-
-        // Bar geometry, keyed by task so the arrows can find their endpoints.
-        let mut boxes: HashMap<TaskId, BarBox> = HashMap::new();
-        // Which line each task sits on, so an arrow can be skipped without first
-        // working out the path it would have taken.
-        let mut lines: HashMap<TaskId, usize> = HashMap::new();
-        for (line, index) in rows.iter().enumerate().filter_map(task_line) {
-            let task = &project.tasks[index];
-            lines.insert(task.id, line);
-            let Some((left, right)) = bar_edges(project, &scale, s.round_bars, index) else {
-                continue;
-            };
-            boxes.insert(
-                task.id,
-                BarBox {
-                    left,
-                    right,
-                    mid: line as f64 * ROW_H + ROW_H / 2.0,
-                },
-            );
-        }
-
-        // A band draws nothing but the strip that holds its line open, so the
-        // rows below it sit where the grid put them.
-        let band_lines: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(line, row)| matches!(row, GroupRow::Band { .. }).then_some(line))
-            .collect();
-
-        ChartLayout {
-            rows,
-            from,
-            to,
-            width,
-            body_h,
-            major,
-            minor,
-            nonworking,
-            today_x,
-            boxes,
-            lines,
-            band_lines,
-        }
+        let rows = chart_rows(&s, None);
+        Some(build_layout(&s, rows, None))
     });
 
-    let layout = layout.read();
+    let memo_layout = layout.read();
+    let inline_layout = rows.map(|rows| {
+        let s = state.read();
+        let lines = chart_rows(&s, Some(&rows));
+        build_layout(&s, lines, Some(&rows))
+    });
+    // Exactly one of the two is filled in, but the compiler cannot know that.
+    let Some(layout) = inline_layout.as_ref().or((*memo_layout).as_ref()) else {
+        return rsx! {};
+    };
     let ChartLayout {
         rows,
         width,
@@ -393,7 +465,7 @@ pub fn GanttChart() -> Element {
         // scale already carries the origin, so nothing here reads it again.
         from: _,
         to: _,
-    } = &*layout;
+    } = layout;
     let (width, body_h, today_x) = (*width, *body_h, *today_x);
     let s = state.read();
     let project = &s.project;
@@ -405,6 +477,11 @@ pub fn GanttChart() -> Element {
         .then(|| s.project.status_date.map(|d| scale.x(d)))
         .flatten();
     let show_links = s.show_links;
+    // The critical colouring is a view option, off by default, and a report of
+    // the critical path that drew it in the ordinary bar colour would be
+    // telling the reader nothing. Forced on here so the bars come out of the
+    // plan's own critical style rather than a colour of the report's own.
+    let show_critical = s.show_critical || !interactive;
     let bar_text = s.bar_text;
     let px_per_day = scale.px_per_day;
     let drag = s.bar_drag;
@@ -418,10 +495,23 @@ pub fn GanttChart() -> Element {
     let mut scroll = use_signal(PaneScroll::default);
     let rows_len = rows.len();
     let seen = scroll();
-    let window = RowWindow::new(seen.top - HEADER_H, seen.height, rows_len);
-    // The same idea sideways: a year of day columns is thousands of pixels of
-    // gridline and tick label, and the pane shows a screenful of it.
-    let span = seen.span();
+    // A report is never scrolled, so there is no viewport to window against:
+    // it draws every row and the whole timescale, or the chain would print
+    // with pieces of itself missing.
+    let (window, span) = if interactive {
+        (
+            RowWindow::new(seen.top - HEADER_H, seen.height, rows_len),
+            // The same idea sideways: a year of day columns is thousands of
+            // pixels of gridline and tick label, and the pane shows a
+            // screenful of it.
+            seen.span(),
+        )
+    } else {
+        (
+            RowWindow { first: 0, end: rows_len, above: 0.0, below: 0.0 },
+            SpanWindow { left: f64::NEG_INFINITY, right: f64::INFINITY },
+        )
+    };
 
     // The placement maths lives in the core so screen and print cannot drift.
     // The map borrows the layout's bar geometry, so nothing here is rebuilt and
@@ -441,14 +531,19 @@ pub fn GanttChart() -> Element {
 
     rsx! {
         div {
-            class: "chart-pane",
+            // A report sizes to the chart instead of being a pane the chart is
+            // scrolled inside, so the whole chain is on the page at once.
+            class: if interactive { "chart-pane" } else { "chart-pane report" },
             oncontextmenu: move |event| {
+                if !interactive {
+                    return;
+                }
                 event.prevent_default();
                 let point = event.client_coordinates();
                 state.write().open_chart_menu(point.x, point.y);
             },
             onmousemove: move |event| {
-                if state.read().bar_drag.is_some() {
+                if interactive && state.read().bar_drag.is_some() {
                     state.write().update_bar_drag(event.client_coordinates().x);
                 }
             },
@@ -456,11 +551,14 @@ pub fn GanttChart() -> Element {
                 // A click on bare canvas lets go of any selected shape. A click
                 // on a shape stops before it reaches here, and one on a bar
                 // clears the selection through `select` anyway.
-                if state.read().selected_drawing.is_some() {
+                if interactive && state.read().selected_drawing.is_some() {
                     state.write().selected_drawing = None;
                 }
             },
             onmouseup: move |_| {
+                if !interactive {
+                    return;
+                }
                 if state.read().bar_drag.is_some() {
                     state.write().finish_bar_drag(px_per_day);
                 }
@@ -472,11 +570,17 @@ pub fn GanttChart() -> Element {
                 }
             },
             onmouseleave: move |_| {
+                if !interactive {
+                    return;
+                }
                 let mut s = state.write();
                 s.cancel_bar_drag();
                 s.cancel_draw_drag();
             },
             onscroll: move |event| {
+                if !interactive {
+                    return;
+                }
                 let data = event.data();
                 let now = PaneScroll {
                     top: data.scroll_top(),
@@ -609,7 +713,9 @@ pub fn GanttChart() -> Element {
                         for d in project.drawings.iter().filter(|d| d.behind_bars) {
                             {
                                 match placed(d) {
-                                    Some(at) => drawn_shape(d, at, selected_drawing == Some(d.id), state),
+                                    Some(at) => {
+                                        drawn_shape(d, at, selected_drawing == Some(d.id), state, interactive)
+                                    }
                                     None => rsx! {},
                                 }
                             }
@@ -667,7 +773,7 @@ pub fn GanttChart() -> Element {
                         let bar_w = (right - left).max(2.0);
                         let bar_y = y + (ROW_H - BAR_H) / 2.0;
                         let critical =
-                            s.show_critical && aop_core::issues::shows_as_critical(project, index);
+                            show_critical && aop_core::issues::shows_as_critical(project, index);
                         let fill = if !task.active {
                             "var(--bar-inactive)".to_string()
                         } else if critical {
@@ -707,10 +813,25 @@ pub fn GanttChart() -> Element {
                             g {
                                 key: "bar{index}",
 
-                                onmouseenter: move |_| state.write().set_bar_hover(index),
-                                onclick: move |_| state.write().select(index),
-                                ondoubleclick: move |_| state.write().dialog = Some(Dialog::TaskInformation(index)),
+                                onmouseenter: move |_| {
+                                    if interactive {
+                                        state.write().set_bar_hover(index);
+                                    }
+                                },
+                                onclick: move |_| {
+                                    if interactive {
+                                        state.write().select(index);
+                                    }
+                                },
+                                ondoubleclick: move |_| {
+                                    if interactive {
+                                        state.write().dialog = Some(Dialog::TaskInformation(index));
+                                    }
+                                },
                                 oncontextmenu: move |event| {
+                                    if !interactive {
+                                        return;
+                                    }
                                     event.prevent_default();
                                     event.stop_propagation();
                                     let point = event.client_coordinates();
@@ -741,6 +862,9 @@ pub fn GanttChart() -> Element {
                                 if project.is_marker(index) {
                                     g {
                                         onmousedown: move |event| {
+                                            if !interactive {
+                                                return;
+                                            }
                                             let kind = if event.modifiers().shift() {
                                                 BarDragKind::Link
                                             } else {
@@ -749,7 +873,7 @@ pub fn GanttChart() -> Element {
                                             let x = event.client_coordinates().x;
                                             state.write().begin_bar_drag(index, kind, x, 11.0);
                                         },
-                                        style: "cursor: move;",
+                                        style: if interactive { "cursor: move;" } else { "" },
                                         {milestone_marker(
                                             left + ghost_dx,
                                             centre,
@@ -777,42 +901,46 @@ pub fn GanttChart() -> Element {
                                         }
 
                                         // Hit zones: left sets progress, right resizes,
-                                        // the middle moves the whole bar.
-                                        rect {
-                                            x: "{left}", y: "{bar_y}",
-                                            width: "{(bar_w * 0.25).min(7.0)}", height: "{BAR_H}",
-                                            fill: "transparent", style: "cursor: col-resize;",
-                                            onmousedown: move |event| {
-                                                event.stop_propagation();
-                                                let x = event.client_coordinates().x;
-                                                state.write().begin_bar_drag(index, BarDragKind::Progress, x, bar_w);
-                                            },
-                                        }
-                                        rect {
-                                            x: "{right - (bar_w * 0.25).min(7.0)}", y: "{bar_y}",
-                                            width: "{(bar_w * 0.25).min(7.0)}", height: "{BAR_H}",
-                                            fill: "transparent", style: "cursor: ew-resize;",
-                                            onmousedown: move |event| {
-                                                event.stop_propagation();
-                                                let x = event.client_coordinates().x;
-                                                state.write().begin_bar_drag(index, BarDragKind::Resize, x, bar_w);
-                                            },
-                                        }
-                                        rect {
-                                            x: "{left + (bar_w * 0.25).min(7.0)}", y: "{bar_y}",
-                                            width: "{(bar_w - 2.0 * (bar_w * 0.25).min(7.0)).max(0.0)}",
-                                            height: "{BAR_H}",
-                                            fill: "transparent", style: "cursor: move;",
-                                            onmousedown: move |event| {
-                                                event.stop_propagation();
-                                                let kind = if event.modifiers().shift() {
-                                                    BarDragKind::Link
-                                                } else {
-                                                    BarDragKind::Move
-                                                };
-                                                let x = event.client_coordinates().x;
-                                                state.write().begin_bar_drag(index, kind, x, bar_w);
-                                            },
+                                        // the middle moves the whole bar. A report
+                                        // has none of them at all, rather than three
+                                        // invisible rectangles that do nothing.
+                                        if interactive {
+                                            rect {
+                                                x: "{left}", y: "{bar_y}",
+                                                width: "{(bar_w * 0.25).min(7.0)}", height: "{BAR_H}",
+                                                fill: "transparent", style: "cursor: col-resize;",
+                                                onmousedown: move |event| {
+                                                    event.stop_propagation();
+                                                    let x = event.client_coordinates().x;
+                                                    state.write().begin_bar_drag(index, BarDragKind::Progress, x, bar_w);
+                                                },
+                                            }
+                                            rect {
+                                                x: "{right - (bar_w * 0.25).min(7.0)}", y: "{bar_y}",
+                                                width: "{(bar_w * 0.25).min(7.0)}", height: "{BAR_H}",
+                                                fill: "transparent", style: "cursor: ew-resize;",
+                                                onmousedown: move |event| {
+                                                    event.stop_propagation();
+                                                    let x = event.client_coordinates().x;
+                                                    state.write().begin_bar_drag(index, BarDragKind::Resize, x, bar_w);
+                                                },
+                                            }
+                                            rect {
+                                                x: "{left + (bar_w * 0.25).min(7.0)}", y: "{bar_y}",
+                                                width: "{(bar_w - 2.0 * (bar_w * 0.25).min(7.0)).max(0.0)}",
+                                                height: "{BAR_H}",
+                                                fill: "transparent", style: "cursor: move;",
+                                                onmousedown: move |event| {
+                                                    event.stop_propagation();
+                                                    let kind = if event.modifiers().shift() {
+                                                        BarDragKind::Link
+                                                    } else {
+                                                        BarDragKind::Move
+                                                    };
+                                                    let x = event.client_coordinates().x;
+                                                    state.write().begin_bar_drag(index, kind, x, bar_w);
+                                                },
+                                            }
                                         }
                                     }
                                 }
@@ -873,7 +1001,9 @@ pub fn GanttChart() -> Element {
                         for d in project.drawings.iter().filter(|d| !d.behind_bars) {
                             {
                                 match placed(d) {
-                                    Some(at) => drawn_shape(d, at, selected_drawing == Some(d.id), state),
+                                    Some(at) => {
+                                        drawn_shape(d, at, selected_drawing == Some(d.id), state, interactive)
+                                    }
                                     None => rsx! {},
                                 }
                             }
@@ -917,7 +1047,8 @@ pub fn GanttChart() -> Element {
                 // over everything else. This SVG carries no view box and no
                 // transform, so a pointer position measured against it already
                 // is a chart coordinate: no bounding rectangles, no eval.
-                if draw_tool.is_some() || draw_drag.is_some() {
+                // A report never gets one: there is nothing on it to draw on.
+                if interactive && (draw_tool.is_some() || draw_drag.is_some()) {
                     rect {
                         x: "0", y: "0", width: "{width}", height: "{body_h}",
                         fill: "transparent",
@@ -1106,7 +1237,13 @@ fn shape_shows(at: Placement, span: &SpanWindow, window: &RowWindow) -> bool {
 const SELECT_PAD: f64 = 3.0;
 
 /// One annotation, drawn where `place` put it.
-fn drawn_shape(d: &Drawing, at: Placement, selected: bool, mut state: Signal<AppState>) -> Element {
+fn drawn_shape(
+    d: &Drawing,
+    at: Placement,
+    selected: bool,
+    mut state: Signal<AppState>,
+    interactive: bool,
+) -> Element {
     let id = d.id;
     let outer = at.normalised();
     let (end_x, end_y) = at.end();
@@ -1116,25 +1253,36 @@ fn drawn_shape(d: &Drawing, at: Placement, selected: bool, mut state: Signal<App
     let fill = d.style.fill();
     // A locked shape lets the pointer through to the bars underneath, which is
     // the point of locking one: mark the plan up, then get back to work on it.
-    let closed_hit = if d.locked { "none" } else { "all" };
-    let stroke_hit = if d.locked { "none" } else { "stroke" };
+    // A report is locked all over, since nothing on it is meant to be touched.
+    let inert = d.locked || !interactive;
+    let closed_hit = if inert { "none" } else { "all" };
+    let stroke_hit = if inert { "none" } else { "stroke" };
 
     rsx! {
         g {
             key: "dw{id}",
             onmousedown: move |event| {
+                if !interactive {
+                    return;
+                }
                 event.stop_propagation();
                 state.write().begin_drawing_move(id);
             },
             // Opening the shape's own settings, the way double clicking a task
             // opens its information.
             ondoubleclick: move |event| {
+                if !interactive {
+                    return;
+                }
                 event.stop_propagation();
                 let mut writer = state.write();
                 writer.cancel_draw_drag();
                 writer.dialog = Some(Dialog::FormatDrawing(id));
             },
             oncontextmenu: move |event| {
+                if !interactive {
+                    return;
+                }
                 event.prevent_default();
                 event.stop_propagation();
                 let mut writer = state.write();
@@ -1588,8 +1736,78 @@ pub fn TimelineBand() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aop_core::WorkCalendar;
+    use crate::state::AppState;
+    use aop_core::{WorkCalendar, MINUTES_PER_DAY};
     use chrono::NaiveDate;
+
+    /// The property the report mode is not allowed to cost. The main view
+    /// passes no rows of its own, and when it does the chart has to draw
+    /// exactly the lines the plan lays out, bands included: one line more or
+    /// fewer here slides every bar off its row in the grid beside it.
+    #[test]
+    fn a_report_is_scaled_to_the_rows_it_draws_not_the_whole_plan() {
+        // A short chain inside a long plan would otherwise be a small cluster
+        // of bars in a mostly empty chart, which defeats the point of the
+        // report drawing it at all.
+        let mut state = AppState::new();
+        for name in ["Early", "Middle", "Late"] {
+            state.append_task(name);
+        }
+        // Push the last task far out so the plan is much longer than any pair.
+        state.select(2);
+        state.commit_cell(2, crate::state::Column::Duration, "200 days");
+        state.reschedule();
+
+        let whole = chart_range(&state.project);
+        let pair = rows_range(&state.project, &[0, 1]).expect("two real rows");
+
+        assert!(
+            pair.1 < whole.1,
+            "a range over the first two rows must be shorter than the plan's: {pair:?} against {whole:?}"
+        );
+        assert!(pair.0 <= pair.1, "a range cannot run backwards: {pair:?}");
+        assert_eq!(
+            rows_range(&state.project, &[]),
+            None,
+            "no rows means no range of their own, so the plan's is used"
+        );
+    }
+
+    #[test]
+    fn with_no_rows_of_its_own_the_chart_draws_the_plans_layout() {
+        let mut state = AppState::new();
+        state.project.tasks.clear();
+        state.project.links.clear();
+        for name in ["Phase", "Child A", "Child B", "Standalone"] {
+            state.project.push_task(name, MINUTES_PER_DAY);
+        }
+        state.project.tasks[1].outline_level = 1;
+        state.project.tasks[2].outline_level = 1;
+        state.reschedule();
+
+        assert_eq!(chart_rows(&state, None), state.layout_rows());
+
+        // And once grouping puts bands in the list, still exactly that list.
+        state.set_group_by("milestone");
+        let grouped = state.layout_rows();
+        assert!(
+            grouped.iter().any(|row| matches!(row, GroupRow::Band { .. })),
+            "the grouped plan should have bands to lose"
+        );
+        assert_eq!(chart_rows(&state, None), grouped);
+    }
+
+    /// A report draws the chain it was handed, in the order it was handed it,
+    /// and nothing else: no bands, no rows the plan would have put between.
+    #[test]
+    fn the_rows_a_report_asks_for_are_the_rows_it_gets() {
+        let state = AppState::new();
+        assert_eq!(
+            chart_rows(&state, Some(&[3, 0, 1])),
+            vec![GroupRow::Task(3), GroupRow::Task(0), GroupRow::Task(1)]
+        );
+        assert!(chart_rows(&state, Some(&[])).is_empty());
+    }
 
     fn at(y: i32, m: u32, d: u32, h: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(y, m, d)
