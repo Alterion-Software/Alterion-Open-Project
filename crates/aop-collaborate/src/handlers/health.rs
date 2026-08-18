@@ -15,7 +15,7 @@ pub async fn health(state: web::Data<AppState>) -> HttpResponse {
     let database = state.db.ping().await.is_ok();
     let body = json!({
         "status": if database { "ok" } else { "degraded" },
-        "service": "aop-sync-server",
+        "service": "aop-collaborate",
         "version": env!("CARGO_PKG_VERSION"),
         "database": database,
         "issuer": state.idp.issuer(),

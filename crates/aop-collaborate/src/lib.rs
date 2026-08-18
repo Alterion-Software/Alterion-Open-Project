@@ -1,4 +1,4 @@
-//! Sync server for Alterion Open Project.
+//! AOP Collaborate: the server behind sharing a plan.
 //!
 //! A plan's history is an append-only log of the commands that made it, and
 //! this service is the shared copy of that log. It holds no scheduling logic

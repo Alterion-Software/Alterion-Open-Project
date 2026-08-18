@@ -5,7 +5,7 @@
 //! process happens to source it, and that every tutorial tells you to commit
 //! "just the example" of, is not where a database password belongs. The file
 //! sits next to the binary, is written on first run with safe defaults, and
-//! every key can be overridden by `AOP_SYNC_*` for the deployments that keep
+//! every key can be overridden by `AOP_COLLAB_*` for the deployments that keep
 //! their secrets in the orchestrator instead.
 
 use std::env;
@@ -102,7 +102,7 @@ impl Config {
     /// exercised without one.
     pub fn from_ini(ini: &Ini) -> Self {
         let read = |section: &str, key: &str| -> Option<String> {
-            let env_key = format!("AOP_SYNC_{}_{}", section.to_uppercase(), key.to_uppercase());
+            let env_key = format!("AOP_COLLAB_{}_{}", section.to_uppercase(), key.to_uppercase());
             env::var(&env_key)
                 .ok()
                 .or_else(|| ini.get(section, key))

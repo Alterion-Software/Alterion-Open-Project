@@ -1,4 +1,4 @@
-# aop-sync-server
+# AOP Collaborate
 
 The self-hostable sync service for Alterion Open Project. It stores plans,
 keeps the authored change log, syncs clients, and streams live edits.
@@ -31,7 +31,7 @@ a project starts as a snapshot with nothing appended yet.
 You need PostgreSQL 13 or newer and a reachable Alterion identity provider.
 
 ```sh
-cargo run -p aop-sync-server
+cargo run -p aop-collaborate
 ```
 
 The first run writes a `config.cfg` next to the binary and exits with whatever
@@ -41,8 +41,8 @@ at startup, so there is no separate migrate step.
 ## Configuration
 
 `config.cfg`, beside the binary. Every key can be overridden by an environment
-variable named `AOP_SYNC_<SECTION>_<KEY>`, so `AOP_SYNC_DATABASE_URL` and
-`AOP_SYNC_IDP_ISSUER` do what they look like. There is deliberately no `.env`
+variable named `AOP_COLLAB_<SECTION>_<KEY>`, so `AOP_COLLAB_DATABASE_URL` and
+`AOP_COLLAB_IDP_ISSUER` do what they look like. There is deliberately no `.env`
 support: a database password does not belong in a file that every tool in the
 tree knows how to source.
 
@@ -197,10 +197,10 @@ history is ignored by its merge rather than applied twice.
 ## Tests
 
 ```sh
-cargo test -p aop-sync-server
+cargo test -p aop-collaborate
 ```
 
 The push decision, the cursor arithmetic and the introspection cache all run
 without a database or an identity provider. The tests that need Postgres are
-ignored by default; set `AOP_SYNC_TEST_DATABASE_URL` and run with
+ignored by default; set `AOP_COLLAB_TEST_DATABASE_URL` and run with
 `--ignored` to include them.

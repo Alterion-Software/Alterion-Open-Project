@@ -10,11 +10,11 @@ use std::sync::Arc;
 use actix_cors::Cors;
 use actix_web::{App, HttpServer, middleware::Logger, web};
 use anyhow::{Context, Result};
-use aop_sync_server::auth::IdpClient;
-use aop_sync_server::config::{Config, config_path};
-use aop_sync_server::live::Hub;
-use aop_sync_server::schema::Migrator;
-use aop_sync_server::state::AppState;
+use aop_collaborate::auth::IdpClient;
+use aop_collaborate::config::{Config, config_path};
+use aop_collaborate::live::Hub;
+use aop_collaborate::schema::Migrator;
+use aop_collaborate::state::AppState;
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
 
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
             .wrap(cors)
             .wrap(Logger::default())
             .app_data(state.clone())
-            .configure(aop_sync_server::handlers::routes)
+            .configure(aop_collaborate::handlers::routes)
     })
     .bind(&bind)
     .with_context(|| format!("bind {bind}"))?

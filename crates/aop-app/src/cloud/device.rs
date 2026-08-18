@@ -133,10 +133,7 @@ impl DeviceComponents {
     /// and there is no reason to put a hardware inventory on the wire.
     pub fn fingerprint_hex(&self) -> String {
         use sha2::{Digest, Sha256};
-        Sha256::digest(self.exact_tier().as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        crate::cloud::tokens::to_hex(&Sha256::digest(self.exact_tier().as_bytes()))
     }
 }
 

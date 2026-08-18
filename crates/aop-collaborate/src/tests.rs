@@ -250,13 +250,13 @@ mod live_database {
     use sea_orm_migration::MigratorTrait;
 
     async fn connect() -> DatabaseConnection {
-        let url = std::env::var("AOP_SYNC_TEST_DATABASE_URL")
-            .expect("set AOP_SYNC_TEST_DATABASE_URL to run this");
+        let url = std::env::var("AOP_COLLAB_TEST_DATABASE_URL")
+            .expect("set AOP_COLLAB_TEST_DATABASE_URL to run this");
         Database::connect(&url).await.expect("connect")
     }
 
     #[actix_web::test]
-    #[ignore = "needs live Postgres (set AOP_SYNC_TEST_DATABASE_URL)"]
+    #[ignore = "needs live Postgres (set AOP_COLLAB_TEST_DATABASE_URL)"]
     async fn migrations_apply_and_roll_back() {
         let db = connect().await;
         crate::schema::Migrator::up(&db, None).await.expect("up");

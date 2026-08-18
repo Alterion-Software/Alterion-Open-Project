@@ -1,12 +1,12 @@
 [package]
-name = "aop-sync-server"
+name = "aop-collaborate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Self-hostable sync server for Alterion Open Project: authored change log, rebase sync, live edits."
 
 [[bin]]
-name = "aop-sync-server"
+name = "aop-collaborate"
 path = "src/main.rs"
 
 [dependencies]

@@ -157,7 +157,7 @@ impl IdpClient {
     pub fn new(config: &crate::Config) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent(concat!("aop-sync-server/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("aop-collaborate/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             http,
