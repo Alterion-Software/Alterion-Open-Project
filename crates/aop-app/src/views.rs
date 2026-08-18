@@ -1672,7 +1672,10 @@ fn CriticalPathPage() -> Element {
     let hovered = hover();
 
     let path = aop_core::critical_path(project);
-    let minutes = aop_core::critical_path_minutes(project, &path);
+    // The elapsed working span, not the sum of the task durations. A chain
+    // carrying a ten day lag occupies twelve days and did two days of work, and
+    // the figure is labelled as the span, so it has to be the span.
+    let minutes = aop_core::critical_path_span_minutes(project, &path);
     // The scheduler's own answer, not the warning list's. Dismissing a
     // critical warning changes the colour a bar is drawn in; it does not give
     // the task slack, so it must not change the count either.

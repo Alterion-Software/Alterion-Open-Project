@@ -637,6 +637,15 @@ pub struct Project {
     pub drawings: Vec<crate::draw::Drawing>,
     pub currency_symbol: String,
     pub show_project_summary: bool,
+    /// How little slack makes a task critical, in minutes. Zero is the usual
+    /// answer and the default.
+    ///
+    /// Project offers this per plan because a chain running across two
+    /// calendars, a five day week feeding a seven day one, ends up with a day
+    /// or two of slack on every link and no critical path at all at zero. The
+    /// setting is how a planner gets the chain back.
+    #[serde(default)]
+    pub critical_slack_minutes: i64,
     #[serde(default)]
     pub bar_styles: BarStyles,
     next_task_id: TaskId,
@@ -674,6 +683,7 @@ impl Project {
             drawings: Vec::new(),
             currency_symbol: "$".into(),
             show_project_summary: false,
+            critical_slack_minutes: 0,
             bar_styles: BarStyles::default(),
             next_task_id: 1,
             next_resource_id: 1,

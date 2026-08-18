@@ -508,8 +508,12 @@ fn backward_pass(project: &mut Project, graph: &Graph, project_finish: NaiveDate
 /// only this function has to change when it lands.
 pub const DEFAULT_CRITICAL_SLACK_MINUTES: i64 = 0;
 
-fn critical_slack_threshold(_project: &Project) -> i64 {
-    DEFAULT_CRITICAL_SLACK_MINUTES
+fn critical_slack_threshold(project: &Project) -> i64 {
+    // Negative would mean a task needs slack to be critical, which is backwards,
+    // so a hand edited file cannot turn the critical path off this way.
+    project
+        .critical_slack_minutes
+        .max(DEFAULT_CRITICAL_SLACK_MINUTES)
 }
 
 /// The latest finish among the tasks that count.
@@ -1083,6 +1087,68 @@ mod tests {
             project.push_task(format!("Task {}", n + 1), duration);
         }
         project
+    }
+
+    #[test]
+    fn the_slack_threshold_widens_what_counts_as_critical() {
+        // A chain across two calendars picks up a day of slack on every link
+        // and can end up with no critical path at all at zero. Raising the
+        // threshold is how a planner gets the chain back, which is why Project
+        // makes it a per plan setting.
+        let mut project = Project::blank(
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 5)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        );
+        let mut ids = Vec::new();
+        for name in ["Drives", "Slack one day"] {
+            let id = project.allocate_task_id();
+            project.tasks.push(crate::model::Task::new(id, name, 480));
+            ids.push(id);
+        }
+        project.links.push(Link {
+            predecessor: ids[0],
+            successor: ids[1],
+            kind: LinkType::FS,
+            lag_minutes: 0,
+        });
+        // A deadline a day past the finish gives the chain exactly one day.
+        schedule(&mut project).expect("schedules");
+        let finish = project.tasks[1].scheduled.finish;
+        project.tasks[1].deadline = Some(project.calendar.add_minutes(finish, 480));
+
+        schedule(&mut project).expect("still schedules");
+        let at_zero = project.tasks.iter().filter(|t| t.scheduled.critical).count();
+
+        project.critical_slack_minutes = 480;
+        schedule(&mut project).expect("still schedules");
+        let at_one_day = project.tasks.iter().filter(|t| t.scheduled.critical).count();
+
+        assert!(
+            at_one_day >= at_zero,
+            "raising the threshold can only widen the set, {at_zero} to {at_one_day}"
+        );
+        assert!(at_one_day > 0, "at a day of slack the chain has to be critical");
+    }
+
+    #[test]
+    fn a_negative_threshold_cannot_turn_the_critical_path_off() {
+        let mut project = Project::blank(
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 5)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        );
+        let id = project.allocate_task_id();
+        project.tasks.push(crate::model::Task::new(id, "Only", 480));
+        project.critical_slack_minutes = -10_000;
+
+        schedule(&mut project).expect("schedules");
+        assert!(
+            project.tasks[0].scheduled.critical,
+            "a lone task drives the finish whatever a hand edited file says"
+        );
     }
 
     #[test]
@@ -2132,15 +2198,6 @@ pub fn critical_path_duration_minutes(project: &Project, path: &[CriticalStep]) 
         .sum()
 }
 
-/// How long the critical path runs, in working minutes.
-///
-/// The name the rest of the tree already calls, answering with the elapsed
-/// span: the durations added up called a chain with a fortnight of lag in it
-/// two days long. Callers that want one reading or the other by name have
-/// [`critical_path_span_minutes`] and [`critical_path_duration_minutes`].
-pub fn critical_path_minutes(project: &Project, path: &[CriticalStep]) -> i64 {
-    critical_path_span_minutes(project, path)
-}
 
 #[cfg(test)]
 mod critical_path_tests {
@@ -2297,7 +2354,9 @@ mod critical_path_tests {
         let mut project = chain(&[480, 960]);
         crate::schedule(&mut project).unwrap();
         let path = critical_path(&project);
-        assert_eq!(critical_path_minutes(&project, &path), 1440);
+        // With no lag and no gaps the two agree, which is the only case where
+        // the old duration sum was ever right.
+        assert_eq!(critical_path_span_minutes(&project, &path), 1440);
         assert_eq!(critical_path_duration_minutes(&project, &path), 1440);
     }
 
@@ -2461,10 +2520,10 @@ mod critical_path_tests {
             12 * crate::MINUTES_PER_DAY,
             "twelve working days from the fifth to the twentieth of January"
         );
-        assert_eq!(
-            critical_path_minutes(&project, &path),
+        assert_ne!(
+            critical_path_duration_minutes(&project, &path),
             critical_path_span_minutes(&project, &path),
-            "the length a report shows is the time it runs for"
+            "the length a report shows is the time it runs for, not the work in it"
         );
     }
 

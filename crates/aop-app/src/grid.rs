@@ -92,6 +92,14 @@ fn PickerCellEditor(row: usize, column: Column) -> Element {
 
     let mut commit = move || {
         let text = draft();
+        // Only when it says something different from the plan. Ticking a box in
+        // the picker changes the plan and refreshes this text, and committing
+        // the text again on the way out would write the old value back over the
+        // change that was just made.
+        if text == state.peek().cell_text(row, column) {
+            state.write().editing = None;
+            return;
+        }
         state.write().commit_cell(row, column, &text);
     };
 

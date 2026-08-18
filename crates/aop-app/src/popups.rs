@@ -363,20 +363,24 @@ pub fn ResourcePicker(row: usize) -> Element {
                                     tr { key: "rp{index}", class: "{class}",
                                         td {
                                             onclick: move |_| {
-                                                state.write().set_assignment(
+                                                let mut w = state.write();
+                                                w.set_assignment(
                                                     row, id,
                                                     if assigned { None } else { Some(1.0) },
                                                 );
+                                                w.refresh_cell_draft();
                                             },
                                             span { class: "{box_class}", style: "display: inline-grid; width: 12px; height: 12px;",
                                                 if assigned { "\u{2713}" } }
                                         }
                                         td {
                                             onclick: move |_| {
-                                                state.write().set_assignment(
+                                                let mut w = state.write();
+                                                w.set_assignment(
                                                     row, id,
                                                     if assigned { None } else { Some(1.0) },
                                                 );
+                                                w.refresh_cell_draft();
                                             },
                                             "{label}"
                                         }
@@ -389,7 +393,9 @@ pub fn ResourcePicker(row: usize) -> Element {
                                                     onchange: move |event| {
                                                         let cleaned = event.value().trim().trim_end_matches('%').to_string();
                                                         if let Ok(percent) = cleaned.parse::<f64>() {
-                                                            state.write().set_assignment(row, id, Some((percent / 100.0).max(0.0)));
+                                                            let mut w = state.write();
+                                                            w.set_assignment(row, id, Some((percent / 100.0).max(0.0)));
+                                                            w.refresh_cell_draft();
                                                         }
                                                     },
                                                 }

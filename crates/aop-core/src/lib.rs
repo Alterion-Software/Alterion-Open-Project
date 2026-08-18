@@ -38,7 +38,8 @@ pub use model::{
 pub use mspdi::ImportError;
 pub use persist::{FileError, FILE_EXTENSION, FILE_TYPE_NAME};
 pub use schedule::{
-    apply_remedy, critical_path, critical_path_minutes, critical_reason, diagnose, schedule,
+    apply_remedy, critical_path, critical_path_duration_minutes, critical_path_span_minutes,
+    critical_paths, critical_reason, diagnose, schedule, CriticalChain,
     CriticalStep, Overallocation, Remedy, ScheduleError,
     ScheduleReport,
 };

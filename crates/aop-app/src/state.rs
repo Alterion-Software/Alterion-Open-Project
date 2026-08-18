@@ -764,8 +764,13 @@ pub struct AppState {
     /// in, and a full-screen list of mistakes takes away the thing being
     /// corrected.
     pub spelling_open: bool,
-    /// How long an iteration runs, for the burn charts and velocity. A team's
-    /// cadence is not something to guess at, so it is settable.
+    /// How long an iteration runs, for the burn charts and velocity.
+    ///
+    /// Only used as a fallback: a plan that names its sprints has its
+    /// iterations read from those instead, which is the case that matters,
+    /// because guessing a cadence from a calendar slices straight through
+    /// declared sprints. Nothing writes this yet and it is not persisted, so
+    /// it is the default until a plan without named sprints needs otherwise.
     pub iteration_days: i64,
     /// Which palette to paint, or to follow the desktop.
     pub theme: crate::theme::ThemeChoice,
@@ -3586,6 +3591,42 @@ mod tests {
         let (left, right) =
             bar_edges(&state.project, &scale, state.round_bars, 0).expect("row zero has a bar");
         ((left + right) / 2.0, ROW_H / 2.0)
+    }
+
+    #[test]
+    fn a_pickers_change_is_not_written_back_over_by_the_cells_text() {
+        // The cell and the picker edit the same thing from two places. Ticking
+        // a box changes the plan; committing the cell's text afterwards used to
+        // put the old value back, so the tick appeared to do nothing.
+        let mut state = AppState::new();
+        state.append_task("A");
+        state.append_task("B");
+        state.add_resource("Ada");
+
+        let resource = state.project.resources[0].id;
+        state.edit_cell_at(1, Column::Resources, 0.0, 0.0);
+        let seeded = state.cell_draft.clone();
+        assert!(seeded.is_empty(), "nothing is booked yet");
+
+        state.set_assignment(1, resource, Some(1.0));
+        state.refresh_cell_draft();
+        assert!(
+            state.cell_draft.contains("Ada"),
+            "the cell has to catch up with the picker, got {:?}",
+            state.cell_draft
+        );
+
+        // What blur then compares against: identical, so it must not commit.
+        assert_eq!(
+            state.cell_draft,
+            state.cell_text(1, Column::Resources),
+            "the text now matches the plan, so there is nothing to write back"
+        );
+        assert_eq!(
+            state.project.tasks[1].assignments.len(),
+            1,
+            "and the booking survives"
+        );
     }
 
     #[test]
