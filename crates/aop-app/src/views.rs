@@ -1249,6 +1249,9 @@ fn CriticalPathPage() -> Element {
                 "Nothing is critical: every task has slack." }
         } else {
             h2 { class: "rep-section", "The chain" }
+            CriticalPathChart { path: path.clone() }
+
+            h2 { class: "rep-section", "Task by task" }
             table { class: "rep-table",
                 thead {
                     tr {
@@ -1277,6 +1280,150 @@ fn CriticalPathPage() -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+/// The critical path drawn on a timescale, the way the Gantt view draws the
+/// plan, rather than listed as rows.
+///
+/// A table says which tasks are on the path; it does not show that they form
+/// one unbroken run, where the gaps are, or how much of the calendar the chain
+/// covers. The scale is fitted to the chain itself rather than to the whole
+/// project, so a short path buried in a long plan still fills the pane.
+#[component]
+fn CriticalPathChart(path: Vec<aop_core::CriticalStep>) -> Element {
+    let state = use_context::<Signal<AppState>>();
+    let s = state.read();
+    let project = &s.project;
+
+    let first = path
+        .iter()
+        .filter_map(|step| project.tasks.get(step.index))
+        .map(|task| task.scheduled.start)
+        .min();
+    let last = path
+        .iter()
+        .filter_map(|step| project.tasks.get(step.index))
+        .map(|task| task.scheduled.finish)
+        .max();
+    let (Some(from), Some(to)) = (first, last) else {
+        return rsx! {};
+    };
+    let total = ((to - from).num_minutes().max(1)) as f64;
+
+    // Drawn in its own coordinate space and fitted to the pane by the viewBox,
+    // so it stays readable at any width without measuring the window.
+    const NAME_W: f64 = 250.0;
+    const CHART_W: f64 = 700.0;
+    const ROW: f64 = 26.0;
+    const HEAD: f64 = 30.0;
+    const BAR: f64 = 12.0;
+    let width = NAME_W + CHART_W;
+    let height = HEAD + path.len() as f64 * ROW + 6.0;
+
+    let at = |when: chrono::NaiveDateTime| -> f64 {
+        NAME_W + (when - from).num_minutes() as f64 / total * CHART_W
+    };
+
+    // Enough ticks to read the dates by, without crowding a long chain.
+    let days = (to - from).num_days().max(1);
+    let stride = if days > 240 {
+        30
+    } else if days > 60 {
+        7
+    } else {
+        1
+    };
+    let mut ticks: Vec<(f64, String)> = Vec::new();
+    let mut cursor = from;
+    while cursor <= to {
+        ticks.push((at(cursor), crate::state::format_date(cursor)));
+        cursor += chrono::Duration::days(stride);
+    }
+
+    rsx! {
+        div { class: "cp-chart",
+            svg {
+                width: "100%",
+                view_box: "0 0 {width} {height}",
+                preserve_aspect_ratio: "xMinYMin meet",
+
+                rect { x: "0", y: "0", width: "{width}", height: "{height}", fill: "var(--surface)" }
+                rect { x: "{NAME_W}", y: "0", width: "{CHART_W}", height: "{HEAD}",
+                    fill: "var(--grid-header)" }
+
+                for (index, (x, label)) in ticks.iter().enumerate() {
+                    {
+                        let x = *x;
+                        rsx! {
+                            line { key: "t{index}", x1: "{x}", y1: "0", x2: "{x}", y2: "{height}",
+                                stroke: "var(--grid-line)", stroke_width: "1" }
+                            text { class: "cp-tick", x: "{x + 3.0}", y: "19", "{label}" }
+                        }
+                    }
+                }
+                line { x1: "{NAME_W}", y1: "{HEAD}", x2: "{width}", y2: "{HEAD}",
+                    stroke: "var(--grid-line)", stroke_width: "1" }
+                line { x1: "{NAME_W}", y1: "0", x2: "{NAME_W}", y2: "{height}",
+                    stroke: "var(--grid-line)", stroke_width: "1" }
+
+                for (number, step) in path.iter().enumerate() {
+                    {
+                        let task = &project.tasks[step.index];
+                        let y = HEAD + number as f64 * ROW;
+                        let mid = y + ROW / 2.0;
+                        let left = at(task.scheduled.start);
+                        let right = at(task.scheduled.finish);
+                        let bar_w = (right - left).max(2.0);
+                        // A milestone has no width, so it is drawn as a marker
+                        // rather than as a bar of nothing.
+                        let marker = project.is_marker(step.index);
+                        let label = format!("{}.  {}", number + 1, task.name);
+                        let joint = step
+                            .link_from_previous
+                            .map(|kind| kind.code().to_string())
+                            .unwrap_or_default();
+                        let span = aop_core::format_duration(task.scheduled.duration_minutes);
+
+                        rsx! {
+                            if number % 2 == 1 {
+                                rect { x: "0", y: "{y}", width: "{width}",
+                                    height: "{ROW}", fill: "var(--hover)" }
+                            }
+                            text { class: "cp-name", x: "8", y: "{mid + 4.0}",
+                                "{label}" }
+
+                            // The link that put this task on the path, drawn
+                            // from the row above so the chain reads as a chain.
+                            if number > 0 {
+                                path {                                     d: "M {left - 9.0} {y - ROW / 2.0} L {left - 9.0} {mid} L {left - 1.0} {mid}",
+                                    fill: "none", stroke: "var(--danger)", stroke_width: "1.3" }
+                                if !joint.is_empty() {
+                                    text { class: "cp-joint",
+                                        x: "{left - 12.0}", y: "{y - 4.0}", "{joint}" }
+                                }
+                            }
+
+                            if marker {
+                                path { key: "m{number}",
+                                    d: "M {left} {mid - 6.0} L {left + 6.0} {mid} L {left} {mid + 6.0} L {left - 6.0} {mid} Z",
+                                    fill: "var(--danger)" }
+                            } else {
+                                rect { x: "{left}", y: "{mid - BAR / 2.0}",
+                                    width: "{bar_w}", height: "{BAR}", rx: "2",
+                                    fill: "var(--danger)" }
+                            }
+                            text { class: "cp-span",
+                                x: "{left + bar_w + 7.0}", y: "{mid + 4.0}", "{span}" }
+                        }
+                    }
+                }
+            }
+        }
+        div { class: "cp-legend",
+            span { class: "cp-swatch" }
+            "Red is the critical path. Every task here has zero slack, so delaying any one of them moves the project finish."
         }
     }
 }

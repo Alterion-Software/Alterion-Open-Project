@@ -20,20 +20,9 @@ fn Anchored(width: f64, children: Element) -> Element {
     rsx! {
         div {
             class: "ctx-scrim",
-            onclick: move |_| {
-                // Blur does not commit here, so dismissing is what banks any
-                // text the planner typed but did not press Enter on.
-                let pending = {
-                    let s = state.read();
-                    s.editing.map(|(row, column)| (row, column, s.cell_draft.clone()))
-                };
-                match pending {
-                    Some((row, column, text)) if text != state.read().cell_text(row, column) => {
-                        state.write().commit_cell(row, column, &text);
-                    }
-                    _ => state.write().editing = None,
-                }
-            },
+            // The cell's own text box commits on blur, and clicking here
+            // blurs it, so this only has to close the picker.
+            onclick: move |_| state.write().editing = None,
             oncontextmenu: move |event| {
                 event.prevent_default();
                 state.write().editing = None;

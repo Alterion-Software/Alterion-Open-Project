@@ -15,7 +15,7 @@ options=('!lto')
 # 0.1.0-beta, this says 0.1.0, and the tag below reunites them.
 _tag="v${pkgver}-beta"
 source=("$pkgname-$pkgver.tar.gz::$url/-/archive/$_tag/$pkgname-$_tag.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('3083336c44e568747f73ba4c59d1c16a03242cc9607bb71e2b2733f2dee3f205')
 
 prepare() {
   cd "$pkgname-$_tag"

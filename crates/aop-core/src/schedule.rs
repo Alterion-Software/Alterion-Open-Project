@@ -26,11 +26,35 @@ pub enum ScheduleError {
 impl std::fmt::Display for ScheduleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScheduleError::CircularDependency(path) => write!(
-                f,
-                "Circular dependency: {}. A task cannot be linked so that it depends on itself.",
-                path.join(" \u{2192} ")
-            ),
+            ScheduleError::CircularDependency(path) => {
+                // A loop of three is readable in full; one of thirty is a wall
+                // of text that hides the two tasks the planner has to change.
+                const SHOWN: usize = 6;
+                let arrow = " \u{2192} ";
+                if path.len() <= SHOWN {
+                    write!(
+                        f,
+                        "These tasks depend on each other in a loop:\n\n{}\n\n\
+                         A task cannot be linked so that it ends up waiting for itself. \
+                         Remove one of the links above to break it.",
+                        path.join(arrow)
+                    )
+                } else {
+                    let head = path[..SHOWN - 1].join(arrow);
+                    let last = path.last().map(String::as_str).unwrap_or_default();
+                    write!(
+                        f,
+                        "These tasks depend on each other in a loop of {}:\n\n{}{}\u{2026}{}{}\n\n\
+                         A task cannot be linked so that it ends up waiting for itself. \
+                         Remove one of the links in this loop to break it.",
+                        path.len() - 1,
+                        head,
+                        arrow,
+                        arrow,
+                        last
+                    )
+                }
+            }
         }
     }
 }
@@ -240,6 +264,15 @@ fn trace_cycle(
         node = next;
     }
     path.push(node);
+
+    // Walking from an arbitrary stuck task usually arrives at the loop through
+    // a long run of tasks that are merely upstream of it. Those are not part of
+    // the loop and naming them buries the handful of tasks that are, so the
+    // run-in is trimmed: the loop is what sits between the repeated task and
+    // its second appearance.
+    if let Some(at) = path.iter().position(|&n| n == node) {
+        path.drain(..at);
+    }
 
     path.iter()
         .filter_map(|&i| project.tasks.get(i).map(|t| t.name.clone()))
@@ -960,6 +993,57 @@ mod tests {
             project.push_task(format!("Task {}", n + 1), duration);
         }
         project
+    }
+
+    #[test]
+    fn a_loop_is_reported_as_the_loop_and_not_everything_leading_into_it() {
+        // Walking to a cycle from an arbitrary task passes through everything
+        // upstream of it. Naming all of that buries the two or three tasks the
+        // planner actually has to change: a real plan produced a message
+        // hundreds of tasks long for a loop of two.
+        let mut project = Project::blank(
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 2)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        );
+        let mut ids = Vec::new();
+        for name in ["A", "B", "C", "D", "E", "F"] {
+            let id = project.allocate_task_id();
+            project.tasks.push(crate::model::Task::new(id, name, 480));
+            ids.push(id);
+        }
+        // A long tail, then a loop between the last two.
+        let link = |from: TaskId, to: TaskId| Link {
+            predecessor: from,
+            successor: to,
+            kind: LinkType::FS,
+            lag_minutes: 0,
+        };
+        for pair in ids.windows(2) {
+            project.links.push(link(pair[0], pair[1]));
+        }
+        project.links.push(link(ids[5], ids[4]));
+
+        let error = schedule(&mut project).expect_err("this plan cannot schedule");
+        let ScheduleError::CircularDependency(path) = error;
+
+        assert!(
+            path.len() <= 3,
+            "only the loop should be named, got {} entries: {path:?}",
+            path.len()
+        );
+        assert_eq!(
+            path.first(),
+            path.last(),
+            "a loop has to come back to where it started: {path:?}"
+        );
+        for name in ["A", "B", "C"] {
+            assert!(
+                !path.iter().any(|n| n == name),
+                "{name} only leads into the loop, it is not in it: {path:?}"
+            );
+        }
     }
 
     #[test]

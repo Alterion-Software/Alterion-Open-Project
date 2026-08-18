@@ -606,6 +606,11 @@ pub struct AppState {
     /// boxes. A draft owned by the input would go stale the moment a box was
     /// ticked, and blur would then write the stale text back over the change.
     pub cell_draft: String,
+    /// Bumped only when the picker changes the plan, so the cell's text box
+    /// knows to pull the new text in. Watching `cell_draft` itself would not
+    /// do: the box would then be reset by every unrelated change in the
+    /// application, wiping out whatever was being typed.
+    pub picker_edits: u64,
     /// The column the cursor last sat in. Fill Down works down a column, so it
     /// has to know which one without the grid holding a full cell cursor.
     pub fill_field: Option<Field>,
@@ -709,6 +714,7 @@ impl AppState {
             selection: Vec::new(),
             selected_resource: None,
             cell_draft: String::new(),
+            picker_edits: 0,
             fill_field: None,
             group_by: None,
             text_styles: aop_core::textstyle::TextStyles::new(),
@@ -2608,6 +2614,7 @@ impl AppState {
     pub fn refresh_cell_draft(&mut self) {
         if let Some((row, column)) = self.editing {
             self.cell_draft = self.cell_text(row, column);
+            self.picker_edits = self.picker_edits.wrapping_add(1);
         }
     }
 

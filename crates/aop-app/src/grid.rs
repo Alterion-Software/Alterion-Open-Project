@@ -69,7 +69,25 @@ fn align_class(align: Align) -> &'static str {
 #[component]
 fn PickerCellEditor(row: usize, column: Column) -> Element {
     let mut state = use_context::<Signal<AppState>>();
-    let draft = state.read().cell_draft.clone();
+
+    // The draft is local. Writing every keystroke into the shared state would
+    // redraw the whole grid, which throws the caret out of the box being typed
+    // in; that is exactly what it used to do.
+    let mut draft = use_signal(|| state.read().cell_draft.clone());
+
+    // The picker writes to the plan directly, so when a box is ticked the text
+    // here has to catch up. The counter is what says a change came from the
+    // picker rather than from anywhere else in the application.
+    let stamp = state.read().picker_edits;
+    use_effect(move || {
+        let _ = stamp;
+        draft.set(state.read().cell_draft.clone());
+    });
+
+    let mut commit = move || {
+        let text = draft();
+        state.write().commit_cell(row, column, &text);
+    };
 
     rsx! {
         div { class: "picker-cell",
@@ -81,15 +99,30 @@ fn PickerCellEditor(row: usize, column: Column) -> Element {
                 onmousedown: move |event| event.stop_propagation(),
                 ondoubleclick: move |event| event.stop_propagation(),
                 onmouseup: move |event| event.stop_propagation(),
-                oninput: move |event| state.write().cell_draft = event.value(),
+                oninput: move |event| draft.set(event.value()),
+                // Clicking inside the picker does not blur this box, because
+                // the picker prevents it, so a blur means the planner has
+                // clicked away and whatever they typed should be kept.
+                onblur: move |_| commit(),
                 onkeydown: move |event| match event.key() {
-                    Key::Enter => {
-                        let text = state.read().cell_draft.clone();
-                        state.write().commit_cell(row, column, &text);
-                    }
+                    Key::Enter => commit(),
                     Key::Escape => state.write().editing = None,
                     _ => {}
                 },
+            }
+            // Says out loud that there is a list behind this cell. Clicking it
+            // reopens the picker if it has been dismissed.
+            button {
+                class: "picker-caret",
+                tabindex: "-1",
+                title: "Choose from a list",
+                onmousedown: move |event| event.prevent_default(),
+                onclick: move |event| {
+                    event.stop_propagation();
+                    let point = event.client_coordinates();
+                    state.write().edit_cell_at(row, column, point.x, point.y);
+                },
+                "\u{25be}"
             }
         }
     }
