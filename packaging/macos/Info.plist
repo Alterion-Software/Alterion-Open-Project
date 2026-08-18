@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>                 <string>Alterion Open Project</string>
+  <key>CFBundleDisplayName</key>          <string>Alterion Open Project</string>
+  <key>CFBundleIdentifier</key>           <string>com.alterion.openproject</string>
+  <key>CFBundleExecutable</key>           <string>alterion-open-project</string>
+  <key>CFBundleIconFile</key>             <string>AppIcon</string>
+  <key>CFBundlePackageType</key>          <string>APPL</string>
+  <key>CFBundleShortVersionString</key>   <string>__VERSION__</string>
+  <key>CFBundleVersion</key>              <string>__BUILD__</string>
+  <key>LSMinimumSystemVersion</key>       <string>10.15</string>
+  <key>NSHighResolutionCapable</key>      <true/>
+
+  <!-- Double-clicking a plan opens it here, the same association the Linux
+       MIME file and the Windows installer set up. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>         <string>Alterion Project</string>
+      <key>CFBundleTypeRole</key>         <string>Editor</string>
+      <key>LSHandlerRank</key>            <string>Owner</string>
+      <key>CFBundleTypeIconFile</key>     <string>AppIcon</string>
+      <key>LSItemContentTypes</key>
+      <array><string>com.alterion.openproject.aprj</string></array>
+    </dict>
+  </array>
+
+  <!-- Declaring the type, rather than only claiming to open it, is what lets
+       the Finder show the right icon and description for a .aprj file. -->
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key>         <string>com.alterion.openproject.aprj</string>
+      <key>UTTypeDescription</key>        <string>Alterion Project</string>
+      <key>UTTypeIconFile</key>           <string>AppIcon</string>
+      <key>UTTypeConformsTo</key>
+      <array><string>public.data</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array><string>aprj</string></array>
+      </dict>
+    </dict>
+  </array>
+</dict>
+</plist>
