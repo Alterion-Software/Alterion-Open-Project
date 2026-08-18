@@ -6,39 +6,44 @@ pkgdesc="Project scheduler with a critical path engine, Gantt chart and Microsof
 arch=('x86_64' 'aarch64')
 url="https://gitlab.com/alterion-software/alterion-open-project"
 license=('Apache-2.0')
-# The webview build links against the system web engine.
 depends=('gtk3' 'webkit2gtk-4.1' 'libxdo' 'gcc-libs' 'glibc')
 makedepends=('cargo' 'pkgconf')
 options=('!lto')
-# aop-core depends on alterion-mpp-parser, which lives in its own repository.
-# A source tarball has no sibling checkout, so the build resolves it from the
-# registry: the workspace declares both a version and a path for that reason.
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+
+# Map the Arch-compliant pkgver back to the upstream GitLab tag (betav0.1.0)
+_tag="v${pkgver}-beta"
+source=("$pkgname-$pkgver.tar.gz::$url/-/archive/$_tag/$pkgname-$_tag.tar.gz")
 sha256sums=('SKIP')
 
 prepare() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgname-$_tag"
   export RUSTUP_TOOLCHAIN=stable
-  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+
+  # Removed --locked so Cargo can generate/update the lockfile
+  cargo fetch --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgname-$_tag"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release --package aop-app
+
+  # Removed --frozen
+  cargo build --release --package aop-app
 }
 
 check() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgname-$_tag"
   export RUSTUP_TOOLCHAIN=stable
-  cargo test --frozen --release
+
+  # Removed --frozen
+  cargo test --release
 }
 
 package() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgname-$_tag"
 
-  install -Dm0755 target/release/aop-app "$pkgdir/usr/bin/$pkgname"
+  install -Dm0755 target/release/alterion-open-project "$pkgdir/usr/bin/$pkgname"
 
   install -Dm0644 "packaging/linux/$pkgname.desktop" \
     "$pkgdir/usr/share/applications/$pkgname.desktop"
