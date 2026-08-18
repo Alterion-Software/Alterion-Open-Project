@@ -26,6 +26,19 @@ pub struct Settings {
     pub show_timeline: bool,
     pub show_outline_number: bool,
     pub show_critical: bool,
+    /// Which rules are drawn behind the rows. Off means the pane relies on the
+    /// row banding alone, which some planners prefer for a printed look.
+    pub grid_rows: bool,
+    pub grid_columns: bool,
+    /// The vertical rule marking today in the chart.
+    pub grid_status_date: bool,
+    /// Bars drawn to whole days rather than to the hour, so a half day of work
+    /// still reads as a day wide.
+    pub round_bars: bool,
+    /// Dependency arrows between bars.
+    pub show_links: bool,
+    /// The task name written beside its bar.
+    pub bar_text: bool,
     /// Only the bindings the user has changed. Defaults are left out so a later
     /// release can improve one and have it reach anyone who never touched it.
     pub keys: crate::keymap::Keymap,
@@ -41,6 +54,12 @@ impl Default for Settings {
             date_format: 0,
             show_timeline: true,
             show_outline_number: false,
+            grid_rows: true,
+            grid_columns: true,
+            grid_status_date: true,
+            round_bars: false,
+            show_links: true,
+            bar_text: true,
             // Marking the critical path everywhere by default turns the whole
             // plan red, which says nothing about which parts matter.
             show_critical: false,
@@ -81,6 +100,16 @@ impl Settings {
              timeline = {}\n\
              outline_numbers = {}\n\
              critical_path = {}\n\
+             \n\
+             [gridlines]\n\
+             grid_rows = {}\n\
+             grid_columns = {}\n\
+             grid_status_date = {}\n\
+             \n\
+             [layout]\n\
+             round_bars = {}\n\
+             show_links = {}\n\
+             bar_text = {}\n\
              {}",
             self.user_name,
             self.user_initials,
@@ -90,6 +119,12 @@ impl Settings {
             self.show_timeline,
             self.show_outline_number,
             self.show_critical,
+            self.grid_rows,
+            self.grid_columns,
+            self.grid_status_date,
+            self.round_bars,
+            self.show_links,
+            self.bar_text,
             self.keyboard_section(),
         )
     }
@@ -169,6 +204,12 @@ impl Settings {
         settings.show_timeline = flag("timeline", settings.show_timeline);
         settings.show_outline_number = flag("outline_numbers", settings.show_outline_number);
         settings.show_critical = flag("critical_path", settings.show_critical);
+        settings.grid_rows = flag("grid_rows", settings.grid_rows);
+        settings.grid_columns = flag("grid_columns", settings.grid_columns);
+        settings.grid_status_date = flag("grid_status_date", settings.grid_status_date);
+        settings.round_bars = flag("round_bars", settings.round_bars);
+        settings.show_links = flag("show_links", settings.show_links);
+        settings.bar_text = flag("bar_text", settings.bar_text);
 
         settings
     }
@@ -199,11 +240,10 @@ impl Settings {
     /// theme would be worse than the setting not sticking.
     pub fn save(&self) {
         let Some(path) = path() else { return };
-        if let Some(parent) = path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
+        if let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_err() {
                 return;
             }
-        }
         let _ = std::fs::write(path, self.to_text());
     }
 }
@@ -223,6 +263,14 @@ mod tests {
             show_timeline: false,
             show_outline_number: true,
             show_critical: true,
+            // Each set away from its default, so the round trip has to carry
+            // the value rather than land on it by luck.
+            grid_rows: false,
+            grid_columns: false,
+            grid_status_date: false,
+            round_bars: true,
+            show_links: false,
+            bar_text: false,
             keys: {
                 let mut keys = crate::keymap::Keymap::default();
                 keys.bind(crate::keymap::Action::SetBaseline, "Ctrl+B");

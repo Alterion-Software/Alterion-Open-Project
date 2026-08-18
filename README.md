@@ -32,23 +32,9 @@ deflated MessagePack). Microsoft Project plans open directly, both binary `.mpp`
 and XML Format.
 
 ```
-cargo run -p aop-app        # launch (webview build)
+cargo run -p aop-app        # launch
 cargo test                  # 146 tests: engine, import, geometry, settings, interactions
 ```
-
-Two renderers. The default builds on wry and the system web engine. A
-webview-free build is wired up behind a feature flag, using Blitz, which lays
-out with Stylo and paints with wgpu:
-
-```
-cargo run -p aop-app --no-default-features --features native
-```
-
-The native build type-checks and links, but is not yet verified at runtime:
-Blitz's support for inline SVG, `dangerous_inner_html` and `<iframe srcdoc>` is
-narrower than a web engine's, and the icons, the logo and the print preview all
-lean on those. It also keeps the operating system's window decorations, since
-it has no window-chrome API of its own.
 
 ## Layout
 

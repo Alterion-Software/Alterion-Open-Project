@@ -20,6 +20,9 @@ pub const CSS: &str = r##"
      pale elements on this palette, so it is the dark one. It flips with the
      palette; anything hardcoding a colour here is a bug waiting for a theme. */
   --on-accent: #0b1414;
+  /* Ink for text sitting on a chart bar. The bars are a mid tone in both
+     palettes, so unlike --on-accent this does not flip. */
+  --on-bar: #f2f7f7;
   --accent-dim: rgba(129, 181, 181, 0.14);
   --accent-line: rgba(129, 181, 181, 0.42);
   --contextual: #8aa2c4;
@@ -60,7 +63,12 @@ pub const CSS: &str = r##"
 
   --shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
 
-  --font: Inter, "Segoe UI", system-ui, Roboto, "Noto Sans", "DejaVu Sans", sans-serif;
+  /* Families are listed most-wanted first, but every name here must be one
+     that actually exists somewhere, because a matcher that falls back by
+     substring can land on an unrelated font whose name merely contains the
+     word. "Inter" matching a symbol font called CustomTkinter_shapes_font is
+     exactly that, and it renders text as arbitrary shapes. */
+  --font: "Inter", "InterVariable", "Segoe UI", "Noto Sans", "DejaVu Sans", "Liberation Sans", sans-serif;
   --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
 }
 
@@ -292,7 +300,9 @@ button { font: inherit; color: inherit; }
 
 .rgroup-body {
   display: flex;
-  align-items: flex-start;
+  /* Stretch, so a button with a long caption sets the height and the rest come
+     up to meet it rather than one spilling past a fixed box. */
+  align-items: stretch;
   gap: 2px;
   flex: 1;
   padding-bottom: 2px;
@@ -319,7 +329,10 @@ button { font: inherit; color: inherit; }
   gap: 2px;
   min-width: 48px;
   max-width: 76px;
-  height: 66px;
+  /* A minimum rather than a fixed height. A caption like "Change Working Time"
+     wraps to three lines, and against a fixed height it simply spilled out of
+     the button. The row stretches its buttons to match, so they stay level. */
+  min-height: 66px;
   padding: 4px 5px 2px;
   border: 1px solid transparent;
   border-radius: 3px;
@@ -331,8 +344,8 @@ button { font: inherit; color: inherit; }
   font-size: 11px;
 }
 
-.rbtn-lg .glyph { height: 32px; display: grid; place-items: center; color: var(--accent); }
-.rbtn-lg .caption { white-space: normal; word-break: break-word; }
+.rbtn-lg .glyph { height: 32px; flex: none; display: grid; place-items: center; color: var(--accent); }
+.rbtn-lg .caption { white-space: normal; overflow-wrap: anywhere; }
 
 .rbtn-sm {
   display: flex;
@@ -385,14 +398,18 @@ button { font: inherit; color: inherit; }
 
 .rcheck {
   display: flex;
+  /* Centred on the box rather than the text baseline: the label is 11px and
+     the box 12px, so aligning by baseline leaves the tick sitting low. */
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   height: 20px;
   padding: 0 5px;
   font-size: 11px;
+  line-height: 1;
   border-radius: 3px;
   cursor: default;
   white-space: nowrap;
+  text-align: left;
 }
 
 .rcheck:hover { background: var(--hover); }
@@ -405,7 +422,10 @@ button { font: inherit; color: inherit; }
   background: transparent;
   display: grid;
   place-items: center;
+  /* The tick is drawn from the font, so it needs its own line box or it sits
+     a pixel low inside the square. */
   font-size: 9px;
+  line-height: 1;
   flex: none;
 }
 
@@ -916,6 +936,13 @@ button { font: inherit; color: inherit; }
   border: 1px solid var(--line);
   border-radius: 4px;
   padding: 6px 8px;
+  /* Matches .dd.lg, so a dropdown beside a text box lines up. A textarea
+     overrides this with its own height, since it is meant to be tall. */
+  height: 30px;
+  box-sizing: border-box;
+  /* WebKit paints a native select with the platform look and ignores the
+     background above unless the appearance is cleared first. */
+  appearance: none;
   font: inherit;
   color: var(--ink);
   background: var(--surface-3);
@@ -924,6 +951,7 @@ button { font: inherit; color: inherit; }
   user-select: text;
 }
 
+.dlg textarea { height: auto; }
 .bs-input::placeholder, .dlg input::placeholder { color: var(--ink-faint); }
 .bs-input:focus, .dlg input:focus, .dlg select:focus, .dlg textarea:focus {
   outline: none;
@@ -1407,8 +1435,62 @@ button { font: inherit; color: inherit; }
 .attr-url { flex: 1; color: var(--ink-faint); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
 
 /* print preview */
-.print-layout { display: flex; gap: 26px; align-items: flex-start; }
-.print-settings { width: 280px; flex: none; }
+/* The document on the left, where it is going on the right. The preview takes
+   the room because it is the thing being judged. */
+.print-layout { display: flex; gap: 22px; align-items: stretch; min-height: 0; }
+.print-preview { flex: 1 1 auto; min-width: 0; display: flex; }
+.print-settings {
+  width: 300px;
+  flex: none;
+  overflow-y: auto;
+  max-height: calc(100vh - 210px);
+  padding-right: 4px;
+}
+
+/* Shown when the engine has no PDF viewer of its own to hand. */
+.print-fallback {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  padding: 24px;
+  text-align: center;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+/* ---------- print queues ---------- */
+
+.queue-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+
+.queue {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-3);
+  cursor: default;
+  text-align: left;
+}
+.queue:hover { border-color: var(--accent-line); }
+.queue.on { border-color: var(--accent); background: var(--accent-dim); }
+.queue .glyph { display: grid; place-items: center; flex: none; color: var(--ink-faint); }
+.queue.on .glyph { color: var(--accent); }
+
+.queue-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.queue-name { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink); }
+.queue-status { font-size: 10.5px; color: var(--ink-faint); }
+
+.queue-default {
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--accent);
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  padding: 0 6px;
+}
 
 /* Buttons on the Print page carry a glyph, so they lay out as a row rather
    than as a bare label. */
@@ -1435,9 +1517,10 @@ button { font: inherit; color: inherit; }
 .pf-value { color: var(--ink); text-align: right; }
 
 .print-frame {
-  width: 860px;
-  max-width: 100%;
-  height: 640px;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  height: calc(100vh - 210px);
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #f2f5f5;
@@ -1710,6 +1793,11 @@ button { font: inherit; color: inherit; }
   color: var(--ink);
 }
 
+/* The gridline choices, as classes on the table so one toggle repaints
+   without every cell carrying its own style. */
+.grid.no-rows td { border-top-color: transparent; border-bottom-color: transparent; }
+.grid.no-columns td { border-left-color: transparent; border-right-color: transparent; }
+
 .grid tr.row:hover td { background: var(--hover); }
 .grid tr.row.selected td { background: var(--selection); }
 .grid tr.row.summary td { font-weight: 600; color: var(--ink); }
@@ -1723,6 +1811,22 @@ button { font: inherit; color: inherit; }
 .grid tr.row.drop-above td { box-shadow: inset 0 2px 0 var(--accent); }
 .grid tr.row.drop-below td { box-shadow: inset 0 -2px 0 var(--accent); }
 .grid tr.row.drop-into td { box-shadow: inset 0 0 0 1px var(--accent); }
+
+/* A grouping band: a heading over the rows beneath it, spanning every column.
+   It is not a task, so none of the row states above can reach it, and it takes
+   the header's surface to read as a divider rather than as an empty row. */
+.grid tr.row.band td {
+  background: var(--grid-header);
+  border-left: 0;
+  border-right: 0;
+  color: var(--ink-soft);
+  font-size: 11px;
+  cursor: default;
+}
+
+.grid tr.row.band:hover td { background: var(--grid-header); }
+.grid tr.row.band .band-label { font-weight: 600; color: var(--ink); }
+.grid tr.row.band .band-totals { margin-left: 10px; }
 
 .grid td.rownum {
   background: var(--grid-header);
@@ -1757,14 +1861,18 @@ button { font: inherit; color: inherit; }
 }
 
 .grid .ind-critical { color: var(--warn); font-size: 12px; line-height: 1; }
-.grid .mode-glyph { font-size: 10px; line-height: 1; }
+.grid .mode-glyph { display: grid; place-items: center; line-height: 1; }
 
 /* The grip that resizes a column, straddling its right-hand border. */
+/* Sits centred on the 1px divider between this column and the next, so the
+   line the planner is aiming at is the line they grab. The cell's padding box
+   ends at right: 0, the border occupies the next pixel, so a 9px grab area
+   pulled 5px past that edge is centred on it. */
 .col-grip {
   position: absolute;
   top: 0;
-  right: -3px;
-  width: 7px;
+  right: -5px;
+  width: 9px;
   height: 100%;
   cursor: col-resize;
   z-index: 4;
@@ -1773,15 +1881,28 @@ button { font: inherit; color: inherit; }
 .col-grip::after {
   content: "";
   position: absolute;
-  top: 6px;
-  bottom: 6px;
-  left: 3px;
+  top: 5px;
+  bottom: 5px;
+  left: 4px;
   width: 1px;
   background: transparent;
 }
 
 .col-grip:hover::after { background: var(--accent); }
 
+/* The typed alternative under the predecessor picker's list. */
+/* The pickers appear both in a floating popup and inside a dialog tab. Inside
+   a dialog the popup's own header is redundant, and the list wants to use the
+   height the tab already has. */
+.dlg .picker .ctxheader { display: none; }
+.dlg .picker .pred-list { max-height: 300px; }
+
+.pred-type { display: flex; align-items: center; gap: 8px; padding: 8px 10px 0; }
+.pred-type label { color: var(--ink-soft); font-size: 11px; flex: none; }
+.pred-type .bs-input { flex: 1; min-width: 0; }
+
+/* Sticky already makes the header a containing block, which is what lets the
+   resize grip position itself against the cell's own edge. */
 .grid th { position: sticky; }
 .grid th .th-inner {
   position: relative;
@@ -1826,7 +1947,12 @@ button { font: inherit; color: inherit; }
 
 .add-row td { color: var(--ink-faint); font-style: italic; }
 
-.mode-glyph { color: var(--ink-faint); }
+/* Manual is the state worth noticing: it means the scheduler is not moving
+   this row, which is why a date can look wrong. Auto is the norm, so it stays
+   quiet. */
+.mode-glyph { display: grid; place-items: center; color: var(--ink-faint); }
+.mode-glyph.manual { color: var(--contextual); }
+.mode-glyph.auto { color: var(--ink-faint); }
 
 /* ---------- gantt chart ---------- */
 
@@ -1853,6 +1979,430 @@ button { font: inherit; color: inherit; }
    a bar sits on the bar's own colour, so it takes the dark ink instead. */
 .band-label { font-size: 10px; fill: var(--ink-soft); }
 .band-label.in { fill: var(--on-accent); font-weight: 600; }
+
+/* ---------- reports ---------- */
+
+.reports-pane {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: var(--surface);
+}
+.report-row { display: flex; gap: 14px; align-items: stretch; flex-wrap: wrap; }
+
+.report-card {
+  flex: 1 1 380px;
+  min-width: 320px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-3);
+  padding: 12px 14px 10px;
+}
+.report-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.report-title { font-size: 13px; font-weight: 650; color: var(--ink); }
+.report-note { font-size: 11px; color: var(--ink-faint); }
+.report-chart { display: block; margin: 10px 0 6px; overflow: visible; }
+.axis-label { font-size: 9.5px; fill: var(--ink-faint); }
+.axis-title { font-size: 9.5px; fill: var(--ink-soft); letter-spacing: 0.4px; }
+
+.report-legend { display: flex; gap: 14px; font-size: 10.5px; color: var(--ink-soft); }
+.report-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.report-legend .sw { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+.report-legend .sw.ideal { background: var(--ink-faint); }
+.report-legend .sw.actual { background: var(--accent-bright); }
+.report-legend .sw.scope { background: var(--ink-faint); }
+.report-legend .sw.done { background: var(--bar-progress); }
+.report-legend .sw.planned { background: var(--bar); }
+
+/* Velocity: planned behind, completed in front, so the gap between them is
+   the thing you read rather than two bars to compare by eye. */
+.velocity {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 170px;
+  margin: 10px 0 6px;
+  padding-bottom: 16px;
+  padding-left: 62px;
+  position: relative;
+}
+
+/* The scale the bars are read against. Bars with no axis show which iteration
+   was busiest but not by how much. */
+.vel-axis { position: absolute; left: 0; top: 0; bottom: 16px; width: 56px; }
+.vel-tick {
+  position: absolute;
+  right: 6px;
+  transform: translateY(50%);
+  font-size: 9.5px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+.vel-grid {
+  position: absolute;
+  left: 62px;
+  right: 0;
+  border-top: 1px solid var(--grid-line);
+}
+.vel-col { flex: 1 1 0; min-width: 10px; height: 100%; position: relative; }
+.vel-stack { position: relative; height: 100%; }
+.vel-planned, .vel-done {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  border-radius: 3px 3px 0 0;
+}
+.vel-planned { background: var(--bar); opacity: 0.35; }
+.vel-done { background: var(--bar-progress); }
+.vel-label {
+  position: absolute;
+  bottom: -15px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 9.5px;
+  color: var(--ink-faint);
+}
+
+/* The path reads as a chain: each step, then the link that carries it onward.
+   A flat list would say which tasks are critical but not in what order, which
+   is the part that actually matters. */
+.crit-list { max-height: 170px; overflow-y: auto; margin-top: 8px; }
+.crit-step { display: flex; flex-direction: column; }
+.crit-joint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 0 1px 30px;
+  font-size: 9.5px;
+  color: var(--ink-faint);
+}
+.crit-arrow { color: var(--accent); }
+.crit-dur { color: var(--ink-faint); font-size: 10.5px; white-space: nowrap; }
+.crit-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 0;
+  font-size: 11.5px;
+}
+.crit-id { color: var(--ink-faint); min-width: 26px; }
+.crit-name { flex: 1; min-width: 0; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.crit-dates { color: var(--ink-soft); font-size: 10.5px; white-space: nowrap; }
+
+/* ---------- report pages ---------- */
+
+.rep-head { margin-bottom: 16px; }
+.rep-title { font-size: 22px; font-weight: 650; color: var(--ink); margin: 0 0 6px; letter-spacing: -0.3px; }
+.rep-sub { margin: 0; font-size: 12px; color: var(--ink-soft); line-height: 1.6; max-width: 760px; }
+
+/* A chart says a shape but not a number, so the figures come first. */
+.rep-figures { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+.rep-figure {
+  flex: 1 1 150px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rep-value { font-size: 19px; font-weight: 650; color: var(--ink); letter-spacing: -0.3px; }
+.rep-label { font-size: 9.5px; letter-spacing: 0.9px; text-transform: uppercase; color: var(--ink-faint); }
+
+.rep-chart-box {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-3);
+  padding: 14px;
+  margin-bottom: 18px;
+}
+.velocity.tall { height: 260px; }
+
+.rep-section {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--ink);
+  margin: 0 0 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+.rep-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.rep-table thead th {
+  text-align: left;
+  font-size: 9.5px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  font-weight: 600;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+}
+.rep-table td { padding: 6px 8px; border-bottom: 1px solid var(--line-soft); color: var(--ink); }
+.rep-table tbody tr:hover { background: var(--hover); }
+.rep-table .n { text-align: right; }
+.rep-table .muted { color: var(--ink-soft); }
+
+/* ---------- colour commands ---------- */
+
+/* A row command that also carries a swatch: glyph, label, then the colour. */
+.swatch-btn { display: flex; align-items: center; gap: 6px; }
+.swatch-btn .colour-bar { width: 14px; height: 10px; border-radius: 2px; margin-left: 2px; }
+
+.colour-btn-wrap { position: relative; display: inline-flex; }
+
+/* Glyph above, the colour it will apply below, the way Office does it. */
+.colour-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 3px 4px 2px;
+}
+.colour-bar {
+  display: block;
+  width: 15px;
+  height: 3px;
+  border-radius: 1px;
+  border: 1px solid var(--line);
+}
+
+.colour-pop {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 60;
+  margin-top: 4px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-4);
+  box-shadow: var(--shadow);
+}
+.colour-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 20px);
+  gap: 5px;
+  margin-bottom: 7px;
+}
+.colour-chip {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  cursor: default;
+  padding: 0;
+}
+.colour-chip:hover { outline: 2px solid var(--accent); outline-offset: 1px; }
+.colour-clear {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 10.5px;
+  cursor: default;
+  padding: 3px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.colour-clear:hover { background: var(--hover); color: var(--ink); }
+
+/* ---------- external dependencies ---------- */
+
+.ext-add { display: flex; gap: 8px; margin-bottom: 14px; }
+.ext-add .bs-input { flex: 1; min-width: 0; }
+
+.ext-list { display: flex; flex-direction: column; gap: 4px; }
+.ext-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-3);
+}
+.ext-main { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.ext-ref { font-family: var(--mono); font-size: 11.5px; color: var(--accent); }
+.ext-label { font-size: 12px; color: var(--ink); }
+.ext-date { max-width: 132px; font-size: 11px; padding: 3px 8px; }
+.ext-users { font-size: 10.5px; color: var(--ink-faint); }
+.ext-acts { display: flex; align-items: center; gap: 6px; flex: none; }
+
+/* ---------- custom fields ---------- */
+
+.cf-pick { display: flex; gap: 14px; margin-bottom: 6px; }
+.cf-pick .bs-field { flex: 1; }
+
+.cf-indicator {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin-bottom: 5px;
+  background: var(--surface-3);
+}
+.cf-glyph { font-size: 14px; color: var(--accent); width: 18px; text-align: center; }
+.cf-rule { font-size: 11.5px; color: var(--ink); }
+.cf-meaning { flex: 1; font-size: 10.5px; color: var(--ink-faint); }
+
+/* The fields this plan already uses, as a way back to one. */
+.cf-inuse { display: flex; flex-wrap: wrap; gap: 6px; }
+.cf-chip {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-3);
+  cursor: default;
+}
+.cf-chip:hover { border-color: var(--accent-line); }
+.cf-chip-name { font-size: 11.5px; color: var(--ink); }
+.cf-chip-slot { font-size: 9.5px; color: var(--ink-faint); font-family: var(--mono); }
+
+/* ---------- dictionaries ---------- */
+
+.dict-list { margin-top: 8px; }
+.dict-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.dict-row:last-child { border-bottom: none; }
+.dict-name { flex: 1; min-width: 0; font-size: 12px; color: var(--ink); }
+.dict-code { font-family: var(--mono); font-size: 10.5px; color: var(--ink-faint); }
+.dict-size { font-size: 10.5px; color: var(--ink-faint); min-width: 58px; text-align: right; }
+.dict-state { font-size: 11px; color: var(--accent-bright); }
+
+.dict-note {
+  margin: 10px 0 4px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  border: 1px solid var(--line);
+}
+.dict-note.ok { background: var(--accent-dim); border-color: var(--accent-line); color: var(--ink); }
+.dict-note.bad { background: var(--danger-bg); border-color: var(--danger); color: var(--ink); }
+
+/* ---------- spelling panel ---------- */
+
+/* Floats over the right of the workspace: the plan stays visible, because a
+   correction only makes sense next to the row it belongs to. */
+.spell-panel {
+  position: fixed;
+  top: 108px;
+  right: 12px;
+  bottom: 34px;
+  width: 460px;
+  max-width: calc(100vw - 24px);
+  z-index: 55;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-4);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.spell-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 10px 9px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-3);
+}
+.spell-panel-title { font-size: 12.5px; font-weight: 650; color: var(--ink); }
+.spell-panel-body { flex: 1; overflow-y: auto; padding: 12px 14px 14px; }
+.spell-panel-body .report-card { border: 0; background: transparent; padding: 0; margin-bottom: 14px; }
+
+/* ---------- spelling ---------- */
+
+.spell-hint {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink);
+  white-space: pre;
+}
+
+.spell-list { margin-top: 10px; max-height: calc(100vh - 300px); overflow-y: auto; }
+
+.spell-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.spell-row:last-child { border-bottom: none; }
+
+.spell-main { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; }
+.spell-word {
+  font-weight: 650;
+  color: var(--warn);
+  font-size: 12.5px;
+  text-decoration: underline wavy var(--warn);
+  text-underline-offset: 3px;
+}
+.spell-where { font-size: 10px; color: var(--ink-faint); white-space: nowrap; }
+.spell-context {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--ink-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spell-acts { display: flex; gap: 6px; flex: none; align-items: center; }
+.spell-fix, .spell-skip {
+  border-radius: 4px;
+  padding: 3px 10px;
+  font-size: 11px;
+  cursor: default;
+  border: 1px solid var(--line);
+  background: var(--surface-3);
+  color: var(--ink);
+}
+.spell-fix {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.spell-fix:hover { background: var(--accent-bright); }
+.spell-skip:hover { background: var(--hover); }
+.spell-none { font-size: 10.5px; color: var(--ink-faint); font-style: italic; }
+
+.spell-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+}
 
 /* ---------- sheets ---------- */
 
@@ -2016,7 +2566,18 @@ button { font: inherit; color: inherit; }
 /* ---------- context menu ---------- */
 
 /* Office puts a floating mini toolbar above its context menu. */
-.ctx-minibar-wrap { position: fixed; z-index: 82; }
+/* The toolbar and the menu, anchored as one so the toolbar is above the menu
+   whichever way the pair opened. */
+.ctx-stack {
+  position: fixed;
+  z-index: 81;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  max-height: 80vh;
+}
+.ctx-minibar-wrap { flex: none; }
 
 .ctx-minibar {
   display: flex;
@@ -2054,14 +2615,16 @@ button { font: inherit; color: inherit; }
 .ctx-scrim { position: fixed; inset: 0; z-index: 80; }
 
 .ctxmenu {
-  position: fixed;
+  /* Sits inside the stack, so it is the menu that scrolls when the pair is
+     taller than the room available, never the toolbar above it. */
+  min-height: 0;
+  overflow-y: auto;
   min-width: 226px;
   background: var(--surface-4);
   border: 1px solid var(--line);
   border-radius: 5px;
   box-shadow: var(--shadow);
   padding: 4px;
-  z-index: 81;
 }
 
 .ctxitem {
@@ -2085,6 +2648,45 @@ button { font: inherit; color: inherit; }
 .ctxitem .label { flex: 1; }
 .ctxitem .shortcut { color: var(--ink-faint); font-size: 10.5px; }
 .ctxitem .tick { width: 12px; color: var(--accent); }
+
+/* A flagged issue inside the context menu: what is wrong, then what can be
+   done about it. Wider than a menu row because it carries a sentence, not a
+   command name. */
+.ctx-issue {
+  max-width: 340px;
+  padding: 8px 10px;
+  margin: 2px 0;
+  border-radius: 5px;
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+}
+.ctx-issue-text {
+  display: block;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ink);
+}
+.ctx-issue-acts { display: flex; gap: 6px; margin-top: 7px; }
+.ctx-issue-fix, .ctx-issue-ignore {
+  border-radius: 4px;
+  padding: 3px 10px;
+  font-size: 11px;
+  cursor: default;
+  border: 1px solid var(--line);
+  background: var(--surface-3);
+  color: var(--ink);
+}
+.ctx-issue-fix { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+.ctx-issue-fix:hover { background: var(--accent-bright); }
+.ctx-issue-ignore:hover { background: var(--hover); }
+
+/* A warning the planner has said they know about. Still there, so the row does
+   not silently stop mentioning it, but no longer competing for attention. */
+.ind-critical.ignored { color: var(--ink-faint); opacity: 0.55; }
+
+/* An issue in the menu that has been dismissed reads the same way. */
+.ctx-issue.ignored { background: transparent; border-color: var(--line); }
+.ctx-issue.ignored .ctx-issue-text { color: var(--ink-faint); }
 
 .ctxsep { height: 1px; background: var(--line); margin: 4px 6px; }
 
@@ -2190,6 +2792,15 @@ button { font: inherit; color: inherit; }
 .assign-table tr:hover td { background: var(--hover); }
 
 .hint { color: var(--ink-soft); font-size: 11px; margin-top: 10px; line-height: 1.5; }
+
+/* Trailing unit beside a rate box, so the number does not have to say it. */
+.unit { color: var(--ink-soft); font-size: 11px; }
+.dlg-sub { font-size: 12px; font-weight: 600; color: var(--ink); margin: 0 0 8px; }
+.sep { height: 1px; background: var(--grid-line); margin: 14px 0; }
+.dlg-list { max-height: 150px; overflow-y: auto; border: 1px solid var(--grid-line); border-radius: 3px; margin-top: 8px; }
+.dlg-list-row { display: flex; align-items: center; gap: 10px; padding: 4px 9px; font-size: 12px; }
+.dlg-list-row:nth-child(even) { background: var(--hover); }
+.dlg-list-row .grow { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .error-banner {
   background: var(--danger-bg);

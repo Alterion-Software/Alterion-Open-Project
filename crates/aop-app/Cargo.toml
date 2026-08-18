@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# The crate keeps its short name so `cargo run -p aop-app` still works, but the
+# binary is named for the product: a process list shows the executable's name,
+# and "aop-app" tells nobody what is running.
+[[bin]]
+name = "alterion-open-project"
+path = "src/main.rs"
+
 [dependencies]
 aop-core = { version = "0.1.0", path = "../aop-core" }
 chrono.workspace = true
@@ -11,6 +18,8 @@ dioxus = { version = "0.7.10" }
 serde_json.workspace = true
 tokio = { version = "1.53.1", features = ["time", "rt"] }
 dioxus-native = { version = "0.7.10", optional = true }
+ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
+sha2 = "0.11.0"
 
 # Refusing a close has to be done at the toolkit layer: the portable event loop
 # carries out a close request before any handler can object to it. Pinned to the

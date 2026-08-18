@@ -148,14 +148,13 @@ fn assemble(plan: mpp::Plan, path: &Path) -> Project {
             continue;
         };
         let units = booking.units.filter(|u| *u > 0.0).unwrap_or(1.0);
-        if let Some(task) = project.task_mut(task_id) {
-            if task.assignments.iter().all(|a| a.resource != resource_id) {
+        if let Some(task) = project.task_mut(task_id)
+            && task.assignments.iter().all(|a| a.resource != resource_id) {
                 task.assignments.push(Assignment {
                     resource: resource_id,
                     units,
                 });
             }
-        }
     }
 
     project.start_date = project.calendar.next_working_instant(project.start_date);

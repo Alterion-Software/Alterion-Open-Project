@@ -84,7 +84,7 @@ pub fn Backstage(page: BackstagePage) -> Element {
                 div { class: "bs-sep" }
                 button { class: "bs-item",
                     onclick: move |_| state.write().guard(PendingAction::CloseProject),
-                    span { class: "glyph", {icon("close", 16)} }
+                    span { class: "glyph", {icon("x", 16)} }
                     span { "Close" }
                 }
             }
@@ -132,7 +132,7 @@ fn InfoPage() -> Element {
         .unwrap_or_else(|| format!("Not saved yet \u{00b7} .{}", persist::FILE_EXTENSION));
 
     let report = s.report.as_ref().ok();
-    let dash = "\u{2014}".to_string();
+    let dash = "-".to_string();
 
     let figures: Vec<(&str, String)> = vec![
         (
@@ -665,119 +665,234 @@ fn FileBrowser(saving: bool) -> Element {
 
 // ------------------------------------------------------------------ Print
 
-/// Hand a document to the platform's print dialog.
+/// The Print page: what it will look like on the left, where it is going on
+/// the right.
 ///
-/// The page is written into a hidden frame of its own and that frame is asked
-/// to print, so the print stylesheet applies to the plan alone and never to the
-/// application chrome around it. The dialog this opens is the system one, which
-/// is where Print to File (PDF) comes from: there is no separate PDF writer to
-/// maintain, and the user gets whatever printers they actually have.
-#[cfg(feature = "desktop")]
-fn send_to_printer(document: &str) {
-    // The document goes in as a JavaScript string literal, so it has to be
-    // escaped as one; a plan named with an apostrophe would otherwise end the
-    // literal early and break the script.
-    let payload = serde_json::to_string(document).unwrap_or_else(|_| "\"\"".into());
-    document::eval(&format!(
-        r#"
-        (() => {{
-            const previous = document.getElementById('aop-print-frame');
-            if (previous) previous.remove();
-            const frame = document.createElement('iframe');
-            frame.id = 'aop-print-frame';
-            frame.setAttribute('aria-hidden', 'true');
-            frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1200px;height:900px;border:0;';
-            frame.onload = () => {{
-                try {{
-                    frame.contentWindow.focus();
-                    frame.contentWindow.print();
-                }} catch (e) {{
-                    console.error('print failed', e);
-                }}
-            }};
-            document.body.appendChild(frame);
-            frame.srcdoc = {payload};
-        }})()
-        "#
-    ));
-}
-
-#[cfg(not(feature = "desktop"))]
-fn send_to_printer(_document: &str) {}
-
+/// The document is produced by the application rather than by the web engine,
+/// so what the preview shows and what the printer receives are the same bytes
+/// rather than two renderings that can disagree.
 #[component]
 fn PrintPage() -> Element {
     let mut state = use_context::<Signal<AppState>>();
 
-    // The preview is the exact document that gets printed and saved, rendered
-    // in a frame so its stylesheet cannot leak into the app.
-    let (document, suggested, pages, tasks) = {
+    // The document starts out matching what is on screen, so a plan showing the
+    // critical path prints it without the option having to be found first.
+    let mut options = use_signal(|| aop_core::pdf::PrintOptions {
+        show_critical: state.read().show_critical,
+        ..aop_core::pdf::PrintOptions::default()
+    });
+
+    // Asked for once rather than on every render: it shells out to CUPS, and
+    // the list does not change while a page is being set up.
+    let queues = use_signal(crate::spooler::printers);
+    let mut chosen = use_signal(|| None::<String>);
+    let mut target = use_signal(|| {
         let s = state.read();
-        let suggested = s
-            .file_path
+        s.file_path
             .as_ref()
-            .map(|p| p.with_extension("html"))
-            .unwrap_or_else(|| documents_dir().join(format!("{}.html", s.project.name)));
-        let body = persist::print_body(&s.project);
-        let pages = body.matches("class=\"chart-page").count();
-        (
-            persist::to_print_html(&s.project),
-            suggested,
-            pages,
-            s.project.tasks.len(),
-        )
+            .map(|p| p.with_extension("pdf"))
+            .unwrap_or_else(|| documents_dir().join(format!("{}.pdf", s.project.name)))
+            .display()
+            .to_string()
+    });
+
+    let document = {
+        let s = state.read();
+        aop_core::pdf::render(&s.project, &options())
     };
-    let mut target = use_signal(|| suggested.display().to_string());
-    let to_print = document.clone();
+    let pages = document.windows(10).filter(|w| w == b"/Type /Page").count();
+    let size_kb = document.len() as f64 / 1024.0;
+
+    // The preview is the document itself, handed to the engine's own viewer, so
+    // it cannot drift from what gets printed.
+    let preview_src = format!(
+        "data:application/pdf;base64,{}",
+        crate::spooler::base64(&document)
+    );
+
+    let default_queue = queues()
+        .as_ref()
+        .ok()
+        .and_then(|list| list.iter().find(|p| p.default).or_else(|| list.first()))
+        .map(|p| p.name.clone());
+    let selected = chosen().or(default_queue.clone());
 
     rsx! {
         h1 { class: "bs-title", "Print" }
         Confirmation {}
 
         div { class: "print-layout",
-            div { class: "print-settings",
-                button {
-                    class: "btn primary print-go",
-                    onclick: move |_| send_to_printer(&to_print),
-                    span { class: "glyph", {icon("print", 17)} }
-                    span { "Print" }
-                }
-                div { class: "hint", style: "margin: 8px 0 18px;",
-                    "Opens your system print dialog. Choose Print to File there to save it as a PDF." }
-
-                h2 { class: "bs-sub", "Layout" }
-                div { class: "print-facts" }
-                for (label, value) in [
-                    ("Paper", "A4 landscape".to_string()),
-                    ("Chart", format!("{pages} page(s), all {tasks} tasks")),
-                    ("Table", "starts its own page".to_string()),
-                ] {
-                    div { key: "{label}", class: "print-fact",
-                        span { class: "pf-label", "{label}" }
-                        span { class: "pf-value", "{value}" }
+            // ---- the document, at the size it will be printed --------------
+            div { class: "print-preview",
+                object {
+                    class: "print-frame",
+                    r#type: "application/pdf",
+                    data: "{preview_src}",
+                    div { class: "print-fallback",
+                        "{pages} page(s), {size_kb:.0} KB. Save it to look at it outside the application."
                     }
-                }
-
-                h2 { class: "bs-sub", style: "margin-top: 20px;", "Save a copy" }
-                div { style: "margin-bottom: 10px;",
-                    input {
-                        class: "bs-input",
-                        style: "width: 100%;",
-                        value: "{target}",
-                        oninput: move |event| target.set(event.value()),
-                    }
-                }
-                button { class: "btn", style: "width: 100%;",
-                    onclick: move |_| {
-                        let path = PathBuf::from(target());
-                        state.write().export_html_to(path);
-                    },
-                    span { class: "glyph", {icon("save", 16)} }
-                    span { "Save printable page" }
                 }
             }
 
-            iframe { class: "print-frame", "srcdoc": "{document}" }
+            // ---- where it is going ----------------------------------------
+            div { class: "print-settings",
+                h2 { class: "bs-sub", style: "margin-top: 0;", "Destination" }
+
+                match queues().as_ref() {
+                    Ok(list) => rsx! {
+                        div { class: "queue-list",
+                            for printer in list.clone() {
+                                {
+                                    let name = printer.name.clone();
+                                    let picked = selected.as_deref() == Some(name.as_str());
+                                    let class = if picked { "queue on" } else { "queue" };
+                                    rsx! {
+                                        button { key: "{name}", class: "{class}",
+                                            onclick: move |_| chosen.set(Some(name.clone())),
+                                            span { class: "glyph", {icon("printer", 16)} }
+                                            span { class: "queue-text",
+                                                span { class: "queue-name",
+                                                    "{printer.name}"
+                                                    if printer.default {
+                                                        span { class: "queue-default", "default" }
+                                                    }
+                                                }
+                                                span { class: "queue-status", "{printer.status}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(reason) => {
+                        let message = reason.message();
+                        rsx! {
+                            div { class: "hint", style: "margin: 0 0 12px;", "{message}" }
+                        }
+                    }
+                }
+
+                if let Some(queue) = selected.clone() {
+                    {
+                    let to_print = document.clone();
+                    rsx! {
+                    button {
+                        class: "btn primary print-go",
+                        onclick: move |_| {
+                            let title = state.read().project.name.clone();
+                            let outcome = crate::spooler::spool(&queue, &title, &to_print);
+                            let mut writer = state.write();
+                            match outcome {
+                                Ok(said) => writer.status = said,
+                                Err(complaint) => {
+                                    writer.dialog = Some(Dialog::Message {
+                                        title: "Could not print".into(),
+                                        body: complaint,
+                                    })
+                                }
+                            }
+                        },
+                        span { class: "glyph", {icon("printer", 17)} }
+                        span { "Print" }
+                    }
+                    }
+                    }
+                }
+
+                h2 { class: "bs-sub", "Save as PDF" }
+                div { class: "hint", style: "margin: 0 0 8px;",
+                    "Works whether or not a printer is set up." }
+                input {
+                    class: "bs-input",
+                    style: "width: 100%; margin-bottom: 8px;",
+                    value: "{target}",
+                    oninput: move |event| target.set(event.value()),
+                }
+                {
+                let to_save = document.clone();
+                rsx! {
+                button {
+                    class: "btn",
+                    style: "width: 100%;",
+                    onclick: move |_| {
+                        let path = PathBuf::from(target());
+                        let outcome = crate::spooler::save(&path, &to_save);
+                        let mut writer = state.write();
+                        match outcome {
+                            Ok(written) => writer.status = format!("Saved {}", written.display()),
+                            Err(complaint) => {
+                                writer.dialog = Some(Dialog::Message {
+                                    title: "Could not save".into(),
+                                    body: complaint,
+                                })
+                            }
+                        }
+                    },
+                    span { class: "glyph", {icon("save-mono", 16)} }
+                    span { "Save PDF" }
+                }
+                }
+                }
+
+                h2 { class: "bs-sub", "Layout" }
+                Setting { label: "Paper".to_string(), hint: String::new(),
+                    Dropdown {
+                        value: options().paper.name.to_string(),
+                        options: aop_core::pdf::PAPERS.iter().map(|p| Choice::plain(p.name)).collect(),
+                        width: 0.0, large: true, disabled: false,
+                        on_pick: move |value: String| {
+                            if let Some(paper) = aop_core::pdf::PAPERS.iter().find(|p| p.name == value) {
+                                options.write().paper = *paper;
+                            }
+                        },
+                    }
+                }
+                Setting { label: "Orientation".to_string(), hint: String::new(),
+                    Dropdown {
+                        value: options().orientation.label().to_string(),
+                        options: aop_core::pdf::Orientation::ORDER
+                            .iter()
+                            .map(|o| Choice::plain(o.label()))
+                            .collect(),
+                        width: 0.0, large: true, disabled: false,
+                        on_pick: move |value: String| {
+                            let picked = aop_core::pdf::Orientation::ORDER
+                                .into_iter()
+                                .find(|o| o.label() == value)
+                                .unwrap_or_default();
+                            options.write().orientation = picked;
+                        },
+                    }
+                }
+                Setting { label: "Margin".to_string(), hint: "Millimetres".to_string(),
+                    input {
+                        class: "bs-input",
+                        style: "max-width: 90px;",
+                        value: "{options().margin_mm}",
+                        oninput: move |event| {
+                            if let Ok(value) = event.value().parse::<f32>() {
+                                options.write().margin_mm = value.clamp(0.0, 50.0);
+                            }
+                        },
+                    }
+                }
+
+                h2 { class: "bs-sub", "Include" }
+                OptCheck { label: "Gantt chart".to_string(), on_state: options().include_chart,
+                    on: move |_| { let on = options().include_chart; options.write().include_chart = !on; } }
+                OptCheck { label: "Task table".to_string(), on_state: options().include_table,
+                    on: move |_| { let on = options().include_table; options.write().include_table = !on; } }
+                OptCheck { label: "Resource sheet".to_string(), on_state: options().include_resources,
+                    on: move |_| { let on = options().include_resources; options.write().include_resources = !on; } }
+                OptCheck { label: "Mark the critical path".to_string(), on_state: options().show_critical,
+                    on: move |_| { let on = options().show_critical; options.write().show_critical = !on; } }
+
+                div { class: "print-fact", style: "margin-top: 14px;",
+                    span { class: "pf-label", "Document" }
+                    span { class: "pf-value", "{pages} page(s) \u{00b7} {size_kb:.0} KB" }
+                }
+            }
         }
     }
 }
@@ -796,12 +911,26 @@ fn ExportPage() -> Element {
             .unwrap_or_else(|| documents_dir().join(s.project.name.clone()))
     };
 
+    let mut excel_target = use_signal(|| format!("{}.xlsx", base.display()));
     let mut csv_target = use_signal(|| format!("{}.csv", base.display()));
     let mut html_target = use_signal(|| format!("{}.html", base.display()));
 
     rsx! {
         h1 { class: "bs-title", "Export" }
         Confirmation {}
+
+        h2 { class: "bs-sub", "Excel workbook" }
+        div { class: "hint", style: "margin: 0 0 10px;",
+            "Two sheets: the task table with its outline kept as indentation, and the resources. It reads back in, so a workbook sent out for comment can be brought home." }
+        div { class: "bs-field",
+            label { "Save to" }
+            input { class: "bs-input", value: "{excel_target}",
+                oninput: move |event| excel_target.set(event.value()) }
+            button { class: "btn primary",
+                onclick: move |_| state.write().export_excel_to(PathBuf::from(excel_target())),
+                "Export workbook"
+            }
+        }
 
         h2 { class: "bs-sub", "CSV" }
         div { class: "hint", style: "margin: 0 0 10px;",
@@ -840,13 +969,15 @@ fn ExportPage() -> Element {
 type Attribution = (&'static str, &'static str, &'static str);
 
 /// Attribution rows, grouped the way the Dunespan About panel groups them.
-const ATTRIBUTIONS: [(&str, &[Attribution]); 2] = [
+const ATTRIBUTIONS: [(&str, &[Attribution]); 5] = [
     (
         "Application",
         &[
             ("Dioxus", "MIT / Apache-2.0", "https://github.com/DioxusLabs/dioxus"),
             ("wry", "MIT / Apache-2.0", "https://github.com/tauri-apps/wry"),
             ("tao", "MIT / Apache-2.0", "https://github.com/tauri-apps/tao"),
+            ("ureq", "MIT / Apache-2.0", "https://github.com/algesten/ureq"),
+            ("sha2", "MIT / Apache-2.0", "https://github.com/RustCrypto/hashes"),
         ],
     ),
     (
@@ -855,7 +986,36 @@ const ATTRIBUTIONS: [(&str, &[Attribution]); 2] = [
             ("chrono", "MIT / Apache-2.0", "https://github.com/chronotope/chrono"),
             ("serde", "MIT / Apache-2.0", "https://github.com/serde-rs/serde"),
             ("serde_json", "MIT / Apache-2.0", "https://github.com/serde-rs/json"),
+            ("rmp-serde", "MIT", "https://github.com/3Hren/msgpack-rust"),
+            ("flate2", "MIT / Apache-2.0", "https://github.com/rust-lang/flate2-rs"),
         ],
+    ),
+    (
+        "Reading and writing files",
+        &[
+            ("alterion-mpp-parser", "Apache-2.0", "https://gitlab.com/alterion-software/alterion-mpp-parser"),
+            ("cfb", "MIT", "https://github.com/mdsteele/rust-cfb"),
+            ("quick-xml", "MIT", "https://github.com/tafia/quick-xml"),
+            ("calamine", "MIT", "https://github.com/tafia/calamine"),
+            ("rust_xlsxwriter", "MIT / Apache-2.0", "https://github.com/jmcnamara/rust_xlsxwriter"),
+            ("pdf-writer", "MIT / Apache-2.0", "https://github.com/typst/pdf-writer"),
+        ],
+    ),
+    (
+        "Artwork",
+        &[(
+            "Lucide",
+            "ISC",
+            "https://github.com/lucide-icons/lucide",
+        )],
+    ),
+    (
+        "Dictionaries",
+        &[(
+            "LibreOffice dictionaries",
+            "downloaded on request, licensed per language",
+            "https://github.com/LibreOffice/dictionaries",
+        )],
     ),
 ];
 
@@ -961,7 +1121,7 @@ fn AboutPage() -> Element {
 
 /// One labelled setting row.
 #[component]
-fn Setting(label: String, hint: String, children: Element) -> Element {
+pub fn Setting(label: String, hint: String, children: Element) -> Element {
     rsx! {
         div { class: "opt-row",
             div { class: "opt-label",
@@ -976,7 +1136,7 @@ fn Setting(label: String, hint: String, children: Element) -> Element {
 }
 
 #[component]
-fn OptCheck(label: String, on_state: bool, on: EventHandler<()>) -> Element {
+pub fn OptCheck(label: String, on_state: bool, on: EventHandler<()>) -> Element {
     let box_class = if on_state { "box on" } else { "box" };
     rsx! {
         div { class: "rcheck", style: "height: 26px;", onclick: move |_| on.call(()),

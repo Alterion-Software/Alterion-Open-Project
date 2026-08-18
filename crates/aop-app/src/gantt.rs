@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
 use dioxus::prelude::*;
 
+use aop_core::grouping::GroupRow;
 use aop_core::{LinkType, Project, TaskId, WorkCalendar};
 
 use crate::viewport::{PaneScroll, RowWindow};
@@ -58,6 +59,7 @@ impl Scale {
     }
 }
 
+#[derive(PartialEq)]
 struct Tick {
     from: NaiveDate,
     to: NaiveDate,
@@ -205,10 +207,34 @@ pub fn chart_range(project: &Project) -> (NaiveDate, NaiveDate) {
     )
 }
 
+#[derive(PartialEq)]
 struct BarBox {
     left: f64,
     right: f64,
     mid: f64,
+}
+
+/// Everything about the chart that does not depend on how far it is scrolled.
+///
+/// Scrolling used to rebuild all of this on every step: a tick per day of the
+/// plan, each carrying its own label string, the bar geometry for every task,
+/// and a walk over every calendar day looking for weekends. None of it changes
+/// when the viewport moves, so it is worked out once and reused until the plan,
+/// the zoom or the grouping actually changes.
+#[derive(PartialEq)]
+struct ChartLayout {
+    rows: Vec<GroupRow>,
+    from: NaiveDate,
+    to: NaiveDate,
+    width: f64,
+    body_h: f64,
+    major: Vec<Tick>,
+    minor: Vec<Tick>,
+    nonworking: Vec<f64>,
+    today_x: Option<f64>,
+    boxes: HashMap<TaskId, BarBox>,
+    lines: HashMap<TaskId, usize>,
+    band_lines: Vec<usize>,
 }
 
 #[component]
@@ -217,51 +243,123 @@ pub fn GanttChart() -> Element {
     let s = state.read();
 
     let project = &s.project;
-    let rows = s.visible_rows();
-    let (from, to) = chart_range(project);
-    let scale = Scale { origin: from, px_per_day: s.zoom.px_per_day() };
+    let scale = Scale { origin: chart_range(project).0, px_per_day: s.zoom.px_per_day() };
+    let (grid_rows, grid_columns) = (s.grid_rows, s.grid_columns);
+    drop(s);
 
-    let width = ((to - from).num_days() as f64 * scale.px_per_day).max(600.0);
-    let body_h = (rows.len().max(1) as f64 * ROW_H) + 40.0;
+    // Worked out once per change to the plan, not once per scroll step. The
+    // memo reads `state` and nothing else, so moving the viewport leaves it
+    // alone and scrolling costs only the windowing below.
+    let layout = use_memo(move || {
+        let s = state.read();
+        let project = &s.project;
+        let rows = s.layout_rows();
+        let (from, to) = chart_range(project);
+        let scale = Scale { origin: from, px_per_day: s.zoom.px_per_day() };
 
-    let major = major_ticks(s.zoom, from, to);
-    let minor = minor_ticks(s.zoom, from, to);
+        let width = ((to - from).num_days() as f64 * scale.px_per_day).max(600.0);
+        let body_h = (rows.len().max(1) as f64 * ROW_H) + 40.0;
 
-    // Non-working days are shaded, but only when a day is wide enough to see.
-    let mut nonworking: Vec<f64> = Vec::new();
-    if scale.px_per_day >= 4.0 {
-        let mut cursor = from;
-        while cursor < to {
-            if !project.calendar.is_working_day(cursor) {
-                nonworking.push(scale.x_date(cursor));
+        let major = major_ticks(s.zoom, from, to);
+        let minor = minor_ticks(s.zoom, from, to);
+
+        // Non-working days are shaded, but only when a day is wide enough to see.
+        let mut nonworking: Vec<f64> = Vec::new();
+        if scale.px_per_day >= 4.0 {
+            let mut cursor = from;
+            while cursor < to {
+                if !project.calendar.is_working_day(cursor) {
+                    nonworking.push(scale.x_date(cursor));
+                }
+                cursor += Duration::days(1);
             }
-            cursor += Duration::days(1);
         }
-    }
 
-    let today = Local::now().naive_local().date();
-    let today_x = (today >= from && today < to).then(|| scale.x_date(today));
+        let today = Local::now().naive_local().date();
+        let today_x = (today >= from && today < to).then(|| scale.x_date(today));
 
-    // Bar geometry, keyed by task so the arrows can find their endpoints.
-    let mut boxes: HashMap<TaskId, BarBox> = HashMap::new();
-    // Which line each task sits on, so an arrow can be skipped without first
-    // working out the path it would have taken.
-    let mut lines: HashMap<TaskId, usize> = HashMap::new();
-    for (line, &index) in rows.iter().enumerate() {
-        let task = &project.tasks[index];
-        lines.insert(task.id, line);
-        boxes.insert(
-            task.id,
-            BarBox {
-                left: scale.x_work(&project.calendar, task.scheduled.start),
-                right: scale.x_work(&project.calendar, task.scheduled.finish),
-                mid: line as f64 * ROW_H + ROW_H / 2.0,
-            },
-        );
-    }
+        // Bar geometry, keyed by task so the arrows can find their endpoints.
+        let mut boxes: HashMap<TaskId, BarBox> = HashMap::new();
+        // Which line each task sits on, so an arrow can be skipped without first
+        // working out the path it would have taken.
+        let mut lines: HashMap<TaskId, usize> = HashMap::new();
+        for (line, index) in rows.iter().enumerate().filter_map(task_line) {
+            let task = &project.tasks[index];
+            lines.insert(task.id, line);
+            let (mut left, mut right) = (
+                scale.x_work(&project.calendar, task.scheduled.start),
+                scale.x_work(&project.calendar, task.scheduled.finish),
+            );
+            if s.round_bars {
+                // Snap out to whole days, so half a day of work still reads as
+                // a day wide. The picture changes, the schedule does not.
+                let day = scale.px_per_day.max(1.0);
+                left = (left / day).floor() * day;
+                right = (right / day).ceil() * day;
+            }
+            boxes.insert(
+                task.id,
+                BarBox {
+                    left,
+                    right,
+                    mid: line as f64 * ROW_H + ROW_H / 2.0,
+                },
+            );
+        }
+
+        // A band draws nothing but the strip that holds its line open, so the
+        // rows below it sit where the grid put them.
+        let band_lines: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(line, row)| matches!(row, GroupRow::Band { .. }).then_some(line))
+            .collect();
+
+        ChartLayout {
+            rows,
+            from,
+            to,
+            width,
+            body_h,
+            major,
+            minor,
+            nonworking,
+            today_x,
+            boxes,
+            lines,
+            band_lines,
+        }
+    });
+
+    let layout = layout.read();
+    let ChartLayout {
+        rows,
+        width,
+        body_h,
+        major,
+        minor,
+        nonworking,
+        today_x,
+        boxes,
+        lines,
+        band_lines,
+        // The chart's date range lives in the layout for the memo's sake; the
+        // scale already carries the origin, so nothing here reads it again.
+        from: _,
+        to: _,
+    } = &*layout;
+    let (width, body_h, today_x) = (*width, *body_h, *today_x);
+    let s = state.read();
+    let project = &s.project;
 
     let tracking = s.view == ViewKind::TrackingGantt;
-    let status_x = s.project.status_date.map(|d| scale.x(d));
+    // A hidden status line is simply never given an x to draw at.
+    let status_x = s
+        .grid_status_date
+        .then(|| s.project.status_date.map(|d| scale.x(d)))
+        .flatten();
+    let show_links = s.show_links;
+    let bar_text = s.bar_text;
     let px_per_day = scale.px_per_day;
     let drag = s.bar_drag;
     let styles = project.bar_styles.clone();
@@ -386,12 +484,23 @@ pub fn GanttChart() -> Element {
                     }
                 }
 
+                for line in band_lines.iter().copied().filter(|line| window.holds(*line)) {
+                    rect {
+                        key: "bd{line}",
+                        x: "0", y: "{line as f64 * ROW_H}",
+                        width: "{width}", height: "{ROW_H}",
+                        fill: "var(--grid-header)",
+                    }
+                }
+
                 for line_index in window.first..(window.end + 1).min(rows_len + 1) {
                     {
                         let y = line_index as f64 * ROW_H;
                         rsx! {
-                            line { key: "rl{line_index}", x1: "0", y1: "{y}", x2: "{width}", y2: "{y}",
-                                stroke: "var(--grid-line)", stroke_width: "1" }
+                            if grid_rows {
+                                line { key: "rl{line_index}", x1: "0", y1: "{y}", x2: "{width}", y2: "{y}",
+                                    stroke: "var(--grid-line)", stroke_width: "1" }
+                            }
                         }
                     }
                 }
@@ -404,8 +513,10 @@ pub fn GanttChart() -> Element {
                     {
                         let x = scale.x_date(tick.from);
                         rsx! {
-                            line { key: "vl{index}", x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
-                                stroke: "var(--grid-line)", stroke_width: "1" }
+                            if grid_columns {
+                                line { key: "vl{index}", x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
+                                    stroke: "var(--grid-line)", stroke_width: "1" }
+                            }
                         }
                     }
                 }
@@ -413,12 +524,13 @@ pub fn GanttChart() -> Element {
                 // ---- dependency arrows -----------------------------------
                 for (index, link) in project.links.iter().enumerate() {
                     {
-                        let shown = match (lines.get(&link.predecessor), lines.get(&link.successor)) {
-                            (Some(&a), Some(&b)) => window.spans(a, b),
-                            _ => false,
-                        };
+                        let shown = show_links
+                            && match (lines.get(&link.predecessor), lines.get(&link.successor)) {
+                                (Some(&a), Some(&b)) => window.spans(a, b),
+                                _ => false,
+                            };
                         match shown
-                            .then(|| arrow_path(&boxes, link.predecessor, link.successor, link.kind))
+                            .then(|| arrow_path(boxes, link.predecessor, link.successor, link.kind))
                             .flatten()
                         {
                             Some((d, head_x, head_y, downward)) => rsx! {
@@ -433,17 +545,22 @@ pub fn GanttChart() -> Element {
                 }
 
                 // ---- bars ------------------------------------------------
-                for (line_index, &index) in rows.iter().enumerate().filter(|(line, i)| {
-                    // A bar has to be on screen both ways: on a drawn row, and
-                    // within the stretch of timescale the pane is showing.
-                    window.holds(*line) && {
-                        let t = &project.tasks[**i];
-                        let left = scale.x_work(&project.calendar, t.scheduled.start);
-                        let right = scale.x_work(&project.calendar, t.scheduled.finish);
-                        // The trailing label reaches past the bar's own end.
-                        span.overlaps(left, right + BAR_LABEL_REACH)
-                    }
-                }) {
+                for (line_index, index) in rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(task_line)
+                    .filter(|(line, i)| {
+                        // A bar has to be on screen both ways: on a drawn row,
+                        // and within the stretch of timescale the pane shows.
+                        window.holds(*line) && {
+                            let t = &project.tasks[*i];
+                            let left = scale.x_work(&project.calendar, t.scheduled.start);
+                            let right = scale.x_work(&project.calendar, t.scheduled.finish);
+                            // The trailing label reaches past the bar's own end.
+                            span.overlaps(left, right + BAR_LABEL_REACH)
+                        }
+                    })
+                {
                     {
                         let task = &project.tasks[index];
                         let summary = project.is_summary(index);
@@ -453,7 +570,8 @@ pub fn GanttChart() -> Element {
                         let right = scale.x_work(&project.calendar, task.scheduled.finish);
                         let bar_w = (right - left).max(2.0);
                         let bar_y = y + (ROW_H - BAR_H) / 2.0;
-                        let critical = task.scheduled.critical && s.show_critical;
+                        let critical =
+                            s.show_critical && aop_core::issues::shows_as_critical(project, index);
                         let fill = if !task.active {
                             "var(--bar-inactive)".to_string()
                         } else if critical {
@@ -603,8 +721,50 @@ pub fn GanttChart() -> Element {
                                     }
                                 }
 
-                                if !label.is_empty() {
+                                if bar_text && !label.is_empty() {
                                     text { class: "bar-label", x: "{right + 6.0}", y: "{centre + 0.5}", "{label}" }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- what the plan is waiting on ------------------------
+                //
+                // Something outside the plan gets its own mark on the row that
+                // waits for it, at the date it lands. Held only in a dialog it
+                // is invisible in the one place a planner is actually looking
+                // when they wonder why a bar will not move.
+                for (line_index, index) in rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(task_line)
+                    .filter(|(line, _)| window.holds(*line))
+                {
+                    {
+                        let waits = project.externals_of(index);
+                        let y = line_index as f64 * ROW_H;
+                        rsx! {
+                            for entry in waits {
+                                {
+                                    let x = scale.x_work(&project.calendar, entry.available);
+                                    let mid = y + ROW_H / 2.0;
+                                    rsx! {
+                                        g { key: "ex{index}-{entry.id}",
+                                            title { "{entry.reference}: {entry.label}" }
+                                            // A pin through the row: it is a
+                                            // date nothing in the plan can move.
+                                            line {
+                                                x1: "{x}", y1: "{y + 1.0}",
+                                                x2: "{x}", y2: "{y + ROW_H - 1.0}",
+                                                stroke: "var(--contextual)", stroke_width: "1.5",
+                                            }
+                                            polygon {
+                                                points: "{x - 4.0},{mid - 5.0} {x + 4.0},{mid - 5.0} {x},{mid + 1.0}",
+                                                fill: "var(--contextual)",
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -627,6 +787,17 @@ pub fn GanttChart() -> Element {
             }
             }
         }
+    }
+}
+
+/// The line a task sits on, or nothing when that line belongs to a band.
+///
+/// Both panes lay out the same list, bands included, so the chart counts every
+/// line but only draws on the ones that carry a task.
+fn task_line((line, row): (usize, &GroupRow)) -> Option<(usize, usize)> {
+    match row {
+        &GroupRow::Task(index) => Some((line, index)),
+        GroupRow::Band { .. } => None,
     }
 }
 
@@ -1005,10 +1176,10 @@ pub fn TimelineBand() -> Element {
 
                 for (slot, (band, lane)) in placed.into_iter().enumerate() {
                     {
-                        let task = &project.tasks[band.index];
                         let w = (band.right - band.left).max(3.0);
                         let y = top + lane as f64 * lane_h;
-                        let critical = task.scheduled.critical && s.show_critical;
+                        let critical =
+                            s.show_critical && aop_core::issues::shows_as_critical(project, band.index);
                         // Each band takes its own shade of the plan's colour so
                         // one phase reads as separate from the next.
                         let base = if critical {

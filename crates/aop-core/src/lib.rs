@@ -3,15 +3,26 @@
 //! This crate holds the plan and the maths and knows nothing about the user
 //! interface, so the critical path engine can be exercised entirely from tests.
 
+pub mod agile;
 pub mod calendar;
+pub mod custom;
 pub mod duration;
+pub mod excel;
 pub mod fields;
+pub mod grouping;
+pub mod issues;
+pub mod leveling;
 pub mod model;
 pub mod mpp;
 pub mod mspdi;
+pub mod pdf;
 pub mod persist;
 pub mod schedule;
+pub mod spelling;
+pub mod subproject;
 pub mod templates;
+pub mod textstyle;
+pub mod update;
 
 pub use calendar::{CalendarException, DayShifts, Shift, WorkCalendar};
 pub use fields::{Align, Field, FieldGroup};
@@ -25,7 +36,8 @@ pub use model::{
 pub use mspdi::ImportError;
 pub use persist::{FileError, FILE_EXTENSION, FILE_TYPE_NAME};
 pub use schedule::{
-    apply_remedy, critical_reason, diagnose, schedule, Overallocation, Remedy, ScheduleError,
+    apply_remedy, critical_path, critical_path_minutes, critical_reason, diagnose, schedule,
+    CriticalStep, Overallocation, Remedy, ScheduleError,
     ScheduleReport,
 };
 

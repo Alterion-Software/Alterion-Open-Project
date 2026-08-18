@@ -16,6 +16,20 @@ use crate::gantt::ROW_H;
 /// rows covers that without costing much.
 const OVERSCAN: usize = 6;
 
+/// Rows per step of the window.
+///
+/// The window used to be worked out from the exact first visible row, so it
+/// changed every time one row scrolled past: at 22 pixels a row, a full redraw
+/// every 22 pixels of travel. Preparing the data for a redraw is cheap, but
+/// each one hands the webview a fresh set of rows to lay out and paint, and
+/// that is what made a long plan feel heavy under the wheel.
+///
+/// Snapping the window to a block means it changes once per block instead, so
+/// scrolling a screenful costs a couple of redraws rather than dozens. The
+/// block is drawn on both sides beyond what is visible, so nothing is missing
+/// at the edges while the window sits still.
+const BLOCK: usize = 16;
+
 /// The height to assume before a pane has told us its own.
 ///
 /// A pane reports its height with its first scroll or mount event, which is
@@ -45,10 +59,19 @@ impl RowWindow {
     /// Work out which rows fall inside a pane scrolled to `scroll_top`.
     pub fn new(scroll_top: f64, viewport: f64, total: usize) -> Self {
         let first_visible = (scroll_top.max(0.0) / ROW_H).floor() as usize;
-        let first = first_visible.saturating_sub(OVERSCAN).min(total);
-
         let spanned = (viewport.max(0.0) / ROW_H).ceil() as usize;
-        let end = first_visible
+
+        // Both edges come off one snapped anchor rather than being rounded
+        // separately. Rounded separately they sit on different lattices and
+        // take turns moving, so the window still changed twice a block; from
+        // one anchor it changes exactly once.
+        let first = (first_visible.saturating_sub(OVERSCAN) / BLOCK * BLOCK).min(total);
+
+        // The anchor can sit up to a whole block further back than the margin
+        // asked for, so the span has to make that distance up as well.
+        let end = first
+            .saturating_add(BLOCK)
+            .saturating_add(OVERSCAN)
             .saturating_add(spanned)
             .saturating_add(OVERSCAN)
             .min(total);
@@ -153,8 +176,11 @@ mod tests {
         let w = RowWindow::new(0.0, 220.0, 200);
         assert_eq!(w.first, 0);
         assert_eq!(w.above, 0.0);
-        // Ten rows fit, plus the margin below.
-        assert_eq!(w.end, 10 + OVERSCAN);
+        // Ten rows fit. What is drawn past them is the margin plus the block
+        // the window snaps to, and the exact figure is not the point: what
+        // matters is that every visible row is covered.
+        let spanned = (220.0 / ROW_H).ceil() as usize;
+        assert!(w.end >= spanned + OVERSCAN);
     }
 
     #[test]
@@ -191,7 +217,51 @@ mod tests {
         // while the pane catches up with the pointer.
         let w = RowWindow::new(ROW_H * 30.0, 220.0, 200);
         assert!(w.holds(30 - OVERSCAN), "the margin above must be drawn");
-        assert!(!w.holds(30 - OVERSCAN - 1));
+        // Snapping to a block only ever draws more, never less, so the exact
+        // far edge is no longer fixed. What matters is that it stays bounded:
+        // a window that crept outwards would give back the virtualization.
+        let spanned = (220.0 / ROW_H).ceil() as usize;
+        assert!(w.end - w.first <= spanned + 2 * OVERSCAN + 2 * BLOCK);
+    }
+
+    #[test]
+    fn the_window_only_moves_once_a_whole_block_has_gone_by() {
+        // This is the property that keeps scrolling cheap. Working the window
+        // out from the exact first visible row meant a redraw every row, which
+        // at 22 pixels a row is a redraw every 22 pixels of travel.
+        let total = 500;
+        let at = |row: usize| RowWindow::new(ROW_H * row as f64, 600.0, total);
+
+        // Count how often the window actually changes across a long scroll.
+        // Before snapping this was one change per row.
+        let mut changes = 0usize;
+        let mut last = at(0);
+        for row in 1..160 {
+            let now = at(row);
+            if now != last {
+                changes += 1;
+                last = now;
+            }
+        }
+        assert!(changes >= 1, "the window must still follow the scroll");
+        assert!(
+            changes <= 160 / BLOCK + 1,
+            "the window moved {changes} times across 160 rows, so it is not snapping"
+        );
+    }
+
+    #[test]
+    fn every_row_the_margin_asks_for_is_still_drawn() {
+        // Snapping must never draw less than the overscan wanted, or a fast
+        // scroll would show a blank band at the leading edge.
+        let total = 500usize;
+        for row in 0usize..80 {
+            let w = RowWindow::new(ROW_H * row as f64, 600.0, total);
+            let wanted_first = row.saturating_sub(OVERSCAN);
+            let wanted_end = (row + (600.0 / ROW_H).ceil() as usize + OVERSCAN).min(total);
+            assert!(w.first <= wanted_first, "row {row}: top margin missing");
+            assert!(w.end >= wanted_end, "row {row}: bottom margin missing");
+        }
     }
 
     #[test]

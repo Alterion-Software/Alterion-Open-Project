@@ -5,8 +5,17 @@ use chrono::NaiveDate;
 use dioxus::prelude::*;
 
 use aop_core::{
-    format_duration, format_work, ConstraintType, DayShifts, LinkType, ScheduleFrom, TaskMode,
+    format_duration, format_work, ConstraintType, DayShifts, ResourceKind, ScheduleFrom, TaskMode,
 };
+
+use std::path::PathBuf;
+
+use aop_core::leveling::{LevelOrder, LevelScope};
+use aop_core::persist;
+use aop_core::textstyle::{StyleTarget, TextStyle};
+use aop_core::update::UpdateOptions;
+
+use crate::backstage::OptCheck;
 
 use crate::controls::{Choice, Dropdown};
 use crate::icons::icon;
@@ -25,6 +34,13 @@ pub fn DialogHost(dialog: Dialog) -> Element {
             div { class: "dlg", onclick: move |event| event.stop_propagation(),
                 match dialog {
                     Dialog::TaskInformation(row) => rsx! { TaskInformation { row } },
+                    Dialog::ResourceInformation { row, tab } => rsx! { ResourceInformation { row, tab } },
+                    Dialog::LevelingOptions => rsx! { LevelingOptionsDialog {} },
+                    Dialog::InsertSubproject => rsx! { InsertSubproject {} },
+                    Dialog::LinksBetweenProjects => rsx! { LinksBetweenProjects {} },
+                    Dialog::UpdateProject => rsx! { UpdateProjectDialog {} },
+                    Dialog::TextStyles => rsx! { TextStylesDialog {} },
+                    Dialog::Layout => rsx! { LayoutDialog {} },
                     Dialog::TemplatePreview(id) => rsx! { TemplatePreview { id } },
                     Dialog::ProjectInformation => rsx! { ProjectInformation {} },
                     Dialog::AssignResources => rsx! { AssignResources {} },
@@ -32,6 +48,8 @@ pub fn DialogHost(dialog: Dialog) -> Element {
                     Dialog::CustomizeQat => rsx! { CustomizeQat {} },
                     Dialog::BarStyles => rsx! { BarStylesDialog {} },
                     Dialog::FixIssue => rsx! { FixIssue {} },
+                    Dialog::CustomFields => rsx! { CustomFieldsDialog {} },
+                    Dialog::ExternalDependencies => rsx! { ExternalDependenciesDialog {} },
                     Dialog::InsertColumn(at) => rsx! { InsertColumn { at } },
                     Dialog::UnsavedChanges(action) => rsx! { UnsavedChanges { action } },
                     Dialog::Recover(found) => rsx! { Recover { found } },
@@ -85,33 +103,9 @@ fn TaskInformation(row: usize) -> Element {
     });
     let mut mode = use_signal(|| task.mode);
 
-    let (predecessors, resources, currency, is_summary) = {
+    let (currency, is_summary) = {
         let s = state.read();
-        let project = &s.project;
-        let predecessors: Vec<(String, LinkType, i64)> = project
-            .predecessors_of(task.id)
-            .into_iter()
-            .filter_map(|link| {
-                project.index_of(link.predecessor).map(|index| {
-                    (
-                        format!("{}  {}", index + 1, project.tasks[index].name),
-                        link.kind,
-                        link.lag_minutes,
-                    )
-                })
-            })
-            .collect();
-        let resources: Vec<(String, f64)> = task
-            .assignments
-            .iter()
-            .filter_map(|a| project.resource(a.resource).map(|r| (r.name.clone(), a.units)))
-            .collect();
-        (
-            predecessors,
-            resources,
-            project.currency_symbol.clone(),
-            project.is_summary(row),
-        )
+        (s.project.currency_symbol.clone(), s.project.is_summary(row))
     };
 
     let apply = move |_| {
@@ -202,42 +196,15 @@ fn TaskInformation(row: usize) -> Element {
                 },
 
                 // ---- Predecessors ---------------------------------------
+                // The same picker the grid opens, so there is one way to set a
+                // dependency rather than two that behave differently.
                 1 => rsx! {
-                    if predecessors.is_empty() {
-                        div { class: "hint", "This task has no predecessors. Add them in the Predecessors column, using entries like 3FS+2 days." }
-                    } else {
-                        table { class: "assign-table",
-                            thead { tr { th { "Task" } th { "Type" } th { "Lag" } } }
-                            tbody {
-                                for (index, (label, kind, lag)) in predecessors.iter().enumerate() {
-                                    tr { key: "p{index}",
-                                        td { "{label}" }
-                                        td { "{kind.label()}" }
-                                        td { {if *lag == 0 { "0 days".to_string() } else { format_duration(*lag) }} }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    crate::popups::PredecessorPicker { row }
                 },
 
                 // ---- Resources ------------------------------------------
                 2 => rsx! {
-                    if resources.is_empty() {
-                        div { class: "hint", "Nothing is booked onto this task yet. Use Assign Resources on the Resource tab." }
-                    } else {
-                        table { class: "assign-table",
-                            thead { tr { th { "Resource Name" } th { "Units" } } }
-                            tbody {
-                                for (index, (label, units)) in resources.iter().enumerate() {
-                                    tr { key: "r{index}",
-                                        td { "{label}" }
-                                        td { "{units * 100.0:.0}%" }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    crate::popups::ResourcePicker { row }
                 },
 
                 // ---- Advanced -------------------------------------------
@@ -294,6 +261,898 @@ fn TaskInformation(row: usize) -> Element {
             button { class: "btn primary", onclick: apply, "OK" }
         }
     }
+}
+
+// ------------------------------------------------------------------ layout
+
+/// Flip a display choice and write it straight to the config.
+///
+/// These follow the planner rather than the plan, so they belong in the
+/// config file, not in the saved project.
+fn keep(mut state: Signal<AppState>, edit: fn(&mut AppState)) {
+    let settings = {
+        let mut writer = state.write();
+        edit(&mut writer);
+        writer.settings()
+    };
+    settings.save();
+}
+
+#[component]
+fn LayoutDialog() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let (round_bars, show_links, bar_text, rows, columns, status_line) = {
+        let s = state.read();
+        (
+            s.round_bars,
+            s.show_links,
+            s.bar_text,
+            s.grid_rows,
+            s.grid_columns,
+            s.grid_status_date,
+        )
+    };
+
+    rsx! {
+        Head { title: "Layout".to_string() }
+        div { class: "dlg-body", style: "min-width: 520px; min-height: 280px;",
+            h3 { class: "dlg-sub", "Bars" }
+            OptCheck {
+                label: "Round bars to whole days".to_string(),
+                on_state: round_bars,
+                on: move |_| keep(state, |s| s.round_bars = !s.round_bars),
+            }
+            OptCheck {
+                label: "Show the task name beside its bar".to_string(),
+                on_state: bar_text,
+                on: move |_| keep(state, |s| s.bar_text = !s.bar_text),
+            }
+            OptCheck {
+                label: "Draw dependency arrows".to_string(),
+                on_state: show_links,
+                on: move |_| keep(state, |s| s.show_links = !s.show_links),
+            }
+            div { class: "hint",
+                "Rounding draws a bar to whole days, so half a day of work still reads as a day wide. It changes the picture only, never the schedule."
+            }
+
+            div { class: "sep" }
+            h3 { class: "dlg-sub", "Gridlines" }
+            OptCheck {
+                label: "Row lines".to_string(),
+                on_state: rows,
+                on: move |_| keep(state, |s| s.grid_rows = !s.grid_rows),
+            }
+            OptCheck {
+                label: "Column lines".to_string(),
+                on_state: columns,
+                on: move |_| keep(state, |s| s.grid_columns = !s.grid_columns),
+            }
+            OptCheck {
+                label: "Status date line".to_string(),
+                on_state: status_line,
+                on: move |_| keep(state, |s| s.grid_status_date = !s.grid_status_date),
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Close" }
+        }
+    }
+}
+
+// -------------------------------------------------------------- text styles
+
+/// Colours offered for text and fill, as palette tokens so both themes work.
+const STYLE_COLOURS: [(&str, &str); 8] = [
+    ("Theme default", ""),
+    ("Muted", "var(--ink-soft)"),
+    ("Critical", "var(--danger)"),
+    ("Accent", "var(--accent)"),
+    ("Warning", "var(--warning)"),
+    ("Success", "var(--success)"),
+    ("Ink", "var(--ink)"),
+    ("Surface", "var(--surface)"),
+];
+
+/// Change one field of a category's style, dropping the entry entirely when
+/// nothing is left set, so an untouched category stays absent rather than
+/// holding an empty record.
+fn amend(mut state: Signal<AppState>, target: StyleTarget, edit: impl Fn(&mut TextStyle)) {
+    let mut writer = state.write();
+    let mut style = writer.text_styles.style_of(target);
+    edit(&mut style);
+    if style.is_unset() {
+        writer.text_styles.clear(target);
+    } else {
+        writer.text_styles.set(target, style);
+    }
+    writer.dirty = true;
+}
+
+#[component]
+fn TextStylesDialog() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let mut target = use_signal(|| StyleTarget::All);
+
+    // Read back whatever this category already carries, so the boxes show the
+    // current answer rather than a blank form.
+    let current = state.read().text_styles.style_of(target());
+
+
+    rsx! {
+        Head { title: "Text Styles".to_string() }
+        div { class: "dlg-body", style: "min-width: 600px; min-height: 300px;",
+            div { class: "form-row",
+                label { "Item to change" }
+                Dropdown {
+                    value: format!("{:?}", target()),
+                    options: StyleTarget::ALL
+                        .iter()
+                        .map(|entry| Choice::new(format!("{entry:?}"), entry.label()))
+                        .collect(),
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        if let Some(found) = StyleTarget::ALL.iter().find(|t| format!("{t:?}") == picked) {
+                            target.set(*found);
+                        }
+                    },
+                }
+            }
+            div { class: "sep" }
+
+            div { class: "form-row",
+                label { "Emphasis" }
+                {
+                    let (bold, italic, underline) = (current.bold, current.italic, current.underline);
+                    rsx! {
+                        button {
+                            class: if bold { "rbtn-icon on" } else { "rbtn-icon" }, title: "Bold",
+                            onclick: move |_| amend(state, target(), |s: &mut TextStyle| s.bold = !bold),
+                            {icon("bold", 15)}
+                        }
+                        button {
+                            class: if italic { "rbtn-icon on" } else { "rbtn-icon" }, title: "Italic",
+                            onclick: move |_| amend(state, target(), |s: &mut TextStyle| s.italic = !italic),
+                            {icon("italic", 15)}
+                        }
+                        button {
+                            class: if underline { "rbtn-icon on" } else { "rbtn-icon" }, title: "Underline",
+                            onclick: move |_| amend(state, target(), |s: &mut TextStyle| s.underline = !underline),
+                            {icon("underline", 15)}
+                        }
+                    }
+                }
+            }
+
+            div { class: "form-row",
+                label { "Font" }
+                Dropdown {
+                    value: current.family.clone(),
+                    options: std::iter::once(Choice::new("", "Theme default"))
+                        .chain(
+                            ["Calibri", "Segoe UI", "Inter", "Arial", "Times New Roman"]
+                                .iter()
+                                .map(|family| Choice::plain(*family)),
+                        )
+                        .collect(),
+                    width: 180.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        amend(state, target(), |s: &mut TextStyle| s.family = picked.clone());
+                    },
+                }
+                label { style: "width: auto; margin-left: 12px;", "Size" }
+                Dropdown {
+                    value: if current.size_pt > 0.0 {
+                        format!("{:.0}", current.size_pt)
+                    } else {
+                        "0".to_string()
+                    },
+                    options: std::iter::once(Choice::new("0", "Theme default"))
+                        .chain(
+                            ["8", "9", "10", "11", "12", "14", "16", "18"]
+                                .iter()
+                                .map(|size| Choice::plain(*size)),
+                        )
+                        .collect(),
+                    width: 180.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        let value = picked.parse::<f32>().unwrap_or(0.0);
+                        amend(state, target(), |s: &mut TextStyle| s.size_pt = value);
+                    },
+                }
+            }
+
+            div { class: "form-row",
+                label { "Text colour" }
+                Dropdown {
+                    value: current.colour.clone(),
+                    options: STYLE_COLOURS
+                        .iter()
+                        .map(|(name, token)| Choice::new(*token, *name))
+                        .collect(),
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        amend(state, target(), |s: &mut TextStyle| s.colour = picked.clone());
+                    },
+                }
+            }
+            div { class: "form-row",
+                label { "Fill" }
+                Dropdown {
+                    value: current.background.clone(),
+                    options: STYLE_COLOURS
+                        .iter()
+                        .map(|(name, token)| Choice::new(*token, *name))
+                        .collect(),
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        amend(state, target(), |s: &mut TextStyle| s.background = picked.clone());
+                    },
+                }
+            }
+
+            div { class: "sep" }
+            div { class: "form-row",
+                label { "Preview" }
+                span { style: "{current.to_css()} padding: 3px 9px; border: 1px solid var(--grid-line);",
+                    "Design the foundations" }
+            }
+            div { class: "hint",
+                "A category's look sits under a row's own formatting, so a row you have coloured by hand keeps its colour. All applies first, then the category, so setting a font on All changes every row that has not been told otherwise."
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn",
+                onclick: move |_| {
+                    let chosen = target();
+                    let mut writer = state.write();
+                    writer.text_styles.clear(chosen);
+                    writer.dirty = true;
+                },
+                "Reset this item"
+            }
+            button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Close" }
+        }
+    }
+}
+
+// ---------------------------------------------------------- update project
+
+#[component]
+fn UpdateProjectDialog() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    let (today, has_selection) = {
+        let s = state.read();
+        (
+            s.project.status_date.unwrap_or(s.project.start_date),
+            !s.selection.is_empty(),
+        )
+    };
+
+    // Two modes, one date field, exactly as Project puts it.
+    let mut rescheduling = use_signal(|| false);
+    let mut whole_only = use_signal(|| false);
+    let mut selected_only = use_signal(|| false);
+    let mut move_manual = use_signal(|| false);
+    let mut when = use_signal(|| today.format("%Y-%m-%d").to_string());
+
+    let apply = move |_| {
+        let Some(date) = crate::state::parse_date(&when()) else {
+            state.write().note("That date could not be read. Use YYYY-MM-DD.");
+            return;
+        };
+
+        let mut options = if rescheduling() {
+            let options = UpdateOptions::reschedule_after(date);
+            if move_manual() { options.moving_manually_scheduled() } else { options }
+        } else {
+            let options = UpdateOptions::complete_through(date);
+            if whole_only() { options.whole_tasks_only() } else { options }
+        };
+        if selected_only() {
+            let rows = state.read().selection.clone();
+            options = options.for_rows(rows);
+        }
+        state.write().update_project(options);
+    };
+
+    rsx! {
+        Head { title: "Update Project".to_string() }
+        div { class: "dlg-body", style: "min-width: 560px; min-height: 280px;",
+            div { class: "form-row",
+                label { "Action" }
+                Dropdown {
+                    value: (if rescheduling() { "reschedule" } else { "complete" }).to_string(),
+                    options: vec![
+                        Choice::new("complete", "Update work as complete through"),
+                        Choice::new("reschedule", "Reschedule uncompleted work to start after"),
+                    ],
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| rescheduling.set(picked == "reschedule"),
+                }
+            }
+            div { class: "form-row",
+                label { "Date" }
+                input { placeholder: "YYYY-MM-DD", value: "{when}",
+                    oninput: move |e| when.set(e.value()) }
+            }
+            div { class: "sep" }
+
+            if rescheduling() {
+                OptCheck {
+                    label: "Move manually scheduled tasks too".to_string(),
+                    on_state: move_manual(),
+                    on: move |_| move_manual.toggle(),
+                }
+                div { class: "hint",
+                    "Work that has not started moves to begin after the date. A task already part done keeps the work it has done, and the rest picks up after the date. Manually scheduled tasks stay where they were put unless the box above is ticked."
+                }
+            } else {
+                OptCheck {
+                    label: "Set 0% or 100% complete only".to_string(),
+                    on_state: whole_only(),
+                    on: move |_| whole_only.toggle(),
+                }
+                div { class: "hint",
+                    if whole_only() {
+                        "Only tasks that finished on or before the date are marked complete. Everything else is left exactly as it is."
+                    } else {
+                        "Each task gets the share of its working time that falls before the date, so a task halfway through reads about 50%. This assumes the plan was followed, and will overwrite progress already reported."
+                    }
+                }
+            }
+
+            div { class: "sep" }
+            OptCheck {
+                label: "Selected tasks only".to_string(),
+                on_state: selected_only(),
+                on: move |_| selected_only.toggle(),
+            }
+            if selected_only() && !has_selection {
+                div { class: "hint", "Nothing is selected, so this would update nothing." }
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn", onclick: move |_| state.write().dialog = None, "Cancel" }
+            button { class: "btn primary", onclick: apply, "OK" }
+        }
+    }
+}
+
+// -------------------------------------------------- links between projects
+
+#[component]
+fn LinksBetweenProjects() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    // Two kinds of reach outside this plan: work waiting on another system,
+    // and rows that came in from another plan.
+    let (waiting, inserted) = {
+        let s = state.read();
+        let project = &s.project;
+        let mut waiting: Vec<(String, String, String, String)> = Vec::new();
+        for task in &project.tasks {
+            for id in &task.external_predecessors {
+                if let Some(entry) = project.external.iter().find(|e| e.id == *id) {
+                    waiting.push((
+                        task.name.clone(),
+                        entry.reference.clone(),
+                        entry.label.clone(),
+                        entry.available.format("%Y-%m-%d").to_string(),
+                    ));
+                }
+            }
+        }
+
+        let inserted: Vec<(String, String)> = project
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| project.is_summary(*index))
+            .filter_map(|(_, task)| {
+                // The subproject reader leaves this note on the summary row,
+                // which is the only record that the rows came from elsewhere.
+                task.notes
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Inserted from "))
+                    .map(|rest| (task.name.clone(), rest.trim_end_matches('.').to_string()))
+            })
+            .collect();
+
+        (waiting, inserted)
+    };
+
+    rsx! {
+        Head { title: "Links Between Projects".to_string() }
+        div { class: "dlg-body", style: "min-width: 640px; max-height: 62vh; overflow-y: auto;",
+            div { class: "hint", style: "margin: 0 0 12px;",
+                "Everything in this plan that reaches outside it. Nothing here is checked against the other side, so a date shown is the one recorded here, not one read back from another system."
+            }
+
+            h3 { class: "dlg-sub", "Waiting on something outside the plan" }
+            if waiting.is_empty() {
+                p { class: "hint", "Nothing in this plan waits on an outside dependency." }
+            } else {
+                table { class: "assign-table",
+                    thead {
+                        tr {
+                            th { "Task" }
+                            th { "Reference" }
+                            th { "What it is" }
+                            th { "Expected" }
+                        }
+                    }
+                    tbody {
+                        for (task, reference, label, when) in waiting.iter() {
+                            tr { key: "{task}{reference}",
+                                td { "{task}" }
+                                td { "{reference}" }
+                                td { "{label}" }
+                                td { "{when}" }
+                            }
+                        }
+                    }
+                }
+            }
+
+            div { class: "sep" }
+
+            h3 { class: "dlg-sub", "Rows brought in from another plan" }
+            if inserted.is_empty() {
+                p { class: "hint", "No subprojects have been inserted." }
+            } else {
+                table { class: "assign-table",
+                    thead {
+                        tr {
+                            th { "Summary row" }
+                            th { "Came from" }
+                        }
+                    }
+                    tbody {
+                        for (name, source) in inserted.iter() {
+                            tr { key: "{name}",
+                                td { "{name}" }
+                                td { "{source}" }
+                            }
+                        }
+                    }
+                }
+                p { class: "hint",
+                    "Inserted rows are a copy taken at the time. Changes made to the other file afterwards do not appear here."
+                }
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn", onclick: move |_| state.write().dialog = Some(Dialog::ExternalDependencies),
+                "External Dependencies" }
+            button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Close" }
+        }
+    }
+}
+
+// ------------------------------------------------------ insert subproject
+
+#[component]
+fn InsertSubproject() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    let start_in = {
+        let s = state.read();
+        s.file_path
+            .as_ref()
+            .and_then(|p| p.parent().map(PathBuf::from))
+            .unwrap_or_else(crate::state::documents_dir)
+    };
+    let mut dir = use_signal(|| start_in);
+
+    // Folders, then anything the plan reader can open. Same rules the Open
+    // page uses, so a file visible there is visible here.
+    let (folders, files) = {
+        let mut folders: Vec<(String, PathBuf)> = Vec::new();
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                if path.is_dir() {
+                    folders.push((name, path));
+                } else if path.extension().is_some_and(|e| {
+                    e.eq_ignore_ascii_case(persist::FILE_EXTENSION)
+                        || e.eq_ignore_ascii_case("xml")
+                        || e.eq_ignore_ascii_case("mpp")
+                        || e.eq_ignore_ascii_case("xlsx")
+                }) {
+                    files.push((name, path));
+                }
+            }
+        }
+        folders.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        files.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        (folders, files)
+    };
+
+    let recent = state.read().recent.clone();
+    let current = dir().display().to_string();
+
+    rsx! {
+        Head { title: "Insert Subproject".to_string() }
+        div { class: "dlg-body", style: "min-height: 340px;",
+            p { class: "hint", style: "margin-top: 0;",
+                "The plan you pick comes in as a summary row with its tasks beneath it, at the row selected here. It is copied in, not linked, so saving this plan never writes to the other file."
+            }
+            div { class: "bs-field",
+                label { "Folder" }
+                input {
+                    class: "bs-input",
+                    value: "{current}",
+                    onchange: move |event| {
+                        let candidate = PathBuf::from(event.value());
+                        if candidate.is_dir() { dir.set(candidate); }
+                    },
+                }
+                button { class: "btn",
+                    onclick: move |_| {
+                        let parent = dir().parent().map(PathBuf::from);
+                        if let Some(parent) = parent { dir.set(parent); }
+                    },
+                    "Up"
+                }
+            }
+
+            if !recent.is_empty() {
+                div { class: "recent-list", style: "max-height: 90px; overflow-y: auto;",
+                    for entry in recent.iter().take(5) {
+                        {
+                            let target = entry.path.clone();
+                            let label = entry.name.clone();
+                            rsx! {
+                                button { key: "r{label}", class: "recent-row",
+                                    onclick: move |_| state.write().insert_subproject(target.clone()),
+                                    span { class: "glyph", {icon("subproject", 20)} }
+                                    div { class: "recent-name", "{label}" }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "sep" }
+            }
+
+            div { class: "recent-list", style: "max-height: 190px; overflow-y: auto;",
+                for (name, path) in folders {
+                    {
+                        let target = path.clone();
+                        rsx! {
+                            button { key: "d{name}", class: "recent-row",
+                                onclick: move |_| dir.set(target.clone()),
+                                span { class: "glyph", {icon("folder", 20)} }
+                                div { class: "recent-name", "{name}" }
+                            }
+                        }
+                    }
+                }
+                for (name, path) in files {
+                    {
+                        let target = path.clone();
+                        rsx! {
+                            button { key: "f{name}", class: "recent-row",
+                                onclick: move |_| state.write().insert_subproject(target.clone()),
+                                span { class: "glyph", {icon("subproject", 20)} }
+                                div { class: "recent-name", "{name}" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn", onclick: move |_| state.write().dialog = None, "Cancel" }
+        }
+    }
+}
+
+// ------------------------------------------------------- leveling options
+
+#[component]
+fn LevelingOptionsDialog() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let current = state.read().leveling.clone();
+
+    let mut only_within_slack = use_signal(|| current.only_within_slack);
+    let mut level_manual = use_signal(|| current.level_manual);
+    let mut order = use_signal(|| current.order);
+
+    let apply = move |_| {
+        let (slack, manual, chosen) = (only_within_slack(), level_manual(), order());
+        let mut writer = state.write();
+        writer.leveling.only_within_slack = slack;
+        writer.leveling.level_manual = manual;
+        writer.leveling.order = chosen;
+        writer.dialog = None;
+        writer.note("Levelling options saved.");
+    };
+
+    let level_now = move |_| {
+        let (slack, manual, chosen) = (only_within_slack(), level_manual(), order());
+        {
+            let mut writer = state.write();
+            writer.leveling.only_within_slack = slack;
+            writer.leveling.level_manual = manual;
+            writer.leveling.order = chosen;
+            writer.dialog = None;
+        }
+        state.write().level(LevelScope::EntireProject);
+    };
+
+    rsx! {
+        Head { title: "Resource Leveling".to_string() }
+        div { class: "dlg-body", style: "min-height: 230px;",
+            div { class: "form-row",
+                label { "Order" }
+                Dropdown {
+                    value: match order() {
+                        LevelOrder::IdOnly => "id",
+                        LevelOrder::PriorityFirst => "priority",
+                        LevelOrder::Standard => "standard",
+                    }.to_string(),
+                    options: vec![
+                        Choice::new("standard", "Standard"),
+                        Choice::new("id", "ID only"),
+                        Choice::new("priority", "Priority, then standard"),
+                    ],
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| order.set(match picked.as_str() {
+                        "id" => LevelOrder::IdOnly,
+                        "priority" => LevelOrder::PriorityFirst,
+                        _ => LevelOrder::Standard,
+                    }),
+                }
+            }
+            div { class: "hint",
+                "Standard moves the task with the most slack, so the tasks holding up the finish stay put. ID only moves whichever comes later in the plan. Priority looks first at whether the task has a deadline or a date the planner pinned."
+            }
+            div { class: "sep" }
+            OptCheck {
+                label: "Level only within available slack".to_string(),
+                on_state: only_within_slack(),
+                on: move |_| only_within_slack.toggle(),
+            }
+            OptCheck {
+                label: "Level manually scheduled tasks".to_string(),
+                on_state: level_manual(),
+                on: move |_| level_manual.toggle(),
+            }
+            div { class: "hint",
+                "Levelling within slack never pushes the finish date out, so it will leave some overallocations alone rather than break the plan. Manually scheduled tasks are left where the planner put them unless the second box is ticked."
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn", onclick: move |_| state.write().dialog = None, "Cancel" }
+            button { class: "btn", onclick: apply, "OK" }
+            button { class: "btn primary", onclick: level_now, "Level All" }
+        }
+    }
+}
+
+// ---------------------------------------------------- resource information
+
+#[component]
+fn ResourceInformation(row: usize, tab: usize) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let mut tab = use_signal(|| tab.min(2));
+
+    let snapshot = {
+        let s = state.read();
+        s.project.resources.get(row).cloned()
+    };
+    let Some(resource) = snapshot else {
+        return rsx! { MessageBox { title: "Resource Information".to_string(), body: "That resource no longer exists.".to_string() } };
+    };
+
+    let mut name = use_signal(|| resource.name.clone());
+    let mut initials = use_signal(|| resource.initials.clone());
+    let mut email = use_signal(|| resource.email.clone());
+    let mut group = use_signal(|| resource.group.clone());
+    let mut code = use_signal(|| resource.code.clone());
+    let mut kind = use_signal(|| resource.kind);
+    let mut max_units = use_signal(|| format!("{:.0}%", resource.max_units * 100.0));
+    let mut standard = use_signal(|| format!("{:.2}", resource.standard_rate));
+    let mut overtime = use_signal(|| format!("{:.2}", resource.overtime_rate));
+    let mut per_use = use_signal(|| format!("{:.2}", resource.cost_per_use));
+    let mut notes = use_signal(|| resource.notes.clone());
+
+    // What this person is already carrying, so the dialog is not just a form.
+    let (currency, workload) = {
+        let s = state.read();
+        let project = &s.project;
+        let mut minutes = 0i64;
+        let mut cost = 0.0f64;
+        let mut tasks: Vec<(String, f64)> = Vec::new();
+        for task in &project.tasks {
+            for assignment in &task.assignments {
+                if assignment.resource != resource.id {
+                    continue;
+                }
+                let share = (task.scheduled.work_minutes as f64 * assignment.units).round() as i64;
+                minutes += share;
+                cost += share as f64 / 60.0 * resource.standard_rate;
+                tasks.push((task.name.clone(), assignment.units));
+            }
+        }
+        (project.currency_symbol.clone(), (minutes, cost, tasks))
+    };
+    let (assigned_minutes, assigned_cost, assigned_tasks) = workload;
+
+    let apply = move |_| {
+        let (new_name, new_initials, new_email) = (name(), initials(), email());
+        let (new_group, new_code, new_kind) = (group(), code(), kind());
+        let (new_units, new_standard) = (max_units(), standard());
+        let (new_overtime, new_per_use, new_notes) = (overtime(), per_use(), notes());
+
+        let mut writer = state.write();
+        writer.checkpoint();
+        if let Some(target) = writer.project.resources.get_mut(row) {
+            target.name = new_name;
+            target.initials = new_initials;
+            target.email = new_email;
+            target.group = new_group;
+            target.code = new_code;
+            target.kind = new_kind;
+            if let Ok(units) = new_units.trim_end_matches('%').trim().parse::<f64>() {
+                // Typed as a percentage because that is how the sheet shows it.
+                target.max_units = (units / 100.0).max(0.0);
+            }
+            if let Ok(rate) = money(&new_standard) {
+                target.standard_rate = rate;
+            }
+            if let Ok(rate) = money(&new_overtime) {
+                target.overtime_rate = rate;
+            }
+            if let Ok(rate) = money(&new_per_use) {
+                target.cost_per_use = rate;
+            }
+            target.notes = new_notes;
+        }
+        writer.reschedule();
+        writer.dialog = None;
+    };
+
+    rsx! {
+        Head { title: "Resource Information".to_string() }
+        div { class: "dlg-tabs",
+            for (index, label) in ["General", "Costs", "Notes"].iter().enumerate() {
+                {
+                    let class = if tab() == index { "dlg-tab active" } else { "dlg-tab" };
+                    rsx! {
+                        button { key: "{label}", class: "{class}", onclick: move |_| tab.set(index), "{label}" }
+                    }
+                }
+            }
+        }
+        div { class: "dlg-body", style: "min-height: 260px;",
+            match tab() {
+                // ---- General --------------------------------------------
+                0 => rsx! {
+                    div { class: "form-row",
+                        label { "Name" }
+                        input { class: "grow", value: "{name}", oninput: move |e| name.set(e.value()) }
+                        label { style: "width: auto; margin-left: 12px;", "Initials" }
+                        input { style: "width: 70px;", value: "{initials}",
+                            oninput: move |e| initials.set(e.value()) }
+                    }
+                    div { class: "form-row",
+                        label { "Email" }
+                        input { class: "grow", value: "{email}", oninput: move |e| email.set(e.value()) }
+                    }
+                    div { class: "form-row",
+                        label { "Group" }
+                        input { value: "{group}", oninput: move |e| group.set(e.value()) }
+                        label { style: "width: auto; margin-left: 12px;", "Code" }
+                        input { style: "width: 110px;", value: "{code}",
+                            oninput: move |e| code.set(e.value()) }
+                    }
+                    div { class: "form-row",
+                        label { "Type" }
+                        Dropdown {
+                            value: match kind() {
+                                ResourceKind::Work => "work",
+                                ResourceKind::Material => "material",
+                                ResourceKind::Cost => "cost",
+                            }.to_string(),
+                            options: vec![
+                                Choice::new("work", "Work"),
+                                Choice::new("material", "Material"),
+                                Choice::new("cost", "Cost"),
+                            ],
+                            width: 0.0, large: true, disabled: false,
+                            on_pick: move |picked: String| kind.set(match picked.as_str() {
+                                "material" => ResourceKind::Material,
+                                "cost" => ResourceKind::Cost,
+                                _ => ResourceKind::Work,
+                            }),
+                        }
+                        label { style: "width: auto; margin-left: 12px;", "Max units" }
+                        input { style: "width: 80px;", value: "{max_units}",
+                            disabled: kind() != ResourceKind::Work,
+                            oninput: move |e| max_units.set(e.value()) }
+                    }
+                    p { class: "hint",
+                        "Max units is how much of this person the plan may book at once. 100% is one full-time unit, 50% is half time, 300% is a crew of three."
+                    }
+                },
+
+                // ---- Costs ----------------------------------------------
+                1 => rsx! {
+                    div { class: "form-row",
+                        label { "Standard rate" }
+                        input { value: "{standard}", oninput: move |e| standard.set(e.value()) }
+                        span { class: "unit", "{currency} per hour" }
+                    }
+                    div { class: "form-row",
+                        label { "Overtime rate" }
+                        input { value: "{overtime}", oninput: move |e| overtime.set(e.value()) }
+                        span { class: "unit", "{currency} per hour" }
+                    }
+                    div { class: "form-row",
+                        label { "Cost per use" }
+                        input { value: "{per_use}", oninput: move |e| per_use.set(e.value()) }
+                        span { class: "unit", "{currency} each time booked" }
+                    }
+                    div { class: "sep" }
+                    div { class: "form-row",
+                        label { "Assigned work" }
+                        span { "{format_duration(assigned_minutes)}" }
+                        label { style: "width: auto; margin-left: 12px;", "Cost so far" }
+                        span { "{currency}{assigned_cost:.2}" }
+                    }
+                    p { class: "hint",
+                        "Cost so far is this person's share of the work already booked, at the standard rate. It updates when the rate above is saved."
+                    }
+                    if assigned_tasks.is_empty() {
+                        p { class: "hint", "Not assigned to anything yet." }
+                    } else {
+                        div { class: "dlg-list",
+                            for (task_name, units) in assigned_tasks.iter().take(12) {
+                                div { class: "dlg-list-row", key: "{task_name}",
+                                    span { class: "grow", "{task_name}" }
+                                    span { "{units * 100.0:.0}%" }
+                                }
+                            }
+                        }
+                    }
+                },
+
+                // ---- Notes ----------------------------------------------
+                _ => rsx! {
+                    textarea {
+                        style: "width: 100%; height: 200px; resize: vertical;",
+                        value: "{notes}",
+                        oninput: move |e| notes.set(e.value()),
+                    }
+                },
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn", onclick: move |_| state.write().dialog = None, "Cancel" }
+            button { class: "btn primary", onclick: apply, "OK" }
+        }
+    }
+}
+
+/// Read a rate the planner typed, tolerating a currency symbol and separators.
+fn money(text: &str) -> Result<f64, std::num::ParseFloatError> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    if cleaned.is_empty() {
+        return Ok(0.0);
+    }
+    cleaned.parse::<f64>()
 }
 
 // ----------------------------------------------------- project information
@@ -797,7 +1656,7 @@ fn TemplatePreview(id: String) -> Element {
     let create_id = id.clone();
 
     rsx! {
-        Head { title: format!("{} \u{2014} preview", spec.name) }
+        Head { title: format!("Preview: {}", spec.name) }
         div { class: "dlg-body", style: "min-width: 780px;",
             div { class: "tpl-desc", style: "font-size: 12.5px; margin-bottom: 14px;", "{spec.description}" }
 
@@ -1163,6 +2022,395 @@ fn InsertColumn(at: usize) -> Element {
         div { class: "dlg-foot",
             button { class: "btn", onclick: move |_| state.write().reset_columns(), "Reset table" }
             button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Close" }
+        }
+    }
+}
+
+// ---------------------------------------------------------- custom fields
+
+/// Set up the plan's spare fields.
+///
+/// Laid out the way Project's is: pick a type, pick a slot, then say what it is
+/// for. The slots are fixed rather than freely named so that a column, a filter
+/// or an export written against `Text3` still finds `Text3` in a plan that has
+/// been passed to someone else.
+#[component]
+fn CustomFieldsDialog() -> Element {
+    use aop_core::custom::{CustomField, CustomKind, Indicator, LookupValue, Slot, Test};
+
+    let mut state = use_context::<Signal<AppState>>();
+    let mut kind = use_signal(|| CustomKind::Text);
+    let mut number = use_signal(|| 1u8);
+
+    let slot = Slot::new(kind(), number());
+    let field = state
+        .read()
+        .project
+        .custom_fields
+        .get(&slot)
+        .cloned()
+        .unwrap_or_else(|| CustomField::new(slot));
+
+    // Every write goes through here so the plan is only touched once per edit.
+    let mut put = move |updated: CustomField| {
+        let mut writer = state.write();
+        writer.checkpoint();
+        if updated.is_in_use() {
+            writer.project.custom_fields.insert(slot, updated);
+        } else {
+            writer.project.custom_fields.remove(&slot);
+        }
+        writer.dirty = true;
+    };
+
+    let in_use: Vec<(Slot, String)> = state
+        .read()
+        .project
+        .custom_fields
+        .iter()
+        .filter(|(_, field)| field.is_in_use())
+        .map(|(slot, field)| (*slot, field.title()))
+        .collect();
+
+    rsx! {
+        Head { title: "Custom Fields".to_string() }
+        div { class: "dlg-body", style: "min-width: 640px; max-height: 62vh; overflow-y: auto;",
+
+            div { class: "cf-pick",
+                div { class: "bs-field",
+                    label { "Type" }
+                    Dropdown {
+                        value: kind().label().to_string(),
+                        options: CustomKind::ALL.iter().map(|k| Choice::plain(k.label())).collect(),
+                        width: 0.0, large: true, disabled: false,
+                        on_pick: move |value: String| {
+                            if let Some(picked) = CustomKind::ALL.into_iter().find(|k| k.label() == value) {
+                                kind.set(picked);
+                                // Slot 12 does not exist for a type with ten.
+                                if number() > picked.count() {
+                                    number.set(1);
+                                }
+                            }
+                        },
+                    }
+                }
+                div { class: "bs-field",
+                    label { "Field" }
+                    Dropdown {
+                        value: slot.default_title(),
+                        options: (1..=kind().count())
+                            .map(|n| Choice::plain(format!("{}{}", kind().label(), n)))
+                            .collect(),
+                        width: 0.0, large: true, disabled: false,
+                        on_pick: move |value: String| {
+                            let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
+                            if let Ok(n) = digits.parse::<u8>() {
+                                number.set(n);
+                            }
+                        },
+                    }
+                }
+            }
+
+            crate::backstage::Setting {
+                label: "Name".to_string(),
+                hint: "What the column is called. Leave empty to keep the slot name.".to_string(),
+                input {
+                    class: "bs-input",
+                    value: "{field.title}",
+                    placeholder: "{slot.default_title()}",
+                    oninput: {
+                        let field = field.clone();
+                        move |event: FormEvent| {
+                            let mut updated = field.clone();
+                            updated.title = event.value();
+                            put(updated);
+                        }
+                    },
+                }
+            }
+
+            crate::backstage::Setting {
+                label: "Summary rows".to_string(),
+                hint: "What a summary row shows for this field.".to_string(),
+                Dropdown {
+                    value: field.rollup.label().to_string(),
+                    options: kind().rollups().iter().map(|r| Choice::plain(r.label())).collect(),
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: {
+                        let field = field.clone();
+                        let allowed = kind().rollups();
+                        move |value: String| {
+                            if let Some(picked) = allowed.iter().find(|r| r.label() == value) {
+                                let mut updated = field.clone();
+                                updated.rollup = *picked;
+                                put(updated);
+                            }
+                        }
+                    },
+                }
+            }
+
+            h2 { class: "bs-sub", "Values" }
+            div { class: "hint", style: "margin: 0 0 8px;",
+                "One value per line. Leave empty to accept anything typed." }
+            textarea {
+                class: "bs-input",
+                style: "width: 100%; min-height: 90px; font-family: var(--mono); font-size: 11.5px;",
+                value: "{field.lookup.iter().map(|v| v.value.clone()).collect::<Vec<_>>().join(\"\\n\")}",
+                oninput: {
+                    let field = field.clone();
+                    move |event: FormEvent| {
+                        let mut updated = field.clone();
+                        updated.lookup = event
+                            .value()
+                            .lines()
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .map(|line| LookupValue {
+                                value: line.to_string(),
+                                description: String::new(),
+                            })
+                            .collect();
+                        put(updated);
+                    }
+                },
+            }
+            crate::backstage::OptCheck {
+                label: "Only allow these values".to_string(),
+                on_state: field.lookup_only,
+                on: {
+                    let field = field.clone();
+                    move |_| {
+                        let mut updated = field.clone();
+                        updated.lookup_only = !updated.lookup_only;
+                        put(updated);
+                    }
+                },
+            }
+
+            h2 { class: "bs-sub", "Indicators" }
+            div { class: "hint", style: "margin: 0 0 8px;",
+                "Show a mark instead of the value when it meets a test. The first match wins, so put a catch-all last." }
+
+            for (position, indicator) in field.indicators.iter().enumerate() {
+                {
+                    let field = field.clone();
+                    let indicator = indicator.clone();
+                    rsx! {
+                        div { key: "ind{position}", class: "cf-indicator",
+                            span { class: "cf-glyph", "{indicator.glyph}" }
+                            span { class: "cf-rule",
+                                "{indicator.test.label()} {indicator.against}" }
+                            if !indicator.meaning.is_empty() {
+                                span { class: "cf-meaning", "{indicator.meaning}" }
+                            }
+                            button {
+                                class: "key-clear",
+                                onclick: move |_| {
+                                    let mut updated = field.clone();
+                                    updated.indicators.remove(position);
+                                    put(updated);
+                                },
+                                {icon("x", 13)}
+                            }
+                        }
+                    }
+                }
+            }
+
+            {
+                let field = field.clone();
+                rsx! {
+                    button {
+                        class: "btn",
+                        style: "margin-top: 8px;",
+                        onclick: move |_| {
+                            let mut updated = field.clone();
+                            updated.indicators.push(Indicator {
+                                test: Test::IsNotEmpty,
+                                against: String::new(),
+                                glyph: "\u{25cf}".into(),
+                                meaning: "has a value".into(),
+                            });
+                            put(updated);
+                        },
+                        "Add an indicator"
+                    }
+                }
+            }
+
+            if !in_use.is_empty() {
+                h2 { class: "bs-sub", "In use in this plan" }
+                div { class: "cf-inuse",
+                    for (used_slot, title) in in_use {
+                        button {
+                            key: "{used_slot.default_title()}",
+                            class: "cf-chip",
+                            onclick: move |_| {
+                                kind.set(used_slot.kind);
+                                number.set(used_slot.number);
+                            },
+                            span { class: "cf-chip-name", "{title}" }
+                            span { class: "cf-chip-slot", "{used_slot.default_title()}" }
+                        }
+                    }
+                }
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Done" }
+        }
+    }
+}
+
+// ----------------------------------------------------- external dependencies
+
+/// Things outside the plan that work waits on, and which tasks wait on them.
+///
+/// A reference and a date, nothing more. Nothing here goes looking for the
+/// truth of it: the plan records what it was told, so it stays openable by
+/// someone with no access to the system the reference came from.
+#[component]
+fn ExternalDependenciesDialog() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    let mut reference = use_signal(String::new);
+    let mut label = use_signal(String::new);
+    let mut when = use_signal(|| {
+        state
+            .read()
+            .project
+            .start_date
+            .format("%Y-%m-%d")
+            .to_string()
+    });
+
+    let (entries, row, task_name, waiting) = {
+        let s = state.read();
+        let row = s.primary();
+        let waiting: Vec<u32> = row
+            .and_then(|r| s.project.tasks.get(r))
+            .map(|task| task.external_predecessors.clone())
+            .unwrap_or_default();
+        (
+            s.project.external.clone(),
+            row,
+            row.and_then(|r| s.project.tasks.get(r))
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| "No task selected".into()),
+            waiting,
+        )
+    };
+
+    let can_add = !reference().trim().is_empty()
+        && crate::state::parse_date(&when()).is_some();
+
+    rsx! {
+        Head { title: "External Dependencies".to_string() }
+        div { class: "dlg-body", style: "min-width: 640px; max-height: 62vh; overflow-y: auto;",
+            div { class: "hint", style: "margin: 0 0 12px;",
+                "Something outside this plan that work waits on: a purchase order, a permit, a delivery, a sign-off held in another system. Work cannot start before the date given, and the date is not checked against anything." }
+
+            div { class: "ext-add",
+                input {
+                    class: "bs-input",
+                    placeholder: "Reference, e.g. PO-4471",
+                    value: "{reference}",
+                    oninput: move |event| reference.set(event.value()),
+                }
+                input {
+                    class: "bs-input",
+                    placeholder: "What it is",
+                    value: "{label}",
+                    oninput: move |event| label.set(event.value()),
+                }
+                input {
+                    class: "bs-input",
+                    style: "max-width: 150px;",
+                    placeholder: "YYYY-MM-DD",
+                    value: "{when}",
+                    oninput: move |event| when.set(event.value()),
+                }
+                button {
+                    class: "btn primary",
+                    disabled: !can_add,
+                    onclick: move |_| {
+                        if let Some(date) = crate::state::parse_date(&when()) {
+                            state.write().add_external(&reference(), &label(), date);
+                            reference.set(String::new());
+                            label.set(String::new());
+                        }
+                    },
+                    "Add"
+                }
+            }
+
+            if entries.is_empty() {
+                div { class: "empty-state", style: "height: 120px; font-size: 12px;",
+                    "Nothing recorded yet." }
+            } else {
+                h2 { class: "bs-sub", "Recorded" }
+                div { class: "ext-list",
+                    for entry in entries.iter().cloned() {
+                        {
+                            let id = entry.id;
+                            let held = waiting.contains(&id);
+                            let users = state
+                                .read()
+                                .project
+                                .tasks
+                                .iter()
+                                .filter(|task| task.external_predecessors.contains(&id))
+                                .count();
+                            rsx! {
+                                div { key: "x{id}", class: "ext-row",
+                                    div { class: "ext-main",
+                                        span { class: "ext-ref", "{entry.reference}" }
+                                        span { class: "ext-label", "{entry.label}" }
+                                        input {
+                                            class: "bs-input ext-date",
+                                            value: "{entry.available.format(\"%Y-%m-%d\")}",
+                                            title: "When it becomes available. Work waiting on it cannot start before this.",
+                                            onchange: move |event| {
+                                                if let Some(date) = crate::state::parse_date(&event.value()) {
+                                                    state.write().update_external(id, |entry| entry.available = date);
+                                                }
+                                            },
+                                        }
+                                        span { class: "ext-users", "{users} task(s) waiting" }
+                                    }
+                                    div { class: "ext-acts",
+                                        if row.is_some() {
+                                            button {
+                                                class: if held { "spell-skip" } else { "spell-fix" },
+                                                onclick: move |_| {
+                                                    if let Some(row) = row {
+                                                        state.write().toggle_external_on(row, id);
+                                                    }
+                                                },
+                                                if held { "Stop waiting" } else { "This task waits" }
+                                            }
+                                        }
+                                        button {
+                                            class: "key-clear",
+                                            title: "Remove, and unhook every task waiting on it",
+                                            onclick: move |_| state.write().remove_external(id),
+                                            {icon("x", 13)}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                div { class: "hint", style: "margin-top: 10px;",
+                    "Selected task: {task_name}" }
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Done" }
         }
     }
 }

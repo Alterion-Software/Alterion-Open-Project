@@ -362,15 +362,14 @@ pub fn from_xml(text: &str) -> Result<Project, ImportError> {
                         exception_to = parse_datetime(&value).map(|d| d.date())
                     }
                     ("Exceptions", "Exception") => {
-                        if !exception_working {
-                            if let Some(from) = exception_from {
+                        if !exception_working
+                            && let Some(from) = exception_from {
                                 holidays.push((
                                     std::mem::take(&mut exception_name),
                                     from,
                                     exception_to.unwrap_or(from),
                                 ));
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -517,14 +516,13 @@ fn assemble(
         else {
             continue;
         };
-        if let Some(task) = project.task_mut(task_id) {
-            if task.assignments.iter().all(|a| a.resource != resource_id) {
+        if let Some(task) = project.task_mut(task_id)
+            && task.assignments.iter().all(|a| a.resource != resource_id) {
                 task.assignments.push(Assignment {
                     resource: resource_id,
                     units: if units > 0.0 { units } else { 1.0 },
                 });
             }
-        }
     }
 
     // Keep the plan's own start honest for the scheduler.

@@ -255,11 +255,10 @@ fn forward_pass(project: &mut Project, graph: &Graph, pinned: &HashMap<usize, Na
         let mut start = project_start;
 
         // Manually scheduled tasks sit where the user put them.
-        if project.tasks[index].mode == TaskMode::Manual {
-            if let Some(manual) = project.tasks[index].manual_start {
+        if project.tasks[index].mode == TaskMode::Manual
+            && let Some(manual) = project.tasks[index].manual_start {
                 start = manual;
             }
-        }
 
         for link in graph.incoming.get(&index).into_iter().flatten() {
             let Some(pred_leaves) = graph.leaves_of.get(&link.predecessor) else {
@@ -286,6 +285,16 @@ fn forward_pass(project: &mut Project, graph: &Graph, pinned: &HashMap<usize, Na
             if candidate > start {
                 start = candidate;
             }
+        }
+
+        // Something outside the plan cannot be moved by rescheduling, so it is
+        // a floor on the start rather than something to negotiate with. A
+        // manually placed task is left where the planner put it, as with links.
+        if project.tasks[index].mode != TaskMode::Manual
+            && let Some(ready) = project.external_ready(index)
+            && ready > start
+        {
+            start = ready;
         }
 
         // Date constraints can only push a task later during the forward pass.
@@ -608,15 +617,19 @@ fn find_overallocations(project: &Project) -> Vec<Overallocation> {
         let Some(days) = per_resource.get(&resource.id) else {
             continue;
         };
-        let over: Vec<(&NaiveDate, &f64)> = days
+        // Both halves are Copy, so the days worth reporting are taken by value
+        // rather than carried around as a pair of references and dereferenced
+        // twice at every use.
+        let over: Vec<(NaiveDate, f64)> = days
             .iter()
-            .filter(|(_, &units)| units > resource.max_units + 1e-9)
+            .filter(|(_, units)| **units > resource.max_units + 1e-9)
+            .map(|(date, units)| (*date, *units))
             .collect();
         if over.is_empty() {
             continue;
         }
-        let first_date = **over.iter().map(|(d, _)| d).min().unwrap();
-        let peak = over.iter().map(|(_, &u)| u).fold(0.0f64, f64::max);
+        let first_date = over.iter().map(|(date, _)| *date).min().unwrap();
+        let peak = over.iter().map(|(_, units)| *units).fold(0.0f64, f64::max);
         result.push(Overallocation {
             resource: resource.id,
             resource_name: resource.name.clone(),
@@ -793,15 +806,14 @@ pub fn critical_reason(project: &Project, index: usize) -> Option<String> {
                 deadline.format("%d/%m/%y")
             ));
         }
-        if task.constraint.needs_date() {
-            if let Some(date) = task.constraint_date {
+        if task.constraint.needs_date()
+            && let Some(date) = task.constraint_date {
                 return Some(format!(
                     "Behind by {late_by}. It cannot meet \"{}\" on {}.",
                     task.constraint.label(),
                     date.format("%d/%m/%y")
                 ));
             }
-        }
         return Some(format!(
             "Behind by {late_by}. The plan cannot finish by the date it is held to."
         ));
@@ -1408,5 +1420,576 @@ mod tests {
         fn with_hour_17(self) -> NaiveDateTime {
             self.date().and_hms_opt(17, 0, 0).unwrap()
         }
+    }
+}
+
+#[cfg(test)]
+mod external_tests {
+    use crate::model::{ExternalDependency, Project, Task, TaskMode};
+    use chrono::NaiveDate;
+
+    fn at(y: i32, m: u32, d: u32, h: u32) -> chrono::NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+    }
+
+    fn plan() -> Project {
+        let mut project = Project::blank(at(2026, 9, 7, 8));
+        project.tasks.clear();
+        let id = project.allocate_task_id();
+        project.tasks.push(Task::new(id, "Fit the frame", 480));
+        project
+    }
+
+    fn waiting_on(project: &mut Project, available: chrono::NaiveDateTime) {
+        let id = project.allocate_external_id();
+        project.external.push(ExternalDependency {
+            id,
+            reference: "PO-4471".into(),
+            label: "Steel delivery".into(),
+            source: "ERP".into(),
+            available,
+            notes: String::new(),
+        });
+        project.tasks[0].external_predecessors.push(id);
+    }
+
+    #[test]
+    fn work_cannot_start_before_what_it_waits_on_arrives() {
+        let mut project = plan();
+        waiting_on(&mut project, at(2026, 9, 21, 8));
+        crate::schedule(&mut project).unwrap();
+        assert!(project.tasks[0].scheduled.start >= at(2026, 9, 21, 8));
+    }
+
+    #[test]
+    fn an_arrival_already_past_holds_nothing_up() {
+        // A delivery that landed last month is not a reason to move work.
+        let mut project = plan();
+        waiting_on(&mut project, at(2026, 8, 1, 8));
+        crate::schedule(&mut project).unwrap();
+        assert_eq!(project.tasks[0].scheduled.start, at(2026, 9, 7, 8));
+    }
+
+    #[test]
+    fn the_latest_of_several_arrivals_is_what_counts() {
+        let mut project = plan();
+        waiting_on(&mut project, at(2026, 9, 14, 8));
+        waiting_on(&mut project, at(2026, 10, 5, 8));
+        crate::schedule(&mut project).unwrap();
+        assert!(project.tasks[0].scheduled.start >= at(2026, 10, 5, 8));
+    }
+
+    #[test]
+    fn a_manually_placed_task_is_left_where_the_planner_put_it() {
+        // Consistent with how links behave: manual means manual.
+        let mut project = plan();
+        project.tasks[0].mode = TaskMode::Manual;
+        project.tasks[0].manual_start = Some(at(2026, 9, 7, 8));
+        waiting_on(&mut project, at(2026, 12, 1, 8));
+        crate::schedule(&mut project).unwrap();
+        assert_eq!(project.tasks[0].scheduled.start, at(2026, 9, 7, 8));
+    }
+
+    #[test]
+    fn a_reference_no_longer_in_the_plan_is_ignored_rather_than_fatal() {
+        // Deleting the dependency must not stop the plan from scheduling.
+        let mut project = plan();
+        waiting_on(&mut project, at(2026, 12, 1, 8));
+        project.external.clear();
+        assert!(crate::schedule(&mut project).is_ok());
+        assert_eq!(project.tasks[0].scheduled.start, at(2026, 9, 7, 8));
+    }
+
+    #[test]
+    fn identifiers_are_never_reused_after_a_deletion() {
+        let mut project = plan();
+        waiting_on(&mut project, at(2026, 9, 21, 8));
+        let first = project.external[0].id;
+        let second = project.allocate_external_id();
+        assert_ne!(first, second, "a reused id would rewire a task silently");
+    }
+}
+
+/// One step along the critical path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CriticalStep {
+    /// Row index in the plan.
+    pub index: usize,
+    /// How this task is tied to the one before it, if there is one.
+    pub link_from_previous: Option<LinkType>,
+    pub lag_minutes: i64,
+}
+
+/// The critical path: the longest chain of dependent tasks that sets the
+/// project's finish date.
+///
+/// This is not the same as "every task with zero slack". Those tasks are the
+/// candidates, but the path is the sequence through them, joined by their
+/// links. A plan can hold several zero-slack chains running in parallel, and
+/// only the longest one determines the finish, so that is the one returned.
+///
+/// Summary rows are left out: their span is rolled up from their children, so
+/// including them would put the same time on the path twice.
+pub fn critical_path(project: &Project) -> Vec<CriticalStep> {
+    let candidates: Vec<usize> = (0..project.tasks.len())
+        .filter(|&index| {
+            !project.is_summary(index)
+                && project.tasks[index].active
+                && crate::issues::shows_as_critical(project, index)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let position: HashMap<usize, usize> = candidates
+        .iter()
+        .enumerate()
+        .map(|(slot, &index)| (index, slot))
+        .collect();
+
+    // Links that run between two candidates, which is what makes a chain
+    // rather than a list.
+    let mut incoming: HashMap<usize, Vec<(usize, Link)>> = HashMap::new();
+    for link in &project.links {
+        let (Some(from), Some(to)) = (
+            project.index_of(link.predecessor),
+            project.index_of(link.successor),
+        ) else {
+            continue;
+        };
+        if position.contains_key(&from) && position.contains_key(&to) {
+            incoming.entry(to).or_default().push((from, *link));
+        }
+    }
+
+    // Longest chain ending at each task, measured in duration so that the
+    // path returned is the one that actually sets the finish date. The plan is
+    // already known to be acyclic here, since it scheduled.
+    let mut order = candidates.clone();
+    order.sort_by_key(|&index| project.tasks[index].scheduled.start);
+
+    let mut best: HashMap<usize, i64> = HashMap::new();
+    let mut came_from: HashMap<usize, (usize, Link)> = HashMap::new();
+
+    for &index in &order {
+        let own = project.tasks[index].scheduled.duration_minutes.max(0);
+        let mut longest = own;
+        for (from, link) in incoming.get(&index).into_iter().flatten() {
+            let through = best.get(from).copied().unwrap_or(0) + own;
+            if through > longest {
+                longest = through;
+                came_from.insert(index, (*from, *link));
+            }
+        }
+        best.insert(index, longest);
+    }
+
+    // Walk back from wherever the longest chain ended.
+    let Some((&tail, _)) = best.iter().max_by_key(|(index, length)| {
+        // Ties broken by the later finish, so the path ends where the project
+        // does rather than at whichever row happened to hash first.
+        (**length, project.tasks[**index].scheduled.finish)
+    }) else {
+        return Vec::new();
+    };
+
+    let mut chain = Vec::new();
+    let mut cursor = tail;
+    loop {
+        let step = came_from.get(&cursor).copied();
+        chain.push(CriticalStep {
+            index: cursor,
+            link_from_previous: step.map(|(_, link)| link.kind),
+            lag_minutes: step.map(|(_, link)| link.lag_minutes).unwrap_or(0),
+        });
+        match step {
+            Some((previous, _)) => cursor = previous,
+            None => break,
+        }
+        // A malformed graph must not spin here.
+        if chain.len() > project.tasks.len() {
+            break;
+        }
+    }
+
+    chain.reverse();
+    chain
+}
+
+/// How long the critical path runs, in working minutes.
+pub fn critical_path_minutes(project: &Project, path: &[CriticalStep]) -> i64 {
+    path.iter()
+        .map(|step| project.tasks[step.index].scheduled.duration_minutes.max(0))
+        .sum()
+}
+
+#[cfg(test)]
+mod critical_path_tests {
+    use super::*;
+    use crate::model::{LinkType, Task};
+    use chrono::NaiveDate;
+
+    fn at(y: i32, m: u32, d: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(8, 0, 0)
+            .unwrap()
+    }
+
+    /// A chain of `durations`, each linked to the one before it, plus any
+    /// extra standalone tasks.
+    fn chain(durations: &[i64]) -> Project {
+        let mut project = Project::blank(at(2026, 1, 5));
+        project.tasks.clear();
+        let mut previous: Option<crate::model::TaskId> = None;
+        for (index, minutes) in durations.iter().enumerate() {
+            let id = project.allocate_task_id();
+            project
+                .tasks
+                .push(Task::new(id, format!("Task {}", index + 1), *minutes));
+            if let Some(from) = previous {
+                project.links.push(Link {
+                    predecessor: from,
+                    successor: id,
+                    kind: LinkType::FS,
+                    lag_minutes: 0,
+                });
+            }
+            previous = Some(id);
+        }
+        project
+    }
+
+    #[test]
+    fn the_path_is_the_chain_in_order_not_a_bag_of_tasks() {
+        let mut project = chain(&[480, 480, 480]);
+        crate::schedule(&mut project).unwrap();
+
+        let path = critical_path(&project);
+        assert_eq!(path.len(), 3);
+        assert_eq!(
+            path.iter().map(|s| s.index).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "it has to read start to finish"
+        );
+        assert!(path[0].link_from_previous.is_none(), "the first has nothing before it");
+        assert_eq!(path[1].link_from_previous, Some(LinkType::FS));
+    }
+
+    #[test]
+    fn the_longest_chain_wins_when_two_run_in_parallel() {
+        // Both are zero slack in their own right; only one sets the finish.
+        let mut project = Project::blank(at(2026, 1, 5));
+        project.tasks.clear();
+        let mut ids = Vec::new();
+        for (name, minutes) in [("A1", 480), ("A2", 4800), ("B1", 480)] {
+            let id = project.allocate_task_id();
+            project.tasks.push(Task::new(id, name, minutes));
+            ids.push(id);
+        }
+        project.links.push(Link {
+            predecessor: ids[0],
+            successor: ids[1],
+            kind: LinkType::FS,
+            lag_minutes: 0,
+        });
+        crate::schedule(&mut project).unwrap();
+
+        let path = critical_path(&project);
+        let names: Vec<&str> = path
+            .iter()
+            .map(|s| project.tasks[s.index].name.as_str())
+            .collect();
+        assert!(names.contains(&"A2"), "the long chain is the path");
+        assert!(!names.contains(&"B1"), "the short standalone one is not");
+    }
+
+    #[test]
+    fn a_plan_with_no_critical_tasks_has_no_path() {
+        let mut project = chain(&[480]);
+        crate::schedule(&mut project).unwrap();
+        project.tasks[0].scheduled.critical = false;
+        assert!(critical_path(&project).is_empty());
+    }
+
+    #[test]
+    fn an_acknowledged_task_drops_off_the_path() {
+        // Consistent with everywhere else: ignoring criticality demotes it.
+        let mut project = chain(&[480, 480]);
+        crate::schedule(&mut project).unwrap();
+        assert_eq!(critical_path(&project).len(), 2);
+
+        crate::issues::ignore(&mut project, 1, crate::model::IssueKind::Critical);
+        let path = critical_path(&project);
+        assert!(path.iter().all(|s| s.index != 1));
+    }
+
+    #[test]
+    fn the_path_length_is_the_sum_of_its_steps() {
+        let mut project = chain(&[480, 960]);
+        crate::schedule(&mut project).unwrap();
+        let path = critical_path(&project);
+        assert_eq!(critical_path_minutes(&project, &path), 1440);
+    }
+
+    #[test]
+    fn a_summary_row_is_never_a_step_on_the_path() {
+        // Its span is its children's, so it would put the same time on twice.
+        let mut project = chain(&[480, 480]);
+        project.tasks[0].outline_level = 0;
+        project.tasks[1].outline_level = 1;
+        crate::schedule(&mut project).unwrap();
+
+        let path = critical_path(&project);
+        assert!(path.iter().all(|step| !project.is_summary(step.index)));
+    }
+}
+
+// ------------------------------------------------------------ updating
+
+/// What an update run should do to the plan.
+///
+/// The two halves of Project's Update Project dialog. They answer different
+/// questions: the first says "assume everything went to plan up to here", the
+/// second says "nothing more happened before here, move it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Update {
+    /// Mark work complete as though the plan had been followed exactly up to
+    /// this date. A task finished before it becomes fully complete; one
+    /// straddling it becomes part complete in proportion to the working time
+    /// that has passed.
+    CompleteThrough(NaiveDateTime),
+    /// Move work that has not started to begin after this date, for when a
+    /// plan has been left alone and its early tasks are now in the past.
+    RescheduleAfter(NaiveDateTime),
+}
+
+/// Which tasks an update applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateScope {
+    EntireProject,
+    /// Only these rows, for updating one branch at a time.
+    Selected,
+}
+
+/// Apply an update, returning how many tasks it changed.
+///
+/// Summary rows are skipped throughout: their progress is their children's, so
+/// setting it directly would be overwritten by the next reschedule anyway.
+pub fn update_project(
+    project: &mut Project,
+    update: Update,
+    scope: UpdateScope,
+    selected: &[usize],
+) -> usize {
+    let calendar = project.calendar.clone();
+    let mut changed = 0;
+
+    let rows: Vec<usize> = (0..project.tasks.len())
+        .filter(|index| !project.is_summary(*index) && project.tasks[*index].active)
+        .filter(|index| match scope {
+            UpdateScope::EntireProject => true,
+            UpdateScope::Selected => selected.contains(index),
+        })
+        .collect();
+
+    for index in rows {
+        match update {
+            Update::CompleteThrough(through) => {
+                let task = &project.tasks[index];
+                let percent = if task.scheduled.finish <= through {
+                    100
+                } else if task.scheduled.start >= through {
+                    // Not started by this date, so nothing to report.
+                    continue;
+                } else {
+                    // Part done, in proportion to the working time elapsed
+                    // rather than the wall clock, so a weekend does not count
+                    // as progress.
+                    let done = calendar.work_minutes_between(task.scheduled.start, through);
+                    let total = calendar
+                        .work_minutes_between(task.scheduled.start, task.scheduled.finish)
+                        .max(1);
+                    ((done * 100 / total).clamp(0, 100)) as u8
+                };
+
+                if project.tasks[index].percent_complete != percent {
+                    project.tasks[index].percent_complete = percent;
+                    changed += 1;
+                }
+            }
+            Update::RescheduleAfter(after) => {
+                let task = &project.tasks[index];
+                // Only work that has not started. Something already under way
+                // is not moved, because its start actually happened.
+                if task.percent_complete > 0 || task.scheduled.start >= after {
+                    continue;
+                }
+                let task = &mut project.tasks[index];
+                task.constraint = ConstraintType::StartNoEarlierThan;
+                task.constraint_date = Some(after);
+                changed += 1;
+            }
+        }
+    }
+
+    changed
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use crate::model::Task;
+    use chrono::NaiveDate;
+
+    fn at(y: i32, m: u32, d: u32, h: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+    }
+
+    /// Three one-day tasks in a row from Monday.
+    fn plan() -> Project {
+        let mut project = Project::blank(at(2026, 1, 5, 8));
+        project.tasks.clear();
+        let mut previous = None;
+        for name in ["One", "Two", "Three"] {
+            let id = project.allocate_task_id();
+            project.tasks.push(Task::new(id, name, 480));
+            if let Some(from) = previous {
+                project.links.push(Link {
+                    predecessor: from,
+                    successor: id,
+                    kind: crate::model::LinkType::FS,
+                    lag_minutes: 0,
+                });
+            }
+            previous = Some(id);
+        }
+        crate::schedule(&mut project).unwrap();
+        project
+    }
+
+    #[test]
+    fn work_finished_before_the_date_is_marked_complete() {
+        let mut project = plan();
+        let changed = update_project(
+            &mut project,
+            Update::CompleteThrough(at(2026, 1, 6, 17)),
+            UpdateScope::EntireProject,
+            &[],
+        );
+        assert!(changed >= 2);
+        assert_eq!(project.tasks[0].percent_complete, 100);
+        assert_eq!(project.tasks[1].percent_complete, 100);
+    }
+
+    #[test]
+    fn work_not_yet_started_is_left_alone() {
+        let mut project = plan();
+        update_project(
+            &mut project,
+            Update::CompleteThrough(at(2026, 1, 5, 17)),
+            UpdateScope::EntireProject,
+            &[],
+        );
+        assert_eq!(project.tasks[2].percent_complete, 0, "it has not begun");
+    }
+
+    #[test]
+    fn a_task_straddling_the_date_is_part_complete() {
+        let mut project = plan();
+        project.tasks[0].duration_minutes = 960;
+        crate::schedule(&mut project).unwrap();
+
+        // Half a two day task.
+        update_project(
+            &mut project,
+            Update::CompleteThrough(at(2026, 1, 5, 17)),
+            UpdateScope::EntireProject,
+            &[],
+        );
+        let percent = project.tasks[0].percent_complete;
+        assert!((40..=60).contains(&percent), "got {percent}");
+    }
+
+    #[test]
+    fn progress_counts_working_time_not_the_wall_clock() {
+        // A weekend passing is not work getting done.
+        let mut project = Project::blank(at(2026, 1, 9, 8));
+        project.tasks.clear();
+        let id = project.allocate_task_id();
+        project.tasks.push(Task::new(id, "Over the weekend", 960));
+        crate::schedule(&mut project).unwrap();
+
+        // Friday start, measured to Monday morning: one working day has passed.
+        update_project(
+            &mut project,
+            Update::CompleteThrough(at(2026, 1, 12, 8)),
+            UpdateScope::EntireProject,
+            &[],
+        );
+        let percent = project.tasks[0].percent_complete;
+        assert!((40..=60).contains(&percent), "two days of weekend counted, got {percent}");
+    }
+
+    #[test]
+    fn rescheduling_moves_only_work_that_never_started() {
+        let mut project = plan();
+        project.tasks[0].percent_complete = 50;
+
+        let after = at(2026, 2, 2, 8);
+        update_project(
+            &mut project,
+            Update::RescheduleAfter(after),
+            UpdateScope::EntireProject,
+            &[],
+        );
+        crate::schedule(&mut project).unwrap();
+
+        assert!(
+            project.tasks[0].scheduled.start < after,
+            "work already under way is not moved"
+        );
+        assert!(project.tasks[1].scheduled.start >= after);
+    }
+
+    #[test]
+    fn an_update_can_be_limited_to_the_rows_chosen() {
+        let mut project = plan();
+        update_project(
+            &mut project,
+            Update::CompleteThrough(at(2026, 1, 8, 17)),
+            UpdateScope::Selected,
+            &[1],
+        );
+        assert_eq!(project.tasks[0].percent_complete, 0, "not selected");
+        assert_eq!(project.tasks[1].percent_complete, 100);
+    }
+
+    #[test]
+    fn summary_rows_are_left_to_their_children() {
+        let mut project = plan();
+        project.tasks[0].outline_level = 0;
+        project.tasks[1].outline_level = 1;
+        crate::schedule(&mut project).unwrap();
+
+        update_project(
+            &mut project,
+            Update::CompleteThrough(at(2026, 2, 1, 17)),
+            UpdateScope::EntireProject,
+            &[],
+        );
+        assert!(project.is_summary(0));
+        assert_eq!(
+            project.tasks[0].percent_complete, 0,
+            "setting it directly would be overwritten by the next reschedule"
+        );
     }
 }

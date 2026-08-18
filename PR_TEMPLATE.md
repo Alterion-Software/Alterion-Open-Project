@@ -3,8 +3,8 @@
 **Branch:** `your-branch` → `main`
 **Date:** DD Month YYYY
 **Author:** Your Name / GitHub handle
-**Reviewer:** <!-- leave blank — assigned by maintainers -->
-**Issue:** [#000](https://link-to-issue) <!-- required — open an issue first if one doesn't exist -->
+**Reviewer:** <!-- leave blank, assigned by maintainers -->
+**Issue:** [#000](https://link-to-issue) <!-- required: open an issue first if one doesn't exist -->
 **Labels:** `bug` `enhancement` `security` `docs` `refactor`
 
 ---
@@ -12,7 +12,7 @@
 ## Summary
 
 <!-- 2–4 sentences. What does this PR do and why? What problem does it solve or what value does it add?
-     "Updated README" or "fixed typo" are not valid summaries — if that's all this PR does, it should not be a PR. -->
+     "Updated README" or "fixed typo" are not valid summaries. If that is all this PR does, it should not be a PR. -->
 
 ---
 
@@ -93,7 +93,7 @@
 ## Checklist
 
 - [ ] I have read the [CONTRIBUTING.md](CONTRIBUTING.md) in full
-- [ ] This PR solves a real, stated problem — not a cosmetic or self-promotional change
+- [ ] This PR solves a real, stated problem, not a cosmetic or self-promotional change
 - [ ] Every line of code submitted is code I understand and can explain
 - [ ] No AI-generated code has been submitted without being fully read, understood, and verified
 - [ ] `cargo check`, `cargo test`, and `cargo clippy` all pass with no new warnings

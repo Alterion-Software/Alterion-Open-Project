@@ -42,7 +42,7 @@ cargo build --release --target "$target" --package aop-app
 step "Staging"
 rm -rf "$staging"
 mkdir -p "$staging" "$dist"
-cp "$root/target/$target/release/aop-app.exe" "$staging/alterion-open-project.exe"
+cp "$root/target/$target/release/alterion-open-project.exe" "$staging/alterion-open-project.exe"
 cp "$root/LICENSE" "$staging/LICENSE.txt"
 cp "$root/README.md" "$staging/README.md"
 cp "$here/installer.nsi" "$staging/installer.nsi"

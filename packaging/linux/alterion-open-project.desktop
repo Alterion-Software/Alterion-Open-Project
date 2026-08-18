@@ -10,4 +10,4 @@ Categories=Office;ProjectManagement;
 MimeType=application/x-alterion-project;
 Keywords=project;gantt;schedule;plan;critical path;
 StartupNotify=true
-StartupWMClass=aop-app
+StartupWMClass=alterion-open-project

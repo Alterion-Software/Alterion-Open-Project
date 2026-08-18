@@ -5,6 +5,7 @@ mod backstage;
 mod brand;
 mod contextmenu;
 mod controls;
+mod dictionary;
 mod dialogs;
 mod gantt;
 mod grid;
@@ -12,6 +13,7 @@ mod keymap;
 mod icons;
 mod popups;
 mod preview;
+mod spooler;
 mod settings;
 mod ribbon;
 mod recovery;
@@ -48,7 +50,14 @@ fn steady_rendering() {
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
         && std::env::var_os("WAYLAND_DISPLAY").is_some()
     {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        // Setting an environment variable is unsound once other threads are
+        // running, because a reader can be part way through the environment
+        // while it is rewritten. This is the first statement of `main`: nothing
+        // has been spawned yet, and the webview that reads it is not built
+        // until later in this same function.
+        unsafe {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
     }
 }
 
@@ -99,6 +108,28 @@ fn main() {
 #[cfg(all(feature = "native", not(feature = "desktop")))]
 fn main() {
     dioxus_native::launch(App);
+}
+
+/// The stylesheet, in a component of its own so it is written once.
+///
+/// It takes no props, so it never re-renders. Left inside `App` it would be
+/// diffed on every state write, and re-setting a two thousand line stylesheet
+/// is the kind of thing an engine can answer with a repaint of everything.
+#[component]
+fn Stylesheet() -> Element {
+    rsx! { style { dangerous_inner_html: theme::CSS } }
+}
+
+/// The palette overlay, which changes only when the theme does.
+///
+/// Separated for the same reason as `Stylesheet`: as a component it is diffed
+/// against its props, so typing in a cell cannot touch it.
+#[component]
+fn Palette(css: String) -> Element {
+    if css.is_empty() {
+        return rsx! {};
+    }
+    rsx! { style { dangerous_inner_html: "{css}" } }
 }
 
 /// The start-up screen: the mark on the left, a little chart art on the right.
@@ -179,6 +210,11 @@ fn App() -> Element {
     use_context_provider(|| Signal::new(crate::state::from_command_line()));
     let mut state = use_context::<Signal<AppState>>();
 
+    // The window size is kept apart from the plan. It changes for reasons that
+    // have nothing to do with the document, and anything sharing a signal with
+    // it would be re-rendered every time the window moved a pixel.
+    let mut viewport = use_context_provider(|| Signal::new(crate::state::Viewport::default()));
+
     // Snapshot the plan on a timer so that a crash, a kill, or a power cut
     // costs at most one interval of work rather than everything since the last
     // save. Nothing is written while the plan matches its file.
@@ -211,7 +247,7 @@ fn App() -> Element {
     });
 
     let splash = state.read().splash;
-    let (backstage, dialog, show_timeline, view, error, menu, editing) = {
+    let (backstage, dialog, show_timeline, view, error, menu, editing, spelling_open) = {
         let s = state.read();
         (
             s.backstage,
@@ -221,6 +257,7 @@ fn App() -> Element {
             s.schedule_error(),
             s.context_menu,
             s.editing,
+            s.spelling_open,
         )
     };
 
@@ -230,10 +267,8 @@ fn App() -> Element {
     let palette = state.read().theme.overlay();
 
     rsx! {
-        style { dangerous_inner_html: theme::CSS }
-        if !palette.is_empty() {
-            style { dangerous_inner_html: "{palette}" }
-        }
+        Stylesheet {}
+        Palette { css: palette }
 
         div {
             class: "app",
@@ -241,9 +276,15 @@ fn App() -> Element {
             onkeydown: move |event| handle_shortcut(&mut state, event),
             onresize: move |event| {
                 if let Ok(size) = event.get_content_box_size() {
-                    let seen = (size.width, size.height);
-                    if state.read().viewport != seen {
-                        state.write().viewport = seen;
+                    let (was_w, was_h) = viewport();
+                    // Two guards, and both are needed. The size is reported as
+                    // a float, so an unchanged window can still differ in the
+                    // last decimal place and would otherwise be written on
+                    // every event. And writing re-renders, which reflows, which
+                    // fires this again: without a threshold the two feed each
+                    // other and the interface flickers continuously.
+                    if (size.width - was_w).abs() >= 2.0 || (size.height - was_h).abs() >= 2.0 {
+                        viewport.set((size.width, size.height));
                     }
                 }
             },
@@ -295,6 +336,10 @@ fn App() -> Element {
             }
         }
 
+        if spelling_open {
+            views::SpellingPanel {}
+        }
+
         if let Some(menu) = menu {
             contextmenu::ContextMenuHost { menu }
         }
@@ -335,6 +380,27 @@ fn SyncPaneScroll() -> Element {
 
               link(grid, chart);
               link(chart, grid);
+
+              // A plan is a long list, and one wheel notch moving three rows
+              // makes getting down it feel like work. The panes are linked
+              // above, so boosting either one carries the other with it.
+              const SPEED = 1.8;
+              const boost = (pane) => pane.addEventListener('wheel', (event) => {
+                // Leave zoom and sideways scrolling alone: those are other
+                // gestures that happen to arrive on the same event.
+                if (event.ctrlKey || event.shiftKey) return;
+                if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+                // deltaMode counts lines (1) or pages (2) rather than pixels
+                // on some devices, so it is converted before being scaled.
+                const unit = event.deltaMode === 1
+                  ? 16
+                  : event.deltaMode === 2 ? pane.clientHeight : 1;
+                event.preventDefault();
+                pane.scrollTop += event.deltaY * unit * SPEED;
+              }, { passive: false });
+
+              boost(grid);
+              boost(chart);
             })();
             "#,
         );
@@ -537,6 +603,10 @@ fn Workspace(view: ViewKind) -> Element {
                         ViewKind::TaskUsage => rsx! { views::TaskUsage {} },
                         ViewKind::NetworkDiagram => rsx! { views::NetworkDiagram {} },
                         ViewKind::CalendarView => rsx! { views::CalendarView {} },
+                        ViewKind::Burndown
+                        | ViewKind::Burnup
+                        | ViewKind::Velocity
+                        | ViewKind::CriticalPath => rsx! { views::ReportPage { kind: view } },
                         ViewKind::TeamPlanner => rsx! {
                             div { class: "split", views::TeamPlanner {} }
                         },
@@ -568,9 +638,9 @@ fn StatusBar() -> Element {
             report.overallocations.len(),
         ),
         Err(_) => (
-            "\u{2014}".into(),
-            "\u{2014}".into(),
-            "\u{2014}".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
             0,
             0,
         ),
@@ -579,7 +649,7 @@ fn StatusBar() -> Element {
         .report
         .as_ref()
         .map(|r| format_duration(r.duration_minutes))
-        .unwrap_or_else(|_| "\u{2014}".into());
+        .unwrap_or_else(|_| "-".into());
 
     rsx! {
         div { class: "statusbar",
@@ -730,11 +800,10 @@ fn run_action(state: &mut Signal<AppState>, action: keymap::Action) {
         Action::SelectDown => {
             let next = state.read().primary().map(|row| row + 1);
             let limit = state.read().project.tasks.len();
-            if let Some(row) = next {
-                if row < limit {
+            if let Some(row) = next
+                && row < limit {
                     state.write().select(row);
                 }
-            }
         }
         Action::SelectUp => {
             let previous = state.read().primary().and_then(|row| row.checked_sub(1));

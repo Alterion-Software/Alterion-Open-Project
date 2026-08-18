@@ -1,0 +1,10 @@
+[package]
+name = "aop-procname"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A preload shim, so it has to be a shared object rather than an rlib.
+[lib]
+name = "aop_procname"
+crate-type = ["cdylib"]

@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use aop_core::grouping::GroupRow;
 use aop_core::{
     persist, schedule, templates, ConstraintType, Field, Link, LinkType, Project, ResourceId,
     ScheduleReport, Task, TaskId, TaskMode, WorkCalendar,
@@ -59,6 +60,13 @@ pub enum ViewKind {
     ResourceSheet,
     ResourceUsage,
     TeamPlanner,
+    /// Each report stands on its own rather than sharing one page: a report is
+    /// figures, a chart and the rows behind it, and four of those crammed
+    /// together is a dashboard, which is a different thing.
+    Burndown,
+    Burnup,
+    Velocity,
+    CriticalPath,
 }
 
 impl ViewKind {
@@ -73,6 +81,10 @@ impl ViewKind {
             ViewKind::ResourceSheet => "Resource Sheet",
             ViewKind::ResourceUsage => "Resource Usage",
             ViewKind::TeamPlanner => "Team Planner",
+            ViewKind::Burndown => "Burndown",
+            ViewKind::Burnup => "Burnup",
+            ViewKind::Velocity => "Velocity",
+            ViewKind::CriticalPath => "Critical Path",
         }
     }
 
@@ -88,6 +100,10 @@ impl ViewKind {
             ViewKind::ResourceSheet => "Resource Sheet Tools",
             ViewKind::ResourceUsage => "Resource Usage Tools",
             ViewKind::TeamPlanner => "Team Planner Tools",
+            ViewKind::Burndown
+            | ViewKind::Burnup
+            | ViewKind::Velocity
+            | ViewKind::CriticalPath => "Report Tools",
         }
     }
 
@@ -143,6 +159,14 @@ impl BackstagePage {
         }
     }
 }
+
+/// The window's inner size, so a floating panel can tell how much room it has
+/// before an edge. Nothing in a click event says where the screen edges are.
+///
+/// Held in a signal of its own rather than on the plan: it changes for reasons
+/// that have nothing to do with the document, and sharing a signal would mean
+/// every window resize re-rendered the whole application.
+pub type Viewport = (f64, f64);
 
 /// Where a dragged row will land relative to the row under the pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,6 +457,21 @@ impl ContextMenu {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Dialog {
     TaskInformation(usize),
+    /// How levelling should behave before it runs.
+    LevelingOptions,
+    /// Pick another plan to bring in under a summary row.
+    InsertSubproject,
+    /// Everything in this plan that reaches outside it.
+    LinksBetweenProjects,
+    /// Move progress or remaining work relative to a status date.
+    UpdateProject,
+    /// The look each category of row gets.
+    TextStyles,
+    /// How bars and links are drawn in the chart.
+    Layout,
+    /// Everything about one person, in the same shape Project puts it.
+    /// The tab says which page opens first, so Notes can go straight there.
+    ResourceInformation { row: usize, tab: usize },
     /// Preview of a starter template before creating it.
     TemplatePreview(String),
     ProjectInformation,
@@ -442,6 +481,10 @@ pub enum Dialog {
     BarStyles,
     /// Offers a repair for a plan that will not schedule.
     FixIssue,
+    /// Set up the plan's spare fields: rename, lookup list, rollup, indicators.
+    CustomFields,
+    /// Things outside the plan that work waits on.
+    ExternalDependencies,
     /// Asks what to do about unsaved work before something discards it.
     UnsavedChanges(PendingAction),
     /// Offers back work left behind by a session that never finished.
@@ -552,7 +595,25 @@ pub struct AppState {
 
     pub selection: Vec<usize>,
     pub selected_resource: Option<usize>,
+    /// How levelling should behave, kept between runs like Project keeps it.
+    pub leveling: aop_core::leveling::LevelingOptions,
     pub editing: Option<(usize, Column)>,
+    /// The column the cursor last sat in. Fill Down works down a column, so it
+    /// has to know which one without the grid holding a full cell cursor.
+    pub fill_field: Option<Field>,
+    /// How the rows are banded, when the planner has asked for that.
+    pub group_by: Option<aop_core::grouping::GroupBy>,
+    /// The look each category of row gets, before any row's own formatting.
+    pub text_styles: aop_core::textstyle::TextStyles,
+    /// A look lifted off one row, waiting to be brushed onto others.
+    pub painter: Option<aop_core::textstyle::Painter>,
+    /// Which rules are drawn behind the rows, and how bars are laid out.
+    pub grid_rows: bool,
+    pub grid_columns: bool,
+    pub grid_status_date: bool,
+    pub round_bars: bool,
+    pub show_links: bool,
+    pub bar_text: bool,
     /// What to carry out once a Save As has finished, when the save was asked
     /// for in order to get past unsaved work.
     pub after_save: Option<PendingAction>,
@@ -560,10 +621,6 @@ pub struct AppState {
     pub quit_requested: bool,
     /// Screen position to anchor a cell popup at.
     pub popup_at: (f64, f64),
-    /// The window's inner size, so a floating panel can tell how much room it
-    /// has before an edge. Without it a menu opened near the bottom simply runs
-    /// off the screen, since nothing in a click event says where the edges are.
-    pub viewport: (f64, f64),
     /// Which cell of the selected resource row is being edited, if any.
     pub editing_resource_field: Option<String>,
 
@@ -589,6 +646,17 @@ pub struct AppState {
     pub show_timeline: bool,
     pub show_outline_number: bool,
     pub show_critical: bool,
+    /// Words told to be left alone for this plan.
+    pub ignored_words: std::collections::HashSet<String>,
+    /// Whether the spelling panel is open beside the plan.
+    ///
+    /// A panel rather than a view: correcting a word means seeing the row it is
+    /// in, and a full-screen list of mistakes takes away the thing being
+    /// corrected.
+    pub spelling_open: bool,
+    /// How long an iteration runs, for the burn charts and velocity. A team's
+    /// cadence is not something to guess at, so it is settable.
+    pub iteration_days: i64,
     /// Which palette to paint, or to follow the desktop.
     pub theme: crate::theme::ThemeChoice,
     /// Which key press runs which command.
@@ -632,11 +700,21 @@ impl AppState {
             dirty: false,
             selection: Vec::new(),
             selected_resource: None,
+            fill_field: None,
+            group_by: None,
+            text_styles: aop_core::textstyle::TextStyles::new(),
+            painter: None,
+            grid_rows: true,
+            grid_columns: true,
+            grid_status_date: true,
+            round_bars: false,
+            show_links: true,
+            bar_text: true,
+            leveling: aop_core::leveling::LevelingOptions::default(),
             editing: None,
             after_save: None,
             quit_requested: false,
             popup_at: (0.0, 0.0),
-            viewport: (1560.0, 980.0),
             editing_resource_field: None,
             tab: RibbonTab::Task,
             view: ViewKind::GanttChart,
@@ -655,6 +733,9 @@ impl AppState {
             show_timeline: true,
             show_outline_number: false,
             show_critical: false,
+            ignored_words: std::collections::HashSet::new(),
+            spelling_open: false,
+            iteration_days: aop_core::agile::DEFAULT_ITERATION_DAYS,
             theme: crate::theme::ThemeChoice::default(),
             keys: crate::keymap::Keymap::default(),
             show_slack: false,
@@ -879,6 +960,41 @@ impl AppState {
         }
     }
 
+    /// Read a plan out of a workbook.
+    pub fn import_excel(&mut self, path: PathBuf) {
+        match aop_core::excel::open(&path) {
+            Ok(project) => {
+                self.project = project;
+                // A workbook is not a plan file, so it has nowhere to save back
+                // to: Save As has to be chosen deliberately.
+                self.file_path = None;
+                self.dirty = true;
+                self.undo.clear();
+                self.redo.clear();
+                self.selection = if self.project.tasks.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![0]
+                };
+                self.push_recent(&path);
+                self.backstage = None;
+                self.reschedule();
+                let tasks = self.project.tasks.len();
+                self.status = format!(
+                    "Imported {tasks} tasks from {}. Save As to keep it as a .{} file.",
+                    path.display(),
+                    persist::FILE_EXTENSION
+                );
+            }
+            Err(error) => {
+                self.dialog = Some(Dialog::Message {
+                    title: "Could not import".into(),
+                    body: error.to_string(),
+                })
+            }
+        }
+    }
+
     /// Import a Microsoft Project XML (MSPDI) plan.
     pub fn import_path(&mut self, path: PathBuf) {
         match aop_core::mspdi::open(&path) {
@@ -932,6 +1048,12 @@ impl AppState {
         self.show_timeline = settings.show_timeline;
         self.show_outline_number = settings.show_outline_number;
         self.show_critical = settings.show_critical;
+        self.grid_rows = settings.grid_rows;
+        self.grid_columns = settings.grid_columns;
+        self.grid_status_date = settings.grid_status_date;
+        self.round_bars = settings.round_bars;
+        self.show_links = settings.show_links;
+        self.bar_text = settings.bar_text;
         self.keys = settings.keys;
     }
 
@@ -946,8 +1068,170 @@ impl AppState {
             show_timeline: self.show_timeline,
             show_outline_number: self.show_outline_number,
             show_critical: self.show_critical,
+            grid_rows: self.grid_rows,
+            grid_columns: self.grid_columns,
+            grid_status_date: self.grid_status_date,
+            round_bars: self.round_bars,
+            show_links: self.show_links,
+            bar_text: self.bar_text,
             keys: self.keys.clone(),
         }
+    }
+
+    /// Put a correction into the plan.
+    pub fn correct_spelling(&mut self, place: aop_core::spelling::Place, from: &str, to: &str) {
+        use aop_core::spelling::{replace_word, Place};
+        self.checkpoint();
+        match place {
+            Place::ProjectName => {
+                self.project.name = replace_word(&self.project.name, from, to);
+            }
+            Place::TaskName(row) => {
+                if let Some(task) = self.project.tasks.get_mut(row) {
+                    task.name = replace_word(&task.name, from, to);
+                }
+            }
+            Place::TaskNotes(row) => {
+                if let Some(task) = self.project.tasks.get_mut(row) {
+                    task.notes = replace_word(&task.notes, from, to);
+                }
+            }
+            Place::ResourceName(index) => {
+                if let Some(resource) = self.project.resources.get_mut(index) {
+                    resource.name = replace_word(&resource.name, from, to);
+                }
+            }
+        }
+        self.dirty = true;
+        self.status = format!("Changed \"{from}\" to \"{to}\"");
+    }
+
+    /// Leave a word alone for this plan.
+    pub fn ignore_word(&mut self, word: &str) {
+        self.ignored_words.insert(word.trim().to_lowercase());
+        self.status = format!("Ignoring \"{word}\"");
+    }
+
+    /// Colour the selected rows, or clear the colour when given nothing.
+    ///
+    /// Held on the task rather than in a view setting, so a recoloured plan
+    /// still looks the same when it is sent to somebody else.
+    pub fn set_row_colour(&mut self, text: Option<&str>, fill: Option<&str>) {
+        self.checkpoint();
+        for row in self.selection.clone() {
+            if let Some(task) = self.project.tasks.get_mut(row) {
+                if let Some(colour) = text {
+                    task.text_colour = colour.trim().to_string();
+                }
+                if let Some(colour) = fill {
+                    task.fill_colour = colour.trim().to_string();
+                }
+            }
+        }
+        self.dirty = true;
+        self.status = "Row colour changed".into();
+    }
+
+    /// What the last selected row is coloured, for showing on the button.
+    pub fn current_row_colours(&self) -> (String, String) {
+        self.primary()
+            .and_then(|row| self.project.tasks.get(row))
+            .map(|task| (task.text_colour.clone(), task.fill_colour.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Record something outside the plan that work can wait on.
+    pub fn add_external(&mut self, reference: &str, label: &str, available: NaiveDateTime) -> u32 {
+        self.checkpoint();
+        let id = self.project.allocate_external_id();
+        self.project.external.push(aop_core::model::ExternalDependency {
+            id,
+            reference: reference.trim().to_string(),
+            label: label.trim().to_string(),
+            source: String::new(),
+            available,
+            notes: String::new(),
+        });
+        self.dirty = true;
+        self.reschedule();
+        id
+    }
+
+    /// Change one, and reschedule, since its date moves work.
+    pub fn update_external(&mut self, id: u32, apply: impl FnOnce(&mut aop_core::model::ExternalDependency)) {
+        self.checkpoint();
+        if let Some(entry) = self.project.external.iter_mut().find(|e| e.id == id) {
+            apply(entry);
+        }
+        self.dirty = true;
+        self.reschedule();
+    }
+
+    /// Remove one, and unhook every task that was waiting on it.
+    ///
+    /// Leaving the references behind would be harmless to the scheduler, which
+    /// ignores unknown ids, but it would mean a task quietly waiting on nothing.
+    pub fn remove_external(&mut self, id: u32) {
+        self.checkpoint();
+        self.project.external.retain(|entry| entry.id != id);
+        for task in &mut self.project.tasks {
+            task.external_predecessors.retain(|held| *held != id);
+        }
+        self.dirty = true;
+        self.reschedule();
+    }
+
+    /// Make a task wait on something, or stop it waiting.
+    pub fn toggle_external_on(&mut self, row: usize, id: u32) {
+        self.checkpoint();
+        if let Some(task) = self.project.tasks.get_mut(row) {
+            if task.external_predecessors.contains(&id) {
+                task.external_predecessors.retain(|held| *held != id);
+            } else {
+                task.external_predecessors.push(id);
+            }
+        }
+        self.dirty = true;
+        self.reschedule();
+    }
+
+    /// Make the change a flagged issue asked for.
+    pub fn fix_issue(&mut self, row: usize, fix: aop_core::issues::TaskFix) {
+        self.checkpoint();
+        if aop_core::issues::apply_fix(&mut self.project, row, fix) {
+            self.dirty = true;
+            self.reschedule();
+            self.status = format!("{} on row {}", fix.label(), row + 1);
+        }
+    }
+
+    /// Stop flagging one sort of issue on one task.
+    ///
+    /// Dismissing lives on the task and is saved with the plan: a warning that
+    /// came back on reopening would make dismissing it pointless.
+    pub fn ignore_issue(&mut self, row: usize, kind: aop_core::model::IssueKind) {
+        self.checkpoint();
+        aop_core::issues::ignore(&mut self.project, row, kind);
+        self.dirty = true;
+        self.status = "Warning dismissed for this task".into();
+    }
+
+    /// Show one dismissed warning again.
+    pub fn restore_issue(&mut self, row: usize, kind: aop_core::model::IssueKind) {
+        self.checkpoint();
+        if let Some(task) = self.project.tasks.get_mut(row) {
+            task.ignored_issues.retain(|held| *held != kind);
+        }
+        self.dirty = true;
+        self.status = "Warning shown again".into();
+    }
+
+    /// Show every warning on a task again.
+    pub fn restore_issues(&mut self, row: usize) {
+        self.checkpoint();
+        aop_core::issues::stop_ignoring(&mut self.project, row);
+        self.dirty = true;
+        self.status = "Warnings restored for this task".into();
     }
 
     /// Write a snapshot of the plan, so a crash cannot lose it.
@@ -1054,7 +1338,9 @@ impl AppState {
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
-        if persist::IMPORTED_EXTENSIONS.contains(&extension.as_str()) {
+        if matches!(extension.as_str(), "xlsx" | "xlsm" | "xls" | "ods") {
+            self.import_excel(path);
+        } else if persist::IMPORTED_EXTENSIONS.contains(&extension.as_str()) {
             self.import_path(path);
         } else {
             self.open_path(path);
@@ -1121,6 +1407,22 @@ impl AppState {
         save_recent(&self.recent);
     }
 
+    /// Write the plan as a workbook.
+    pub fn export_excel_to(&mut self, path: PathBuf) {
+        match aop_core::excel::save(&path, &self.project) {
+            Ok(()) => {
+                self.status = format!("Exported {}", path.display());
+                self.backstage_message = Some(format!("Exported {}", path.display()));
+            }
+            Err(error) => {
+                self.dialog = Some(Dialog::Message {
+                    title: "Could not export".into(),
+                    body: error.to_string(),
+                })
+            }
+        }
+    }
+
     pub fn export_csv_to(&mut self, path: PathBuf) {
         let path = path.with_extension("csv");
         self.write_export(path, persist::to_csv(&self.project));
@@ -1134,8 +1436,8 @@ impl AppState {
 
     /// Shared file write that reports back on the page rather than closing it.
     fn write_export(&mut self, path: PathBuf, contents: String) {
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent) {
                 self.backstage_message = None;
                 self.dialog = Some(Dialog::Message {
                     title: "Could not export".into(),
@@ -1143,7 +1445,6 @@ impl AppState {
                 });
                 return;
             }
-        }
         match std::fs::write(&path, contents) {
             Ok(()) => {
                 let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -1530,12 +1831,11 @@ impl AppState {
                 }
             }
             Column::Duration => {
-                if let Some((minutes, estimated)) = aop_core::parse_duration(&value) {
-                    if let Some(task) = self.project.tasks.get_mut(row) {
+                if let Some((minutes, estimated)) = aop_core::parse_duration(&value)
+                    && let Some(task) = self.project.tasks.get_mut(row) {
                         task.duration_minutes = minutes;
                         task.estimated = estimated;
                     }
-                }
             }
             Column::Start => {
                 if let Some(date) = parse_date(&value) {
@@ -1586,15 +1886,14 @@ impl AppState {
         self.reschedule();
 
         // A link edit is the one cell that can create a loop; roll it back.
-        if column == Column::Predecessors {
-            if let Some(error) = self.schedule_error() {
+        if column == Column::Predecessors
+            && let Some(error) = self.schedule_error() {
                 self.undo();
                 self.dialog = Some(Dialog::Message {
                     title: "Cannot create this link".into(),
                     body: error,
                 });
             }
-        }
     }
 
     /// Add or replace the link from `predecessor` into the task on `row`.
@@ -1725,6 +2024,73 @@ impl AppState {
             }
         }
         self.reschedule();
+    }
+
+    /// Find a resource by the name shown on screen.
+    ///
+    /// Kept alongside `set_assignment` because naming a person is how a script
+    /// or an import refers to them; the pickers work by id.
+    #[allow(dead_code)]
+    ///
+    /// Names are matched trimmed and without regard to case, the same rule
+    /// `set_resource_text` uses, so the two ways of naming a person agree.
+    fn resource_id_by_name(&self, name: &str) -> Option<aop_core::ResourceId> {
+        let wanted = name.trim().to_lowercase();
+        self.project
+            .resources
+            .iter()
+            .find(|r| r.name.trim().to_lowercase() == wanted)
+            .map(|r| r.id)
+    }
+
+    /// Book a named person onto a task, or change how much of them is booked.
+    #[allow(dead_code)]
+    pub fn assign_resource_by_name(&mut self, row: usize, name: &str, units: f64) {
+        let Some(resource) = self.resource_id_by_name(name) else {
+            self.note(format!("There is no resource called {name}."));
+            return;
+        };
+        self.checkpoint();
+        if let Some(task) = self.project.tasks.get_mut(row) {
+            match task.assignments.iter_mut().find(|a| a.resource == resource) {
+                Some(existing) => existing.units = units,
+                None => task
+                    .assignments
+                    .push(aop_core::Assignment { resource, units }),
+            }
+        }
+        self.reschedule();
+        self.dirty = true;
+    }
+
+    /// Change how much of a person a task books, leaving the booking in place.
+    #[allow(dead_code)]
+    pub fn set_assignment_units(&mut self, row: usize, name: &str, units: f64) {
+        let Some(resource) = self.resource_id_by_name(name) else {
+            return;
+        };
+        self.checkpoint();
+        if let Some(task) = self.project.tasks.get_mut(row)
+            && let Some(existing) = task.assignments.iter_mut().find(|a| a.resource == resource)
+        {
+            existing.units = units;
+        }
+        self.reschedule();
+        self.dirty = true;
+    }
+
+    /// Take a person off a task.
+    #[allow(dead_code)]
+    pub fn unassign_resource(&mut self, row: usize, name: &str) {
+        let Some(resource) = self.resource_id_by_name(name) else {
+            return;
+        };
+        self.checkpoint();
+        if let Some(task) = self.project.tasks.get_mut(row) {
+            task.assignments.retain(|a| a.resource != resource);
+        }
+        self.reschedule();
+        self.dirty = true;
     }
 
     // ---- project commands -----------------------------------------------
@@ -1979,6 +2345,63 @@ impl AppState {
             .collect()
     }
 
+    /// Every row the two panes should draw, bands included.
+    ///
+    /// The grid and the Gantt both read this one list, so a band can never
+    /// push one pane out of step with the other.
+    pub fn layout_rows(&self) -> Vec<GroupRow> {
+        let Some(spec) = &self.group_by else {
+            return self.visible_rows().into_iter().map(GroupRow::Task).collect();
+        };
+
+        let grouped = aop_core::grouping::group(&self.project, spec);
+        if self.filter == TaskFilter::All {
+            return grouped;
+        }
+
+        // Grouping runs over the whole plan, so a filter has to be applied
+        // afterwards, and the band totals rebuilt from what actually survived.
+        let kept: std::collections::HashSet<usize> = self.visible_rows().into_iter().collect();
+        let mut out: Vec<GroupRow> = Vec::with_capacity(grouped.len());
+        for row in grouped {
+            match row {
+                GroupRow::Task(index) if kept.contains(&index) => out.push(GroupRow::Task(index)),
+                GroupRow::Task(_) => {}
+                band @ GroupRow::Band { .. } => {
+                    // Drop the band above it if nothing came through.
+                    while matches!(out.last(), Some(GroupRow::Band { .. })) {
+                        out.pop();
+                    }
+                    out.push(band);
+                }
+            }
+        }
+        while matches!(out.last(), Some(GroupRow::Band { .. })) {
+            out.pop();
+        }
+        restate_bands(&self.project, &mut out);
+        out
+    }
+
+    pub fn set_group_by(&mut self, key: &str) {
+        self.group_by = match key {
+            "duration" => Some(Field::Duration),
+            "critical" => Some(Field::Critical),
+            "milestone" => Some(Field::Milestone),
+            "resources" => Some(Field::ResourceNames),
+            "start" => Some(Field::Start),
+            "finish" => Some(Field::Finish),
+            "complete" => Some(Field::PercentComplete),
+            _ => None,
+        }
+        .map(aop_core::grouping::GroupBy::new);
+        self.selection.clear();
+        self.status = match &self.group_by {
+            Some(spec) => format!("Grouped by {}", spec.field.label()),
+            None => "No group".to_string(),
+        };
+    }
+
     pub fn set_filter(&mut self, key: &str) {
         self.filter = match key {
             "critical" => TaskFilter::Critical,
@@ -2057,11 +2480,10 @@ impl AppState {
     }
 
     pub fn set_bar_hover(&mut self, row: usize) {
-        if let Some(drag) = &mut self.bar_drag {
-            if drag.kind == BarDragKind::Link {
+        if let Some(drag) = &mut self.bar_drag
+            && drag.kind == BarDragKind::Link {
                 drag.hover_row = Some(row);
             }
-        }
     }
 
     pub fn cancel_bar_drag(&mut self) {
@@ -2187,6 +2609,266 @@ impl AppState {
         self.status = message.into();
     }
 
+    /// Push overbooked work later until nobody is asked for more hours than
+    /// they have. The scope decides how much of the plan is fair game.
+    pub fn level(&mut self, scope: aop_core::leveling::LevelScope) {
+        self.checkpoint();
+        let options = aop_core::leveling::LevelingOptions {
+            scope,
+            ..self.leveling.clone()
+        };
+        let result = aop_core::leveling::level(&mut self.project, &options);
+        self.reschedule();
+        self.dirty = true;
+
+        self.status = if result.delayed.is_empty() {
+            if result.remaining == 0 {
+                "Nothing to level. Nobody is overbooked.".to_string()
+            } else {
+                // Worth saying plainly: silence here reads as a broken button.
+                format!(
+                    "Could not level {} overallocation{} without breaking the schedule.",
+                    result.remaining,
+                    if result.remaining == 1 { "" } else { "s" }
+                )
+            }
+        } else {
+            let moved = result.delayed.len();
+            let mut message = format!(
+                "Levelled {moved} task{}, clearing {} overallocation{}.",
+                if moved == 1 { "" } else { "s" },
+                result.resolved,
+                if result.resolved == 1 { "" } else { "s" }
+            );
+            if result.remaining > 0 {
+                message.push_str(&format!(" {} still overbooked.", result.remaining));
+            }
+            message
+        };
+    }
+
+    /// Copy the top selected row's value down the rest of the selection.
+    pub fn fill_down(&mut self) {
+        let Some(field) = self.fill_field else {
+            self.note("Click a cell first so Fill Down knows which column to fill.");
+            return;
+        };
+        if !aop_core::grouping::is_fillable(field) {
+            self.note(format!("{} cannot be filled down.", field.label()));
+            return;
+        }
+        let mut rows = self.selection.clone();
+        if rows.len() < 2 {
+            self.note("Select the cell to copy and the rows to copy it into.");
+            return;
+        }
+        rows.sort_unstable();
+
+        self.checkpoint();
+        let filled = aop_core::grouping::fill_down(&mut self.project, field, &rows);
+        if filled == 0 {
+            self.undo();
+            self.note("Nothing to fill. Those rows already match.");
+            return;
+        }
+        self.reschedule();
+        self.dirty = true;
+        self.note(format!(
+            "Filled {} down {filled} row{}.",
+            field.label(),
+            if filled == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Bring another plan in as a summary row and its children.
+    ///
+    /// A snapshot, not a live link: the rows become part of this plan, so
+    /// saving here never writes to somebody else's file.
+    pub fn insert_subproject(&mut self, path: PathBuf) {
+        let at = self.selection.first().copied().unwrap_or(self.project.tasks.len());
+        self.checkpoint();
+        match aop_core::subproject::insert(&mut self.project, &path, at) {
+            Ok(inserted) => {
+                self.reschedule();
+                self.dirty = true;
+                self.selection = vec![inserted.summary_row];
+                self.dialog = None;
+                self.status = format!(
+                    "Inserted {} task{} and {} link{} from {}.",
+                    inserted.task_count,
+                    if inserted.task_count == 1 { "" } else { "s" },
+                    inserted.link_count,
+                    if inserted.link_count == 1 { "" } else { "s" },
+                    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                self.undo();
+                self.dialog = Some(Dialog::Message {
+                    title: "Insert Subproject".to_string(),
+                    body: error.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Turn one of the gridline rules on or off, and remember it.
+    pub fn toggle_gridline(&mut self, which: &str) {
+        let on = match which {
+            "rows" => {
+                self.grid_rows = !self.grid_rows;
+                self.grid_rows
+            }
+            "columns" => {
+                self.grid_columns = !self.grid_columns;
+                self.grid_columns
+            }
+            "status" => {
+                self.grid_status_date = !self.grid_status_date;
+                self.grid_status_date
+            }
+            _ => return,
+        };
+        self.settings().save();
+        self.note(format!(
+            "{} gridlines {}.",
+            match which {
+                "rows" => "Row",
+                "columns" => "Column",
+                _ => "Status date",
+            },
+            if on { "shown" } else { "hidden" }
+        ));
+    }
+
+    /// Roll progress forward, or push what has not happened yet past a date.
+    pub fn update_project(&mut self, options: aop_core::update::UpdateOptions) {
+        self.checkpoint();
+        match aop_core::update::update_project(&mut self.project, &options) {
+            Ok(summary) => {
+                if summary.changed() == 0 {
+                    // Nothing moved, so the checkpoint would be an empty step
+                    // in the undo history.
+                    self.undo();
+                }
+                self.dirty = summary.changed() > 0;
+                self.dialog = None;
+                self.status = summary.describe();
+                self.reschedule();
+            }
+            Err(error) => {
+                self.undo();
+                self.dialog = Some(Dialog::Message {
+                    title: "Update Project".to_string(),
+                    body: error.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Turn bold, italic or underline on or off across the selection.
+    pub fn toggle_emphasis(&mut self, mark: aop_core::textstyle::Emphasis) {
+        if self.selection.is_empty() {
+            self.note("Select the rows to format first.");
+            return;
+        }
+        let rows = self.selection.clone();
+        self.checkpoint();
+        let on = aop_core::textstyle::toggle_emphasis(&mut self.project, &rows, mark);
+        self.dirty = true;
+        let name = match mark {
+            aop_core::textstyle::Emphasis::Bold => "Bold",
+            aop_core::textstyle::Emphasis::Italic => "Italic",
+            aop_core::textstyle::Emphasis::Underline => "Underline",
+        };
+        self.note(format!(
+            "{name} {} for {} row{}.",
+            if on { "on" } else { "off" },
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Put a font family or a size on the selected rows.
+    ///
+    /// An empty family or a zero size hands the row back to the theme, which
+    /// is how a row says it has no opinion.
+    pub fn set_row_font(&mut self, family: Option<String>, size_pt: Option<f32>) {
+        if self.selection.is_empty() {
+            self.note("Select the rows to format first.");
+            return;
+        }
+        let rows = self.selection.clone();
+        self.checkpoint();
+        for index in &rows {
+            if let Some(task) = self.project.tasks.get_mut(*index) {
+                if let Some(family) = &family {
+                    task.font_family = family.clone();
+                }
+                if let Some(size) = size_pt {
+                    task.font_size_pt = size;
+                }
+            }
+        }
+        self.dirty = true;
+        self.note(match (&family, size_pt) {
+            (Some(family), _) => format!("Font set to {family}."),
+            (None, Some(size)) => format!("Font size set to {size:.0}."),
+            _ => "Font unchanged.".to_string(),
+        });
+    }
+
+    /// Copy the look of the first selected row, ready to brush onto others.
+    pub fn pick_up_format(&mut self) {
+        let Some(row) = self.primary() else {
+            self.note("Select a row to copy formatting from.");
+            return;
+        };
+        let painter = aop_core::textstyle::pick_up(&self.text_styles, &self.project, row);
+        self.painter = Some(painter);
+        self.note("Format picked up. Select the rows to paint, then click Format Painter again.");
+    }
+
+    /// Brush the picked-up look onto the selection.
+    pub fn brush_format(&mut self) {
+        let Some(painter) = self.painter.clone() else {
+            self.pick_up_format();
+            return;
+        };
+        if self.selection.is_empty() {
+            self.note("Select the rows to paint first.");
+            return;
+        }
+        let rows = self.selection.clone();
+        self.checkpoint();
+        for index in &rows {
+            painter.brush(&mut self.project, *index);
+        }
+        self.painter = None;
+        self.dirty = true;
+        self.note(format!(
+            "Painted {} row{}.",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Take back the delays levelling put in.
+    pub fn clear_leveling(&mut self) {
+        self.checkpoint();
+        let cleared = aop_core::leveling::clear_leveling(&mut self.project);
+        self.reschedule();
+        self.dirty = true;
+        self.status = if cleared == 0 {
+            "No levelling delays to clear.".to_string()
+        } else {
+            format!(
+                "Cleared levelling on {cleared} task{}.",
+                if cleared == 1 { "" } else { "s" }
+            )
+        };
+    }
+
     /// Placeholder for ribbon commands that are present but not yet wired up.
     pub fn not_implemented(&mut self, command: &str) {
         self.status = format!("{command} is not available in this build");
@@ -2207,12 +2889,11 @@ impl Default for AppState {
 pub fn from_command_line() -> AppState {
     let mut state = AppState::new();
     state.apply_settings(crate::settings::Settings::load());
-    if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) {
-        if path.is_file() {
+    if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from)
+        && path.is_file() {
             state.splash = false;
             state.open_any(path);
         }
-    }
     state
 }
 
@@ -2427,6 +3108,53 @@ pub fn documents_dir() -> PathBuf {
         .map(|home| PathBuf::from(home).join("Documents"))
         .unwrap_or_else(|| PathBuf::from("."))
 }
+
+/// Rebuild each band's count and totals from the rows still under it.
+///
+/// Grouping runs before filtering, so once rows are dropped the numbers the
+/// bands were built with no longer describe what is on screen.
+fn restate_bands(project: &aop_core::Project, rows: &mut [GroupRow]) {
+    let depth_of = |row: &GroupRow| match row {
+        GroupRow::Band { depth, .. } => *depth,
+        GroupRow::Task(_) => usize::MAX,
+    };
+
+    for at in 0..rows.len() {
+        let here = depth_of(&rows[at]);
+        if here == usize::MAX {
+            continue;
+        }
+        let mut count = 0usize;
+        let mut work = 0i64;
+        let mut cost = 0.0f64;
+        for row in rows.iter().skip(at + 1) {
+            match row {
+                GroupRow::Task(index) => {
+                    count += 1;
+                    if let Some(task) = project.tasks.get(*index) {
+                        work += task.scheduled.work_minutes;
+                        cost += task.scheduled.cost;
+                    }
+                }
+                // A deeper band still sits inside this one, so keep counting.
+                GroupRow::Band { depth, .. } if *depth > here => {}
+                GroupRow::Band { .. } => break,
+            }
+        }
+        if let GroupRow::Band {
+            count: c,
+            work_minutes: w,
+            cost: k,
+            ..
+        } = &mut rows[at]
+        {
+            *c = count;
+            *w = work;
+            *k = cost;
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

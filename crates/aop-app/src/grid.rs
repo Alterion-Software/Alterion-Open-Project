@@ -9,8 +9,10 @@
 
 use dioxus::prelude::*;
 
-use aop_core::{Align, ConstraintType, Field, TaskMode};
+use aop_core::grouping::GroupRow;
+use aop_core::{format_work, Align, ConstraintType, Field, TaskMode};
 
+use crate::icons::icon;
 use crate::gantt::{HEADER_H, ROW_H};
 use crate::viewport::PaneScroll;
 use crate::state::{format_date, AppState, Column, Dialog, DropWhere};
@@ -37,6 +39,15 @@ fn editor_for(field: Field) -> Option<Column> {
         Field::ResourceNames => Some(Column::Resources),
         _ => None,
     }
+}
+
+/// Fields edited by a floating picker rather than by a text box in the cell.
+///
+/// Both of these name other rows, so a list with the outline visible is the
+/// only way to pick one without knowing its number by heart. The picker still
+/// takes typed numbers, for planners who do.
+fn edits_in_a_popup(field: Field) -> bool {
+    matches!(field, Field::Predecessors | Field::ResourceNames)
 }
 
 fn align_class(align: Align) -> &'static str {
@@ -102,7 +113,7 @@ pub fn TaskGrid() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let s = state.read();
     let project = &s.project;
-    let rows = s.visible_rows();
+    let rows = s.layout_rows();
     let columns = s.columns.clone();
     // The table is as wide as its columns; the pane showing it may be narrower,
     // in which case it scrolls.
@@ -112,6 +123,17 @@ pub fn TaskGrid() -> Element {
     let show_wbs = s.show_outline_number;
     let currency = project.currency_symbol.clone();
     let pattern = s.date_pattern();
+    let text_styles = s.text_styles.clone();
+    let grid_class = {
+        let mut class = String::from("grid");
+        if !s.grid_rows {
+            class.push_str(" no-rows");
+        }
+        if !s.grid_columns {
+            class.push_str(" no-columns");
+        }
+        class
+    };
     let drag_row = s.drag_row;
     let drop_target = s.drop_target;
 
@@ -158,7 +180,7 @@ pub fn TaskGrid() -> Element {
                 }
             },
 
-            table { class: "grid", style: "width: {table_width}px;",
+            table { class: "{grid_class}", style: "width: {table_width}px;",
                 colgroup {
                     for (index, column) in columns.iter().enumerate() {
                         col { key: "c{index}", style: "width: {column.width}px;" }
@@ -193,26 +215,26 @@ pub fn TaskGrid() -> Element {
                                                 },
                                                 _ => rsx! { "{field.heading()}" },
                                             }
-                                            div {
-                                                class: "col-grip",
-                                                title: "Drag to resize; double-click resets every column",
-                                                onmousedown: move |event| {
-                                                    event.prevent_default();
-                                                    event.stop_propagation();
-                                                    let width = state
-                                                        .read()
-                                                        .columns
-                                                        .get(index)
-                                                        .map(|c| c.width)
-                                                        .unwrap_or(90.0);
-                                                    resizing.set(Some((
-                                                        index,
-                                                        event.client_coordinates().x,
-                                                        width,
-                                                    )));
-                                                },
-                                                ondoubleclick: move |_| state.write().reset_columns(),
-                                            }
+                                        }
+                                        div {
+                                            class: "col-grip",
+                                            title: "Drag to resize; double-click resets every column",
+                                            onmousedown: move |event| {
+                                                event.prevent_default();
+                                                event.stop_propagation();
+                                                let width = state
+                                                    .read()
+                                                    .columns
+                                                    .get(index)
+                                                    .map(|c| c.width)
+                                                    .unwrap_or(90.0);
+                                                resizing.set(Some((
+                                                    index,
+                                                    event.client_coordinates().x,
+                                                    width,
+                                                )));
+                                            },
+                                            ondoubleclick: move |_| state.write().reset_columns(),
                                         }
                                     }
                                 }
@@ -226,129 +248,185 @@ pub fn TaskGrid() -> Element {
                         tr { class: "row-spacer", style: "height: {window.above}px;" }
                     }
 
-                    for &index in rows[window.first..window.end].iter() {
+                    for (offset, row) in rows[window.first..window.end].iter().enumerate() {
                         {
-                            let task = &project.tasks[index];
-                            let summary = project.is_summary(index);
-                            let selected = s.is_selected(index);
-
-                            let mut class = String::from("row");
-                            if selected { class.push_str(" selected"); }
-                            if summary { class.push_str(" summary"); }
-                            if !task.active { class.push_str(" inactive"); }
-                            if task.scheduled.critical && s.show_critical { class.push_str(" critical"); }
-                            if drag_row == Some(index) { class.push_str(" dragging"); }
-                            if let Some((target, mode)) = drop_target {
-                                if target == index {
-                                    class.push_str(match mode {
-                                        DropWhere::Above => " drop-above",
-                                        DropWhere::Below => " drop-below",
-                                        DropWhere::Into => " drop-into",
-                                    });
-                                }
-                            }
-
-                            rsx! {
-                                tr {
-                                    key: "row{index}",
-                                    class: "{class}",
-
-                                    // WebKit will not reliably start an HTML5 drag
-                                    // on a table row, so reordering runs on plain
-                                    // pointer events instead.
-                                    onmousemove: move |event| {
-                                        if resizing().is_none() && state.read().drag_row.is_some() {
-                                            let mode = drop_zone(event.element_coordinates().y);
-                                            state.write().hover_drop(index, mode);
-                                        }
-                                    },
-                                    onmouseup: move |_| {
-                                        if state.read().drag_row.is_some() {
-                                            state.write().finish_drag();
-                                        }
-                                    },
-
-                                    onclick: move |event| {
-                                        let mut writer = state.write();
-                                        if event.modifiers().ctrl() {
-                                            writer.toggle_selection(index);
-                                        } else if event.modifiers().shift() {
-                                            writer.extend_selection(index);
-                                        } else {
-                                            writer.select(index);
-                                        }
-                                    },
-
-                                    oncontextmenu: move |event| {
-                                        event.prevent_default();
-                                        let point = event.client_coordinates();
-                                        state.write().open_task_menu(index, point.x, point.y);
-                                    },
-
-                                    for (position, column) in columns.iter().enumerate() {
-                                        {
-                                            let field = column.field;
-                                            let editor = editor_for(field);
-                                            let is_editing =
-                                                editor.map(|c| editing == Some((index, c))).unwrap_or(false);
-                                            let mut cell_class = String::from(align_class(field.align()));
-                                            if field == Field::Id {
-                                                cell_class.push_str(" rownum");
+                            // A band and a task each take exactly one line, in
+                            // this pane and in the chart alike, which is what
+                            // keeps the two scrolling in step.
+                            match row {
+                                GroupRow::Band { label, count, work_minutes, cost, depth } => {
+                                    let line = window.first + offset;
+                                    let span_all = columns.len();
+                                    let indent = 12.0 + *depth as f64 * 14.0;
+                                    let noun = if *count == 1 { "task" } else { "tasks" };
+                                    let totals = format!(
+                                        "{count} {noun}  \u{00b7}  {}  \u{00b7}  {currency}{cost:.2}",
+                                        format_work(*work_minutes),
+                                    );
+                                    rsx! {
+                                        tr { key: "band{line}", class: "row band",
+                                            td {
+                                                colspan: "{span_all}",
+                                                style: "height: {ROW_H}px; padding-left: {indent}px;",
+                                                span { class: "band-label", "{label}" }
+                                                span { class: "band-totals", "{totals}" }
                                             }
-                                            let value = field.value(project, index, pattern);
+                                        }
+                                    }
+                                }
+                                &GroupRow::Task(index) => {
+                                    let task = &project.tasks[index];
+                                    let summary = project.is_summary(index);
+                                    let selected = s.is_selected(index);
 
-                                            rsx! {
-                                                td {
-                                                    key: "c{position}",
-                                                    class: "{cell_class}",
-                                                    style: "height: {ROW_H}px;",
+                                    let mut class = String::from("row");
+                                    if selected { class.push_str(" selected"); }
+                                    if summary { class.push_str(" summary"); }
+                                    if !task.active { class.push_str(" inactive"); }
+                                    if s.show_critical && aop_core::issues::shows_as_critical(project, index) {
+                                        class.push_str(" critical");
+                                    }
+                                    if drag_row == Some(index) { class.push_str(" dragging"); }
+                                    if let Some((target, mode)) = drop_target
+                                        && target == index {
+                                            class.push_str(match mode {
+                                                DropWhere::Above => " drop-above",
+                                                DropWhere::Below => " drop-below",
+                                                DropWhere::Into => " drop-into",
+                                            });
+                                        }
 
-                                                    // The ID cell doubles as the drag handle.
-                                                    onmousedown: move |event| {
-                                                        if field == Field::Id {
-                                                            event.prevent_default();
-                                                            let mut writer = state.write();
-                                                            writer.select(index);
-                                                            writer.begin_drag(index);
-                                                        }
-                                                    },
+                                    // The category's look first, then whatever the
+                                    // planner set on this row on top. Only the parts
+                                    // actually set are written: leaving one unset
+                                    // means "the theme's", not "black".
+                                    let row_style = text_styles.css_for(project, index);
 
-                                                    ondoubleclick: move |event| match field {
-                                                        // These open a picker, not a text box.
-                                                        Field::Predecessors | Field::ResourceNames => {
-                                                            let point = event.client_coordinates();
-                                                            let column = if field == Field::Predecessors {
-                                                                Column::Predecessors
-                                                            } else {
-                                                                Column::Resources
-                                                            };
-                                                            state.write().edit_cell_at(index, column, point.x, point.y);
-                                                        }
-                                                        Field::TaskMode => {
-                                                            let next = if state.read().project.tasks[index].mode
-                                                                == TaskMode::Auto
-                                                            {
-                                                                TaskMode::Manual
-                                                            } else {
-                                                                TaskMode::Auto
-                                                            };
-                                                            state.write().select(index);
-                                                            state.write().set_task_mode(next);
-                                                        }
-                                                        _ => {
-                                                            if let Some(column) = editor {
-                                                                state.write().editing = Some((index, column));
-                                                            } else {
-                                                                state.write().dialog =
-                                                                    Some(Dialog::TaskInformation(index));
-                                                            }
-                                                        }
-                                                    },
+                                    rsx! {
+                                        tr {
+                                            key: "row{index}",
+                                            class: "{class}",
+                                            style: "{row_style}",
 
-                                                    {cell_body(
-                                                        field, project, index, summary, show_wbs,
-                                                        &currency, &value, is_editing, editor,
-                                                    )}
+                                            // WebKit will not reliably start an HTML5 drag
+                                            // on a table row, so reordering runs on plain
+                                            // pointer events instead.
+                                            onmousemove: move |event| {
+                                                if resizing().is_none() && state.read().drag_row.is_some() {
+                                                    let mode = drop_zone(event.element_coordinates().y);
+                                                    state.write().hover_drop(index, mode);
+                                                }
+                                            },
+                                            onmouseup: move |_| {
+                                                if state.read().drag_row.is_some() {
+                                                    state.write().finish_drag();
+                                                }
+                                            },
+
+                                            onclick: move |event| {
+                                                let mut writer = state.write();
+                                                if event.modifiers().ctrl() {
+                                                    writer.toggle_selection(index);
+                                                } else if event.modifiers().shift() {
+                                                    writer.extend_selection(index);
+                                                } else {
+                                                    writer.select(index);
+                                                }
+                                            },
+
+                                            oncontextmenu: move |event| {
+                                                event.prevent_default();
+                                                let point = event.client_coordinates();
+                                                state.write().open_task_menu(index, point.x, point.y);
+                                            },
+
+                                            for (position, column) in columns.iter().enumerate() {
+                                                {
+                                                    let field = column.field;
+                                                    let editor = editor_for(field);
+                                                    let is_editing =
+                                                        editor.map(|c| editing == Some((index, c))).unwrap_or(false);
+                                                    let mut cell_class = String::from(align_class(field.align()));
+                                                    if field == Field::Id {
+                                                        cell_class.push_str(" rownum");
+                                                    }
+                                                    let value = field.value(project, index, pattern);
+
+                                                    rsx! {
+                                                        td {
+                                                            key: "c{position}",
+                                                            class: "{cell_class}",
+                                                            style: "height: {ROW_H}px;",
+
+                                                            // Which column the cursor is on, for the commands
+                                                            // that act on a column rather than a whole row.
+                                                            onclick: move |event| {
+                                                                state.write().fill_field = Some(field);
+                                                                // Predecessors and resources name other
+                                                                // rows, so one click opens the list rather
+                                                                // than making the planner recall a number.
+                                                                if edits_in_a_popup(field) {
+                                                                    event.stop_propagation();
+                                                                    let point = event.client_coordinates();
+                                                                    let column = if field == Field::Predecessors {
+                                                                        Column::Predecessors
+                                                                    } else {
+                                                                        Column::Resources
+                                                                    };
+                                                                    let mut writer = state.write();
+                                                                    writer.select(index);
+                                                                    writer.edit_cell_at(index, column, point.x, point.y);
+                                                                }
+                                                            },
+
+                                                            // The ID cell doubles as the drag handle.
+                                                            onmousedown: move |event| {
+                                                                if field == Field::Id {
+                                                                    event.prevent_default();
+                                                                    let mut writer = state.write();
+                                                                    writer.select(index);
+                                                                    writer.begin_drag(index);
+                                                                }
+                                                            },
+
+                                                            ondoubleclick: move |event| match field {
+                                                                // These open a picker, not a text box.
+                                                                Field::Predecessors | Field::ResourceNames => {
+                                                                    let point = event.client_coordinates();
+                                                                    let column = if field == Field::Predecessors {
+                                                                        Column::Predecessors
+                                                                    } else {
+                                                                        Column::Resources
+                                                                    };
+                                                                    state.write().edit_cell_at(index, column, point.x, point.y);
+                                                                }
+                                                                Field::TaskMode => {
+                                                                    let next = if state.read().project.tasks[index].mode
+                                                                        == TaskMode::Auto
+                                                                    {
+                                                                        TaskMode::Manual
+                                                                    } else {
+                                                                        TaskMode::Auto
+                                                                    };
+                                                                    state.write().select(index);
+                                                                    state.write().set_task_mode(next);
+                                                                }
+                                                                _ => {
+                                                                    if let Some(column) = editor {
+                                                                        state.write().editing = Some((index, column));
+                                                                    } else {
+                                                                        state.write().dialog =
+                                                                            Some(Dialog::TaskInformation(index));
+                                                                    }
+                                                                }
+                                                            },
+
+                                                            {cell_body(
+                                                                field, project, index, summary, show_wbs,
+                                                                &currency, &value, is_editing, editor,
+                                                            )}
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -440,9 +518,12 @@ fn cell_body(
     let mut state = use_context::<Signal<AppState>>();
     let task = &project.tasks[index];
 
-    // While a cell is being edited it is replaced by an input.
-    if is_editing {
-        if let Some(column) = editor {
+    // While a cell is being edited it is replaced by an input, unless the
+    // field is one the picker owns: those keep showing their value, and the
+    // picker floats over the grid beside them.
+    if is_editing
+        && !edits_in_a_popup(field)
+        && let Some(column) = editor {
             let initial = match field {
                 // Dates are edited in an unambiguous form, whatever the display
                 // format happens to be set to.
@@ -453,7 +534,6 @@ fn cell_body(
             };
             return rsx! { CellEditor { row: index, column, initial } };
         }
-    }
 
     match field {
         Field::Id => rsx! { "{index + 1}" },
@@ -467,9 +547,16 @@ fn cell_body(
 
         Field::TaskMode => rsx! {
             span {
-                class: "mode-glyph",
+                // A hand for placed by a person, a bolt for placed by the
+                // scheduler. Two triangles told you a row differed from its
+                // neighbour without saying how.
+                class: if task.mode == TaskMode::Auto { "mode-glyph auto" } else { "mode-glyph manual" },
                 title: "{task.mode.label()}",
-                if task.mode == TaskMode::Auto { "\u{25b8}" } else { "\u{25c6}" }
+                if task.mode == TaskMode::Auto {
+                    {icon("mode-auto", 13)}
+                } else {
+                    {icon("mode-manual", 13)}
+                }
             }
         },
 
@@ -526,9 +613,16 @@ fn indicator_glyph(project: &aop_core::Project, index: usize) -> Element {
         return rsx! { span { style: "color: var(--accent);", "\u{2714}" } };
     }
     // Being on the critical path is the thing most worth flagging: any slip
-    // here moves the finish date.
+    // here moves the finish date. Once that has been acknowledged the marker
+    // stays but goes quiet, so the row still says there is something known
+    // about it without shouting.
     if task.scheduled.critical && !project.is_summary(index) {
-        return rsx! { span { class: "ind-critical", "\u{26a0}" } };
+        let class = if aop_core::issues::is_ignored(project, index, aop_core::model::IssueKind::Critical) {
+            "ind-critical ignored"
+        } else {
+            "ind-critical"
+        };
+        return rsx! { span { class: "{class}", "\u{26a0}" } };
     }
     if !task.notes.is_empty() {
         return rsx! { span { style: "color: var(--ink-soft);", "\u{270e}" } };
@@ -580,4 +674,61 @@ fn indicator_tooltip(
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AppState;
+    use aop_core::MINUTES_PER_DAY;
+
+    /// A four row outline: Phase / Child A / Child B / Standalone, so exactly
+    /// one of the four rows is a summary.
+    fn outlined() -> AppState {
+        let mut state = AppState::new();
+        state.project.tasks.clear();
+        state.project.links.clear();
+        for name in ["Phase", "Child A", "Child B", "Standalone"] {
+            state.project.push_task(name, MINUTES_PER_DAY);
+        }
+        state.project.tasks[1].outline_level = 1;
+        state.project.tasks[2].outline_level = 1;
+        state.reschedule();
+        state
+    }
+
+    fn task_indices(rows: &[GroupRow]) -> Vec<usize> {
+        rows.iter()
+            .filter_map(|row| match row {
+                &GroupRow::Task(index) => Some(index),
+                GroupRow::Band { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_no_grouping_the_layout_is_the_visible_rows_and_nothing_more() {
+        // Both panes now lay out from `layout_rows`, so an ungrouped plan has
+        // to come back exactly as `visible_rows` drew it: one extra or missing
+        // line here would slide every bar in the chart off its row.
+        let state = outlined();
+        let layout = state.layout_rows();
+        let visible = state.visible_rows();
+        assert_eq!(task_indices(&layout), visible);
+        assert_eq!(layout.len(), visible.len(), "no bands when nothing groups");
+    }
+
+    #[test]
+    fn a_grouped_layout_still_holds_every_leaf_row_exactly_once() {
+        // A band is a heading, not a task, so grouping adds lines without ever
+        // dropping or repeating one of the rows the plan actually has.
+        let mut state = outlined();
+        state.set_group_by("duration");
+        let layout = state.layout_rows();
+        let leaves = (0..state.project.tasks.len())
+            .filter(|&index| !state.project.is_summary(index))
+            .count();
+        assert_eq!(task_indices(&layout).len(), leaves);
+        assert!(layout.len() > leaves, "the bands take lines of their own");
+    }
 }

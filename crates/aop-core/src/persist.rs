@@ -179,7 +179,7 @@ pub fn open(path: &Path) -> Result<Project, FileError> {
 /// command line) agrees on what is supported instead of each deciding for
 /// itself. A preview card that quietly drops a format the Open page accepts is
 /// the shape of bug this exists to prevent.
-pub const IMPORTED_EXTENSIONS: [&str; 3] = ["xml", "mpp", "mspdi"];
+pub const IMPORTED_EXTENSIONS: [&str; 7] = ["xml", "mpp", "mspdi", "xlsx", "xlsm", "xls", "ods"];
 
 /// Open any plan the application understands, whatever wrote it.
 pub fn open_any(path: &Path) -> Result<Project, String> {
@@ -188,7 +188,9 @@ pub fn open_any(path: &Path) -> Result<Project, String> {
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
 
-    if IMPORTED_EXTENSIONS.contains(&extension.as_str()) {
+    if matches!(extension.as_str(), "xlsx" | "xlsm" | "xls" | "ods") {
+        crate::excel::open(path).map_err(|e| e.to_string())
+    } else if IMPORTED_EXTENSIONS.contains(&extension.as_str()) {
         crate::mspdi::open(path).map_err(|e| e.to_string())
     } else {
         open(path).map_err(|e| e.to_string())
@@ -253,7 +255,7 @@ pub fn print_body(project: &Project) -> String {
     let mut out = String::new();
 
     let critical = (0..project.tasks.len())
-        .filter(|&i| !project.is_summary(i) && project.tasks[i].scheduled.critical)
+        .filter(|&i| !project.is_summary(i) && crate::issues::shows_as_critical(project, i))
         .count();
     let duration = format_duration(
         project
@@ -338,7 +340,7 @@ pub fn print_body(project: &Project) -> String {
         if summary {
             classes.push("summary");
         }
-        if task.scheduled.critical && !summary {
+        if !summary && crate::issues::shows_as_critical(project, index) {
             classes.push("critical");
         }
         if project.is_marker(index) {
@@ -508,7 +510,11 @@ fn gantt_svg(project: &Project, width: f64, rows: &[usize]) -> String {
                 y + 3.5
             ));
         } else {
-            let class = if task.scheduled.critical { "crit" } else { "bar" };
+            let class = if crate::issues::shows_as_critical(project, index) {
+                "crit"
+            } else {
+                "bar"
+            };
             out.push_str(&format!(
                 "<rect x=\"{left}\" y=\"{}\" width=\"{w}\" height=\"7\" rx=\"1.5\" class=\"{class}\"/>",
                 y + 1.5

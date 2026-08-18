@@ -49,6 +49,10 @@ fn MiniBtn(
     label: String,
     caret: bool,
     enabled: bool,
+    /// A colour to underline the glyph with, for the commands that are about
+    /// one. The same bucket and bar the ribbon shows, so the two read as the
+    /// same command rather than two that happen to share a name.
+    swatch: Option<String>,
     on: EventHandler<()>,
 ) -> Element {
     let mut state = use_context::<Signal<AppState>>();
@@ -65,6 +69,9 @@ fn MiniBtn(
                 }
             },
             {icon(&glyph, 16)}
+            if let Some(colour) = swatch {
+                span { class: "colour-bar", style: "background: {colour};" }
+            }
             if caret { span { class: "caret", "\u{25be}" } }
         }
     }
@@ -88,17 +95,17 @@ fn MiniToolbar(row: usize) -> Element {
         div { class: "ctx-minibar", onclick: move |event| event.stop_propagation(),
             MiniBtn {
                 glyph: "paste".to_string(), label: "Paste".to_string(),
-                caret: true, enabled: true,
+                caret: true, enabled: true, swatch: None,
                 on: move |_| state.write().paste(),
             }
             MiniBtn {
                 glyph: "cut".to_string(), label: "Cut".to_string(),
-                caret: false, enabled: has_selection,
+                caret: false, enabled: has_selection, swatch: None,
                 on: move |_| state.write().cut_selected(),
             }
             MiniBtn {
                 glyph: "copy".to_string(), label: "Copy".to_string(),
-                caret: false, enabled: has_selection,
+                caret: false, enabled: has_selection, swatch: None,
                 on: move |_| state.write().copy_selected(),
             }
 
@@ -107,16 +114,17 @@ fn MiniToolbar(row: usize) -> Element {
             MiniBtn {
                 glyph: "fill-color".to_string(), label: "Bar Colors".to_string(),
                 caret: true, enabled: true,
+                swatch: Some(state.read().project.bar_styles.task.clone()),
                 on: move |_| state.write().dialog = Some(Dialog::BarStyles),
             }
             MiniBtn {
                 glyph: "link".to_string(), label: "Link Tasks".to_string(),
-                caret: false, enabled: multi,
+                caret: false, enabled: multi, swatch: None,
                 on: move |_| state.write().link_selected(),
             }
             MiniBtn {
                 glyph: "unlink".to_string(), label: "Unlink Tasks".to_string(),
-                caret: false, enabled: has_selection,
+                caret: false, enabled: has_selection, swatch: None,
                 on: move |_| state.write().unlink_selected(),
             }
 
@@ -124,12 +132,12 @@ fn MiniToolbar(row: usize) -> Element {
 
             MiniBtn {
                 glyph: "mark-on-track".to_string(), label: "Mark 100% Complete".to_string(),
-                caret: false, enabled: !summary,
+                caret: false, enabled: !summary, swatch: None,
                 on: move |_| state.write().set_percent_complete(100),
             }
             MiniBtn {
                 glyph: "information".to_string(), label: "Task Information".to_string(),
-                caret: false, enabled: true,
+                caret: false, enabled: true, swatch: None,
                 on: move |_| state.write().dialog = Some(Dialog::TaskInformation(row)),
             }
         }
@@ -146,7 +154,7 @@ const MENU_WIDTH: f64 = 260.0;
 pub fn ContextMenuHost(menu: ContextMenu) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let (x, y) = menu.position();
-    let (view_w, view_h) = state.read().viewport;
+    let (view_w, view_h) = use_context::<Signal<crate::state::Viewport>>()();
     let left = x.max(4.0);
     let top = y.max(4.0);
     let task_row = match menu {
@@ -166,16 +174,14 @@ pub fn ContextMenuHost(menu: ContextMenu) -> Element {
         format!("left: {left}px;")
     };
 
-    // The mini toolbar sits on the far side of the click from the menu, so the
-    // two never land on top of each other whichever way the menu opened.
-    let (menu_vertical, bar_vertical) = if flip_up {
-        (
-            format!("bottom: {}px;", (view_h - y).max(4.0)),
-            format!("top: {}px;", top + 6.0),
-        )
+    // The toolbar and the menu are anchored together as one stack rather than
+    // placed separately. Positioned apart, a menu that opened upward would grow
+    // over the toolbar and leave it underneath, which is the one arrangement
+    // the toolbar must never be in.
+    let vertical = if flip_up {
+        format!("bottom: {}px;", (view_h - y).max(4.0))
     } else {
-        let offset = if task_row.is_some() { 40.0 } else { 0.0 };
-        (format!("top: {}px;", top + offset), format!("top: {top}px;"))
+        format!("top: {top}px;")
     };
 
     rsx! {
@@ -188,21 +194,22 @@ pub fn ContextMenuHost(menu: ContextMenu) -> Element {
             },
         }
 
-        if let Some(row) = task_row {
-            div { class: "ctx-minibar-wrap", style: "{horizontal} {bar_vertical}",
-                MiniToolbar { row }
+        div { class: "ctx-stack", style: "{horizontal} {vertical}",
+            if let Some(row) = task_row {
+                div { class: "ctx-minibar-wrap",
+                    MiniToolbar { row }
+                }
             }
-        }
 
-        div {
-            class: "ctxmenu",
-            style: "{horizontal} {menu_vertical} max-height: 70vh; overflow-y: auto;",
-            onclick: move |event| event.stop_propagation(),
-            match menu {
-                ContextMenu::Task { row, .. } => rsx! { TaskMenu { row } },
-                ContextMenu::Chart { .. } => rsx! { ChartMenu {} },
-                ContextMenu::Resource { index, .. } => rsx! { ResourceMenu { index } },
-                ContextMenu::Column { index, .. } => rsx! { ColumnMenu { index } },
+            div {
+                class: "ctxmenu",
+                onclick: move |event| event.stop_propagation(),
+                match menu {
+                    ContextMenu::Task { row, .. } => rsx! { TaskMenu { row } },
+                    ContextMenu::Chart { .. } => rsx! { ChartMenu {} },
+                    ContextMenu::Resource { index, .. } => rsx! { ResourceMenu { index } },
+                    ContextMenu::Column { index, .. } => rsx! { ColumnMenu { index } },
+                }
             }
         }
     }
@@ -230,8 +237,78 @@ fn TaskMenu(row: usize) -> Element {
         )
     };
 
+    // What the row is flagged for, and what can be done about it. This is where
+    // the warning in the table becomes actionable: the marker says something is
+    // up, the menu says what and offers the change.
+    let issues = aop_core::issues::task_issues(&state.read().project, row);
+    let dismissed = state
+        .read()
+        .project
+        .tasks
+        .get(row)
+        .is_some_and(|task| !task.ignored_issues.is_empty());
+
     rsx! {
         div { class: "ctxheader", if name.is_empty() { "(unnamed task)" } else { "{name}" } }
+
+        if !issues.is_empty() {
+            for issue in issues.iter().cloned() {
+                {
+                    let kind = issue.kind;
+                    let ignored = issue.ignored;
+                    let class = if ignored { "ctx-issue ignored" } else { "ctx-issue" };
+                    rsx! {
+                        div { key: "{kind:?}", class: "{class}",
+                            span { class: "ctx-issue-text", "{issue.message}" }
+                            div { class: "ctx-issue-acts",
+                                if let Some(fix) = issue.fix {
+                                    button {
+                                        class: "ctx-issue-fix",
+                                        onclick: move |event| {
+                                            event.stop_propagation();
+                                            state.write().fix_issue(row, fix);
+                                            state.write().close_menu();
+                                        },
+                                        "{fix.label()}"
+                                    }
+                                }
+                                if ignored {
+                                    button {
+                                        class: "ctx-issue-ignore",
+                                        onclick: move |event| {
+                                            event.stop_propagation();
+                                            state.write().restore_issue(row, kind);
+                                            state.write().close_menu();
+                                        },
+                                        "Stop ignoring"
+                                    }
+                                } else {
+                                    button {
+                                        class: "ctx-issue-ignore",
+                                        onclick: move |event| {
+                                            event.stop_propagation();
+                                            state.write().ignore_issue(row, kind);
+                                            state.write().close_menu();
+                                        },
+                                        "Ignore"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "ctxsep" }
+        }
+
+        if dismissed {
+            Item {
+                glyph: "warning".to_string(), label: "Show dismissed warnings".to_string(),
+                shortcut: String::new(), enabled: true, checked: None,
+                on: move |_| state.write().restore_issues(row),
+            }
+            div { class: "ctxsep" }
+        }
 
         Item {
             glyph: "information".to_string(), label: "Task Information...".to_string(),

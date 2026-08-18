@@ -4,7 +4,7 @@
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | Yes (pre-release — API and file format may change) |
+| 0.1.x   | Yes (pre-release, API and file format may change) |
 
 ## Reporting a Vulnerability
 

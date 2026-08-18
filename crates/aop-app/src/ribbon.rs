@@ -8,6 +8,8 @@
 use dioxus::desktop::{use_window, WindowCloseBehaviour};
 use dioxus::prelude::*;
 
+use aop_core::leveling::LevelScope;
+use aop_core::textstyle::Emphasis;
 use aop_core::{TaskMode, APP_NAME};
 
 use crate::controls::{Choice, ComboBox, Dropdown, MenuBtn, MenuOption};
@@ -84,6 +86,11 @@ fn task_view_options() -> Vec<MenuOption> {
         MenuOption::new("team-planner", "Team Planner", "TeamPlanner"),
         MenuOption::new("resource-sheet", "Resource Sheet", "ResourceSheet"),
         MenuOption::new("resource-usage", "Resource Usage", "ResourceUsage"),
+        MenuOption::separator(),
+        MenuOption::new("burndown", "Burndown", "Burndown"),
+        MenuOption::new("burnup", "Burnup", "Burnup"),
+        MenuOption::new("velocity", "Velocity", "Velocity"),
+        MenuOption::new("critical-path", "Critical path", "CriticalPath"),
     ]
 }
 
@@ -108,6 +115,10 @@ fn view_from(value: &str) -> Option<ViewKind> {
         "ResourceSheet" => ViewKind::ResourceSheet,
         "ResourceUsage" => ViewKind::ResourceUsage,
         "TeamPlanner" => ViewKind::TeamPlanner,
+        "Burndown" => ViewKind::Burndown,
+        "Burnup" => ViewKind::Burnup,
+        "Velocity" => ViewKind::Velocity,
+        "CriticalPath" => ViewKind::CriticalPath,
         _ => return None,
     })
 }
@@ -263,7 +274,7 @@ fn WindowChrome(title: String) -> Element {
                 let window = window.clone();
                 move |_| window.toggle_maximized()
             },
-            div { class: "title-text", b { "{title}" } " \u{2014} {APP_NAME}" }
+            div { class: "title-text", b { "{title}" } " | {APP_NAME}" }
         }
 
         div { class: "wincontrols",
@@ -299,7 +310,7 @@ fn WindowChrome(title: String) -> Element {
 fn WindowChrome(title: String) -> Element {
     rsx! {
         div { class: "drag-region",
-            div { class: "title-text", b { "{title}" } " \u{2014} {APP_NAME}" }
+            div { class: "title-text", b { "{title}" } " | {APP_NAME}" }
         }
     }
 }
@@ -417,6 +428,30 @@ pub fn TabStrip() -> Element {
     }
 }
 
+/// Open one person's details, on the tab that was asked for.
+///
+/// Falls back to the first resource when nothing is selected, because the
+/// button is on a resource tab and doing nothing at all reads as broken.
+fn open_resource_information(mut state: Signal<AppState>, tab: usize) {
+    let row = {
+        let s = state.read();
+        s.selected_resource.or(if s.project.resources.is_empty() {
+            None
+        } else {
+            Some(0)
+        })
+    };
+    let mut writer = state.write();
+    match row {
+        Some(row) => {
+            writer.view = ViewKind::ResourceSheet;
+            writer.selected_resource = Some(row);
+            writer.dialog = Some(Dialog::ResourceInformation { row, tab });
+        }
+        None => writer.status = "There are no resources yet. Add one on the Resource Sheet first.".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------- ribbon
 
 #[component]
@@ -490,7 +525,7 @@ fn TaskTab() -> Element {
                 SmallBtn { glyph: "copy".to_string(), caption: "Copy".to_string(), enabled: has_selection,
                     on: move |_| state.write().copy_selected() }
                 SmallBtn { glyph: "format-painter".to_string(), caption: "Format Painter".to_string(), enabled: has_selection,
-                    on: move |_| state.write().not_implemented("Format Painter") }
+                    on: move |_| state.write().brush_format() }
             }
         }
 
@@ -502,28 +537,37 @@ fn TaskTab() -> Element {
                         options: ["Calibri", "Segoe UI", "Inter", "Arial", "Times New Roman"]
                             .iter().map(|f| Choice::plain(*f)).collect(),
                         width: 116.0,
-                        on_pick: move |_| state.write().not_implemented("Font"),
+                        on_pick: move |value: String| state.write().set_row_font(Some(value), None),
                     }
                     ComboBox {
                         value: "11".to_string(),
                         options: ["8", "9", "10", "11", "12", "14", "16", "18"]
                             .iter().map(|f| Choice::plain(*f)).collect(),
                         width: 54.0,
-                        on_pick: move |_| state.write().not_implemented("Font size"),
+                        on_pick: move |value: String| {
+                            let size = value.trim().parse::<f32>().ok();
+                            state.write().set_row_font(None, size);
+                        },
                     }
                 }
                 div { class: "font-row",
                     button { class: "rbtn-icon", title: "Bold",
-                        onclick: move |_| state.write().not_implemented("Bold"), {icon("bold", 15)} }
+                        onclick: move |_| state.write().toggle_emphasis(Emphasis::Bold), {icon("bold", 15)} }
                     button { class: "rbtn-icon", title: "Italic",
-                        onclick: move |_| state.write().not_implemented("Italic"), {icon("italic", 15)} }
+                        onclick: move |_| state.write().toggle_emphasis(Emphasis::Italic), {icon("italic", 15)} }
                     button { class: "rbtn-icon", title: "Underline",
-                        onclick: move |_| state.write().not_implemented("Underline"), {icon("underline", 15)} }
+                        onclick: move |_| state.write().toggle_emphasis(Emphasis::Underline), {icon("underline", 15)} }
                     div { class: "qat-sep", style: "background: var(--line);" }
-                    button { class: "rbtn-icon", title: "Background Color",
-                        onclick: move |_| state.write().not_implemented("Background Color"), {icon("fill-color", 15)} }
-                    button { class: "rbtn-icon", title: "Font Color",
-                        onclick: move |_| state.write().not_implemented("Font Color"), {icon("font-color", 15)} }
+                    ColourBtn {
+                        glyph: "fill-color".to_string(),
+                        title: "Background Color".to_string(),
+                        fill: true,
+                    }
+                    ColourBtn {
+                        glyph: "font-color".to_string(),
+                        title: "Font Color".to_string(),
+                        fill: false,
+                    }
                 }
             }
         }
@@ -724,7 +768,7 @@ fn TaskTab() -> Element {
                     glyph: "fill-down".to_string(), caption: "Fill".to_string(),
                     large: false, enabled: has_selection,
                     options: vec![MenuOption::new("fill-down", "Fill down", "down")],
-                    on_pick: move |_| state.write().not_implemented("Fill Down"),
+                    on_pick: move |_| state.write().fill_down(),
                 }
             }
         }
@@ -800,10 +844,10 @@ fn ResourceTab() -> Element {
 
         Group { title: "Properties".to_string(), launcher: false,
             BigBtn { glyph: "information".to_string(), caption: "Information".to_string(), enabled: true,
-                on: move |_| state.write().view = ViewKind::ResourceSheet }
+                on: move |_| open_resource_information(state, 0) }
             div { class: "rcol",
                 SmallBtn { glyph: "notes".to_string(), caption: "Notes".to_string(), enabled: true,
-                    on: move |_| state.write().not_implemented("Resource Notes") }
+                    on: move |_| open_resource_information(state, 2) }
                 SmallBtn { glyph: "details".to_string(), caption: "Details".to_string(), enabled: true,
                     on: move |_| state.write().view = ViewKind::ResourceUsage }
             }
@@ -812,15 +856,24 @@ fn ResourceTab() -> Element {
         Group { title: "Level".to_string(), launcher: false,
             div { class: "rcol",
                 SmallBtn { glyph: "level-options".to_string(), caption: "Leveling Options".to_string(), enabled: true,
-                    on: move |_| state.write().not_implemented("Leveling Options") }
+                    on: move |_| state.write().dialog = Some(Dialog::LevelingOptions) }
                 SmallBtn { glyph: "level".to_string(), caption: "Level Resource".to_string(), enabled: true,
-                    on: move |_| state.write().not_implemented("Level Resource") }
+                    on: move |_| {
+                        let picked = {
+                            let s = state.read();
+                            s.selected_resource.and_then(|row| s.project.resources.get(row).map(|r| r.id))
+                        };
+                        match picked {
+                            Some(id) => state.write().level(LevelScope::Resource(id)),
+                            None => state.write().note("Select a resource on the Resource Sheet first."),
+                        }
+                    } }
                 SmallBtn { glyph: "level".to_string(), caption: "Level All".to_string(), enabled: true,
-                    on: move |_| state.write().not_implemented("Level All") }
+                    on: move |_| state.write().level(LevelScope::EntireProject) }
             }
             div { class: "rcol",
                 SmallBtn { glyph: "clear".to_string(), caption: "Clear Leveling".to_string(), enabled: true,
-                    on: move |_| state.write().not_implemented("Clear Leveling") }
+                    on: move |_| state.write().clear_leveling() }
                 SmallBtn { glyph: "next-over".to_string(), caption: "Next Overallocation".to_string(), enabled: overallocated,
                     on: move |_| {
                         let message = {
@@ -840,7 +893,14 @@ fn ResourceTab() -> Element {
                         }
                     } }
                 SmallBtn { glyph: "selected-tasks".to_string(), caption: "Level Selection".to_string(), enabled: has_selection,
-                    on: move |_| state.write().not_implemented("Level Selection") }
+                    on: move |_| {
+                        let rows = state.read().selection.clone();
+                        if rows.is_empty() {
+                            state.write().note("Select the tasks to level first.");
+                        } else {
+                            state.write().level(LevelScope::Selected(rows));
+                        }
+                    } }
             }
         }
     }
@@ -859,13 +919,15 @@ fn ReportTab() -> Element {
                 large: true, enabled: true,
                 options: vec![
                     MenuOption::new("project-info", "Project overview", "info"),
-                    MenuOption::new("report-progress", "Work in progress", "tracking"),
+                    MenuOption::new("tracking-gantt", "Work in progress", "tracking"),
                 ],
-                on_pick: move |value: String| {
-                    if value == "tracking" {
-                        state.write().view = ViewKind::TrackingGantt;
-                    } else {
-                        state.write().backstage = Some(BackstagePage::Info);
+                on_pick: move |value: String| match value.as_str() {
+                    "tracking" => state.write().view = ViewKind::TrackingGantt,
+                    "info" => state.write().backstage = Some(BackstagePage::Info),
+                    other => {
+                        if let Some(kind) = view_from(other) {
+                            state.write().view = kind;
+                        }
                     }
                 },
             }
@@ -877,11 +939,11 @@ fn ReportTab() -> Element {
                 },
             }
             MenuBtn {
-                glyph: "report-costs".to_string(), caption: "Costs".to_string(),
+                glyph: "cost-resource".to_string(), caption: "Costs".to_string(),
                 large: true, enabled: true,
                 options: vec![
-                    MenuOption::new("task-sheet", "Cost by task", "TaskSheet"),
-                    MenuOption::new("resource-sheet", "Cost by resource", "ResourceSheet"),
+                    MenuOption::new("cost-task", "Cost by task", "TaskSheet"),
+                    MenuOption::new("cost-resource", "Cost by resource", "ResourceSheet"),
                 ],
                 on_pick: move |value: String| {
                     if let Some(kind) = view_from(&value) { state.write().view = kind; }
@@ -899,9 +961,14 @@ fn ReportTab() -> Element {
                 },
             }
             MenuBtn {
-                glyph: "report-custom".to_string(), caption: "Custom".to_string(),
+                glyph: "report-custom".to_string(), caption: "Other".to_string(),
                 large: true, enabled: true,
                 options: vec![
+                    MenuOption::new("burndown", "Burndown", "Burndown"),
+                    MenuOption::new("burnup", "Burnup", "Burnup"),
+                    MenuOption::new("velocity", "Velocity", "Velocity"),
+                    MenuOption::new("critical-path", "Critical path", "CriticalPath"),
+                    MenuOption::separator(),
                     MenuOption::new("network", "Network Diagram", "NetworkDiagram"),
                     MenuOption::new("calendar", "Calendar", "CalendarView"),
                 ],
@@ -932,17 +999,19 @@ fn ProjectTab() -> Element {
     rsx! {
         Group { title: "Insert".to_string(), launcher: false,
             BigBtn { glyph: "subproject".to_string(), caption: "Subproject".to_string(), enabled: true,
-                on: move |_| state.write().not_implemented("Subproject") }
+                on: move |_| state.write().dialog = Some(Dialog::InsertSubproject) }
         }
 
         Group { title: "Properties".to_string(), launcher: false,
+            SmallBtn { glyph: "link".to_string(), caption: "External Dependencies".to_string(), enabled: true,
+                on: move |_| state.write().dialog = Some(Dialog::ExternalDependencies) }
             BigBtn { glyph: "project-info".to_string(), caption: "Project Information".to_string(), enabled: true,
                 on: move |_| state.write().dialog = Some(Dialog::ProjectInformation) }
             div { class: "rcol",
                 SmallBtn { glyph: "custom-fields".to_string(), caption: "Custom Fields".to_string(), enabled: true,
-                    on: move |_| state.write().not_implemented("Custom Fields") }
+                    on: move |_| state.write().dialog = Some(Dialog::CustomFields) }
                 SmallBtn { glyph: "links-between".to_string(), caption: "Links Between Projects".to_string(), enabled: true,
-                    on: move |_| state.write().not_implemented("Links Between Projects") }
+                    on: move |_| state.write().dialog = Some(Dialog::LinksBetweenProjects) }
                 MenuBtn {
                     glyph: "wbs".to_string(), caption: "WBS".to_string(),
                     large: false, enabled: true,
@@ -996,13 +1065,16 @@ fn ProjectTab() -> Element {
                 SmallBtn { glyph: "status-date".to_string(), caption: "Status Date".to_string(), enabled: true,
                     on: move |_| state.write().dialog = Some(Dialog::ProjectInformation) }
                 SmallBtn { glyph: "update-project".to_string(), caption: "Update Project".to_string(), enabled: true,
-                    on: move |_| state.write().not_implemented("Update Project") }
+                    on: move |_| state.write().dialog = Some(Dialog::UpdateProject) }
             }
         }
 
         Group { title: "Proofing".to_string(), launcher: false,
             BigBtn { glyph: "spelling".to_string(), caption: "Spelling".to_string(), enabled: true,
-                on: move |_| state.write().not_implemented("Spelling") }
+                on: move |_| {
+                    let open = state.read().spelling_open;
+                    state.write().spelling_open = !open;
+                } }
         }
     }
 }
@@ -1012,7 +1084,7 @@ fn ProjectTab() -> Element {
 #[component]
 fn ViewTab() -> Element {
     let mut state = use_context::<Signal<AppState>>();
-    let (view, zoom, show_timeline, has_selection, filter) = {
+    let (view, zoom, show_timeline, has_selection, filter, group_label) = {
         let s = state.read();
         (
             s.view,
@@ -1020,6 +1092,10 @@ fn ViewTab() -> Element {
             s.show_timeline,
             !s.selection.is_empty(),
             s.filter,
+            s.group_by
+                .as_ref()
+                .map(|spec| spec.field.label().to_string())
+                .unwrap_or_else(|| "None".to_string()),
         )
     };
 
@@ -1155,10 +1231,19 @@ fn ViewTab() -> Element {
                     on_pick: move |value: String| state.write().set_filter(&value),
                 }
                 MenuBtn {
-                    glyph: "group-by".to_string(), caption: "Group by".to_string(),
+                    glyph: "group-by".to_string(), caption: format!("Group: {group_label}"),
                     large: false, enabled: true,
-                    options: vec![MenuOption::new("group-by", "No group", "none")],
-                    on_pick: move |_| state.write().not_implemented("Group by"),
+                    options: vec![
+                        MenuOption::new("group-by", "No group", "none"),
+                        MenuOption::new("critical-tasks", "Critical", "critical"),
+                        MenuOption::new("milestone", "Milestones", "milestone"),
+                        MenuOption::new("assign-resources", "Resource", "resources"),
+                        MenuOption::new("duration", "Duration", "duration"),
+                        MenuOption::new("start-date", "Start date", "start"),
+                        MenuOption::new("finish-date", "Finish date", "finish"),
+                        MenuOption::new("report-progress", "Percent complete", "complete"),
+                    ],
+                    on_pick: move |value: String| state.write().set_group_by(&value),
                 }
             }
         }
@@ -1249,17 +1334,19 @@ fn FormatTab() -> Element {
     rsx! {
         Group { title: "Format".to_string(), launcher: false,
             BigBtn { glyph: "text-styles".to_string(), caption: "Text Styles".to_string(), enabled: true,
-                on: move |_| state.write().not_implemented("Text Styles") }
+                on: move |_| state.write().dialog = Some(Dialog::TextStyles) }
             MenuBtn {
                 glyph: "gridlines".to_string(), caption: "Gridlines".to_string(),
                 large: true, enabled: true,
                 options: vec![
-                    MenuOption::new("gridlines", "Gridlines are always shown", "none"),
+                    MenuOption::new("gridlines", "Row lines", "rows"),
+                    MenuOption::new("gridlines", "Column lines", "columns"),
+                    MenuOption::new("status-date", "Status date line", "status"),
                 ],
-                on_pick: move |_| state.write().not_implemented("Gridlines"),
+                on_pick: move |value: String| state.write().toggle_gridline(&value),
             }
             BigBtn { glyph: "layout".to_string(), caption: "Layout".to_string(), enabled: true,
-                on: move |_| state.write().not_implemented("Layout") }
+                on: move |_| state.write().dialog = Some(Dialog::Layout) }
         }
 
         Group { title: "Columns".to_string(), launcher: false,
@@ -1290,7 +1377,7 @@ fn FormatTab() -> Element {
                     },
                 }
                 SmallBtn { glyph: "custom-fields".to_string(), caption: "Custom Fields".to_string(), enabled: true,
-                    on: move |_| state.write().not_implemented("Custom Fields") }
+                    on: move |_| state.write().dialog = Some(Dialog::CustomFields) }
             }
         }
 
@@ -1340,8 +1427,20 @@ fn FormatTab() -> Element {
                 }
             }
             div { class: "rcol",
-                SmallBtn { glyph: "fill-color".to_string(), caption: "Bar Colors...".to_string(), enabled: true,
-                    on: move |_| state.write().dialog = Some(Dialog::BarStyles) }
+                {
+                    // The bar colour it will open on, shown on the button, so
+                    // the command says what it is about before it is opened.
+                    let swatch = state.read().project.bar_styles.task.clone();
+                    rsx! {
+                        button {
+                            class: "rbtn-sm swatch-btn",
+                            onclick: move |_| state.write().dialog = Some(Dialog::BarStyles),
+                            span { class: "glyph", {icon("fill-color", 15)} }
+                            span { class: "caption", "Bar Colors..." }
+                            span { class: "colour-bar", style: "background: {swatch};" }
+                        }
+                    }
+                }
             }
         }
 
@@ -1382,6 +1481,93 @@ fn HelpTab() -> Element {
                 on: move |_| state.write().backstage = Some(BackstagePage::About) }
             BigBtn { glyph: "training".to_string(), caption: "About".to_string(), enabled: true,
                 on: move |_| state.write().backstage = Some(BackstagePage::About) }
+        }
+    }
+}
+
+/// A colour command, drawn the way Office draws one: the glyph with a bar of
+/// the current colour beneath it, so the button says what it will apply.
+///
+/// The swatch is a separate element rather than part of the icon. Baking a
+/// colour into the artwork would mean redrawing the icon to change it, and the
+/// whole point is that it follows the selection.
+#[component]
+fn ColourBtn(glyph: String, title: String, fill: bool) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let mut open = use_signal(|| false);
+
+    let (text_colour, fill_colour) = state.read().current_row_colours();
+    let current = if fill { fill_colour } else { text_colour };
+    let swatch = if current.trim().is_empty() {
+        if fill { "transparent".to_string() } else { "var(--ink)".to_string() }
+    } else {
+        current.clone()
+    };
+
+    // A short spread rather than every colour there is: a wall of swatches is
+    // harder to choose from than a row of obvious ones.
+    const CHOICES: [(&str, &str); 8] = [
+        ("#d9636a", "Red"),
+        ("#d9a441", "Amber"),
+        ("#5fa855", "Green"),
+        ("#4f9ecf", "Blue"),
+        ("#8a7fd1", "Violet"),
+        ("#7f8c8c", "Grey"),
+        ("#d8e7e8", "Pale"),
+        ("#20403f", "Deep"),
+    ];
+
+    rsx! {
+        div { class: "colour-btn-wrap",
+            button {
+                class: "rbtn-icon colour-btn",
+                title: "{title}",
+                onclick: move |_| {
+                    let now = open();
+                    open.set(!now);
+                },
+                {icon(&glyph, 15)}
+                span { class: "colour-bar", style: "background: {swatch};" }
+            }
+
+            if open() {
+                div { class: "colour-pop",
+                    div { class: "colour-grid",
+                        for (value, name) in CHOICES {
+                            button {
+                                key: "{value}",
+                                class: "colour-chip",
+                                style: "background: {value};",
+                                title: "{name}",
+                                onclick: move |_| {
+                                    let mut writer = state.write();
+                                    if fill {
+                                        writer.set_row_colour(None, Some(value));
+                                    } else {
+                                        writer.set_row_colour(Some(value), None);
+                                    }
+                                    drop(writer);
+                                    open.set(false);
+                                },
+                            }
+                        }
+                    }
+                    button {
+                        class: "colour-clear",
+                        onclick: move |_| {
+                            let mut writer = state.write();
+                            if fill {
+                                writer.set_row_colour(None, Some(""));
+                            } else {
+                                writer.set_row_colour(Some(""), None);
+                            }
+                            drop(writer);
+                            open.set(false);
+                        },
+                        "Use the theme's colour"
+                    }
+                }
+            }
         }
     }
 }

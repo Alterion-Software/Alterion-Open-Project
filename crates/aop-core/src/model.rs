@@ -31,6 +31,51 @@ impl TaskMode {
     }
 }
 
+/// Identifies an external dependency within the plan.
+pub type ExternalId = u32;
+
+/// Something outside the plan that work waits on.
+///
+/// A purchase order, a permit, a delivery, a sign-off held in another system.
+/// It is a reference and a date, not a live link: the plan records what it was
+/// told, and nothing here goes looking for the truth of it. That keeps a plan
+/// openable by someone with no access to the system the reference came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternalDependency {
+    pub id: ExternalId,
+    /// The identifier in the system it came from, such as a PO number.
+    pub reference: String,
+    /// What it is, in words.
+    pub label: String,
+    /// Which system it came from, for anyone trying to chase it up.
+    #[serde(default)]
+    pub source: String,
+    /// When it is expected. Work that waits on it cannot start before this.
+    pub available: NaiveDateTime,
+    #[serde(default)]
+    pub notes: String,
+}
+
+/// The sort of thing the table flags about a task.
+///
+/// Kept beside the task because a task remembers which of these it has been
+/// told to stop showing, and that choice belongs in the saved plan: dismissing
+/// a warning and having it return on reopening would make the dismissal
+/// meaningless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IssueKind {
+    /// No slack: any delay moves the project finish.
+    Critical,
+    /// A constraint is pinning the task rather than its links.
+    Constraint,
+    /// The task finishes after the deadline it was given.
+    MissedDeadline,
+    /// Manually scheduled, so its links do not move it.
+    ManuallyScheduled,
+    /// Switched off, so the scheduler ignores it.
+    Inactive,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConstraintType {
     AsSoonAsPossible,
@@ -174,6 +219,17 @@ pub struct Resource {
     pub overtime_rate: f64,
     pub cost_per_use: f64,
     pub base_calendar: String,
+    /// What the planner wrote about this person. Empty for most, so it costs
+    /// nothing in a saved plan.
+    #[serde(default)]
+    pub notes: String,
+    /// Where to reach them. Not used for anything yet, but it is the first
+    /// thing anyone looks for on a resource.
+    #[serde(default)]
+    pub email: String,
+    /// The organisation's own identifier: a payroll number, a cost centre.
+    #[serde(default)]
+    pub code: String,
 }
 
 impl Resource {
@@ -195,6 +251,9 @@ impl Resource {
             overtime_rate: 0.0,
             cost_per_use: 0.0,
             base_calendar: "Standard".into(),
+            notes: String::new(),
+            email: String::new(),
+            code: String::new(),
         }
     }
 
@@ -281,6 +340,35 @@ pub struct Task {
     pub assignments: Vec<Assignment>,
     pub fixed_cost: f64,
     pub active: bool,
+    /// Flags this task has been told to stop showing. Empty for almost every
+    /// task, so it costs nothing in a saved plan.
+    #[serde(default)]
+    pub ignored_issues: Vec<IssueKind>,
+    /// Things outside the plan this task waits on.
+    #[serde(default)]
+    pub external_predecessors: Vec<ExternalId>,
+    /// What this task holds in the plan's spare fields. Empty for most tasks,
+    /// so it costs nothing in a saved plan.
+    #[serde(default)]
+    pub custom: crate::custom::CustomValues,
+    /// Row colours, when the planner has set them. Empty means the theme's.
+    #[serde(default)]
+    pub text_colour: String,
+    #[serde(default)]
+    pub fill_colour: String,
+    /// Emphasis the planner put on this row by hand. False is the theme's.
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub underline: bool,
+    /// Empty family and zero size both mean the theme decides, which is what
+    /// nearly every row wants, so neither costs anything in a saved plan.
+    #[serde(default)]
+    pub font_family: String,
+    #[serde(default)]
+    pub font_size_pt: f32,
     pub collapsed: bool,
     /// Start typed by the user; authoritative only for manually scheduled tasks.
     pub manual_start: Option<NaiveDateTime>,
@@ -306,6 +394,16 @@ impl Task {
             assignments: Vec::new(),
             fixed_cost: 0.0,
             active: true,
+            ignored_issues: Vec::new(),
+            external_predecessors: Vec::new(),
+            custom: Default::default(),
+            text_colour: String::new(),
+            fill_colour: String::new(),
+            bold: false,
+            italic: false,
+            underline: false,
+            font_family: String::new(),
+            font_size_pt: 0.0,
             collapsed: false,
             manual_start: None,
             baseline: None,
@@ -437,6 +535,12 @@ pub struct Project {
     pub tasks: Vec<Task>,
     pub links: Vec<Link>,
     pub resources: Vec<Resource>,
+    /// Things outside the plan that work waits on.
+    #[serde(default)]
+    pub external: Vec<ExternalDependency>,
+    /// The spare fields this plan has put to use.
+    #[serde(default)]
+    pub custom_fields: crate::custom::CustomFields,
     pub currency_symbol: String,
     pub show_project_summary: bool,
     #[serde(default)]
@@ -471,6 +575,8 @@ impl Project {
             tasks: Vec::new(),
             links: Vec::new(),
             resources: Vec::new(),
+            external: Vec::new(),
+            custom_fields: Default::default(),
             currency_symbol: "$".into(),
             show_project_summary: false,
             bar_styles: BarStyles::default(),
@@ -491,6 +597,91 @@ impl Project {
         let id = self.next_resource_id;
         self.next_resource_id += 1;
         id
+    }
+
+    /// The next free external dependency identifier.
+    ///
+    /// Taken from what is already there rather than from a counter on the
+    /// project, so a plan that has been through an import or a merge cannot
+    /// hand out an identifier that is already in use.
+    pub fn allocate_external_id(&mut self) -> ExternalId {
+        self.external.iter().map(|e| e.id).max().unwrap_or(0) + 1
+    }
+
+    pub fn external(&self, id: ExternalId) -> Option<&ExternalDependency> {
+        self.external.iter().find(|entry| entry.id == id)
+    }
+
+    /// What a task waits on outside the plan.
+    pub fn externals_of(&self, index: usize) -> Vec<&ExternalDependency> {
+        let Some(task) = self.tasks.get(index) else {
+            return Vec::new();
+        };
+        task.external_predecessors
+            .iter()
+            .filter_map(|id| self.external(*id))
+            .collect()
+    }
+
+    /// What a task shows for a custom field.
+    ///
+    /// A summary row shows the rollup of its children when the field has one,
+    /// because that is the whole point of setting a rollup. Its own typed value
+    /// is used otherwise, and when the rollup produces nothing.
+    pub fn custom_value(&self, index: usize, slot: crate::custom::Slot) -> String {
+        let own = self
+            .tasks
+            .get(index)
+            .and_then(|task| task.custom.get(&slot))
+            .cloned()
+            .unwrap_or_default();
+
+        let Some(field) = self.custom_fields.get(&slot) else {
+            return own;
+        };
+        if field.rollup == crate::custom::Rollup::None || !self.is_summary(index) {
+            return own;
+        }
+
+        let children: Vec<String> = self
+            .descendants(index)
+            .filter(|&child| !self.is_summary(child))
+            .map(|child| {
+                self.tasks[child]
+                    .custom
+                    .get(&slot)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        field.roll_up(&children).unwrap_or(own)
+    }
+
+    /// Put a value into a custom field, if the field will take it.
+    pub fn set_custom_value(&mut self, index: usize, slot: crate::custom::Slot, value: &str) -> bool {
+        if let Some(field) = self.custom_fields.get(&slot)
+            && !field.accepts(value)
+        {
+            return false;
+        }
+        let Some(task) = self.tasks.get_mut(index) else {
+            return false;
+        };
+        if value.trim().is_empty() {
+            task.custom.remove(&slot);
+        } else {
+            task.custom.insert(slot, value.trim().to_string());
+        }
+        true
+    }
+
+    /// The earliest a task can start given what it waits on outside the plan.
+    pub fn external_ready(&self, index: usize) -> Option<NaiveDateTime> {
+        self.externals_of(index)
+            .iter()
+            .map(|entry| entry.available)
+            .max()
     }
 
     pub fn index_of(&self, id: TaskId) -> Option<usize> {
@@ -956,5 +1147,107 @@ mod tests {
         assert!(!project.is_marker(0), "but it is a block, not a diamond");
         assert!(!project.is_marker(1), "a task with duration is a bar");
         assert!(project.is_marker(2), "a leaf with no duration is a diamond");
+    }
+}
+
+#[cfg(test)]
+mod custom_field_tests {
+    use super::*;
+    use crate::custom::{CustomField, CustomKind, Rollup, Slot};
+    use chrono::NaiveDate;
+
+    fn plan() -> Project {
+        let start = NaiveDate::from_ymd_opt(2026, 1, 5)
+            .unwrap()
+            .and_hms_opt(8, 0, 0)
+            .unwrap();
+        let mut project = Project::blank(start);
+        project.tasks.clear();
+        // A summary with two children under it.
+        for (level, name) in [(0u16, "Phase"), (1, "One"), (1, "Two")] {
+            let id = project.allocate_task_id();
+            let mut task = Task::new(id, name, 480);
+            task.outline_level = level;
+            project.tasks.push(task);
+        }
+        project
+    }
+
+    fn with_rollup(project: &mut Project, slot: Slot, rollup: Rollup) {
+        let mut field = CustomField::new(slot);
+        field.rollup = rollup;
+        project.custom_fields.insert(slot, field);
+    }
+
+    #[test]
+    fn a_value_set_on_a_task_reads_back() {
+        let mut project = plan();
+        let slot = Slot::new(CustomKind::Text, 3);
+        assert!(project.set_custom_value(1, slot, "Delivery"));
+        assert_eq!(project.custom_value(1, slot), "Delivery");
+    }
+
+    #[test]
+    fn clearing_a_cell_removes_it_rather_than_storing_an_empty_string() {
+        // Otherwise every task a user ever touched carries dead weight in the
+        // saved plan.
+        let mut project = plan();
+        let slot = Slot::new(CustomKind::Text, 1);
+        project.set_custom_value(1, slot, "Delivery");
+        project.set_custom_value(1, slot, "   ");
+        assert!(project.tasks[1].custom.is_empty());
+    }
+
+    #[test]
+    fn a_summary_row_shows_the_rollup_of_its_children() {
+        let mut project = plan();
+        let slot = Slot::new(CustomKind::Number, 1);
+        with_rollup(&mut project, slot, Rollup::Sum);
+        project.set_custom_value(1, slot, "10");
+        project.set_custom_value(2, slot, "32");
+
+        assert!(project.is_summary(0));
+        assert_eq!(project.custom_value(0, slot), "42");
+    }
+
+    #[test]
+    fn a_field_with_no_rollup_leaves_the_summary_row_alone() {
+        let mut project = plan();
+        let slot = Slot::new(CustomKind::Text, 1);
+        with_rollup(&mut project, slot, Rollup::None);
+        project.set_custom_value(0, slot, "Typed here");
+        project.set_custom_value(1, slot, "Child");
+        assert_eq!(project.custom_value(0, slot), "Typed here");
+    }
+
+    #[test]
+    fn a_rollup_that_produces_nothing_falls_back_to_what_was_typed() {
+        let mut project = plan();
+        let slot = Slot::new(CustomKind::Number, 1);
+        with_rollup(&mut project, slot, Rollup::Sum);
+        project.set_custom_value(0, slot, "manual");
+        assert_eq!(
+            project.custom_value(0, slot),
+            "manual",
+            "no children have values, so the summary keeps its own"
+        );
+    }
+
+    #[test]
+    fn a_restricted_field_refuses_a_value_off_its_list() {
+        use crate::custom::LookupValue;
+        let mut project = plan();
+        let slot = Slot::new(CustomKind::Text, 1);
+        let mut field = CustomField::new(slot);
+        field.lookup = vec![LookupValue {
+            value: "Delivery".into(),
+            description: String::new(),
+        }];
+        field.lookup_only = true;
+        project.custom_fields.insert(slot, field);
+
+        assert!(!project.set_custom_value(1, slot, "Legal"));
+        assert_eq!(project.custom_value(1, slot), "");
+        assert!(project.set_custom_value(1, slot, "Delivery"));
     }
 }

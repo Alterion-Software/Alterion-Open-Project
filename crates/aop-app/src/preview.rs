@@ -88,7 +88,8 @@ pub fn mini_gantt(
                     let left = x(task.scheduled.start);
                     let right = x(task.scheduled.finish);
                     let w = (right - left).max(2.0);
-                    let critical = task.scheduled.critical && show_critical;
+                    let critical =
+                        show_critical && aop_core::issues::shows_as_critical(project, index);
                     let indent = (task.outline_level as f64 * 3.0).min(9.0);
                     let fill = if summary {
                         palette.summary

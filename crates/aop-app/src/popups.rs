@@ -7,7 +7,7 @@ use aop_core::{format_duration, parse_duration, LinkType, TaskId};
 
 use crate::controls::{Choice, Dropdown};
 use crate::icons::icon;
-use crate::state::AppState;
+use crate::state::{AppState, Column};
 
 /// Shared shell: a scrim that closes on click, plus an anchored panel.
 #[component]
@@ -39,6 +39,33 @@ fn Anchored(width: f64, children: Element) -> Element {
 
 #[component]
 pub fn PredecessorPopup(row: usize) -> Element {
+    rsx! {
+        Anchored { width: 560.0,
+            PredecessorPicker { row }
+            div { style: "display: flex; justify-content: flex-end; margin-top: 10px;",
+                DonePopup {}
+            }
+        }
+    }
+}
+
+/// Closes whichever picker popup is open.
+#[component]
+fn DonePopup() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    rsx! {
+        button { class: "btn", onclick: move |_| state.write().editing = None, "Done" }
+    }
+}
+
+/// The predecessor picker itself: every task that could be depended on, shown
+/// at its outline level with a tick box, plus the typed form for planners who
+/// know the row numbers.
+///
+/// Used both by the popup the grid opens and by the Predecessors tab of Task
+/// Information, so the two cannot drift apart.
+#[component]
+pub fn PredecessorPicker(row: usize) -> Element {
     let mut state = use_context::<Signal<AppState>>();
 
     // Everything that could be a predecessor: the whole outline except this
@@ -91,8 +118,23 @@ pub fn PredecessorPopup(row: usize) -> Element {
 
     let chosen = rows.iter().filter(|r| r.linked.is_some()).count();
 
+    // Seeded with what the cell already says, so typing edits rather than
+    // starts from nothing.
+    let mut typed = use_signal(|| {
+        let s = state.read();
+        s.project
+            .tasks
+            .get(row)
+            .map(|task| s.project.predecessor_text(task.id))
+            .unwrap_or_default()
+    });
+    let mut commit = move || {
+        let text = typed();
+        state.write().commit_cell(row, Column::Predecessors, &text);
+    };
+
     rsx! {
-        Anchored { width: 560.0,
+        div { class: "picker",
             div { class: "ctxheader", "Predecessors of {task_name}" }
 
             if rows.is_empty() {
@@ -171,6 +213,20 @@ pub fn PredecessorPopup(row: usize) -> Element {
                 "delays the successor: 2 days waits, -1 day overlaps."
             }
 
+            // Typing is faster than hunting for a row once you know the number,
+            // so the same cell text Project accepts is accepted here.
+            div { class: "pred-type",
+                label { "Or type it" }
+                input {
+                    class: "bs-input",
+                    placeholder: "3, 5FS+2d, 7SS",
+                    value: "{typed}",
+                    oninput: move |event| typed.set(event.value()),
+                    onkeydown: move |event| if event.key() == Key::Enter { commit() },
+                }
+                button { class: "btn", onclick: move |_| commit(), "Set" }
+            }
+
             div { class: "pred-foot",
                 span { class: "recent-path",
                     {
@@ -181,13 +237,12 @@ pub fn PredecessorPopup(row: usize) -> Element {
                         }
                     }
                 }
-                button { class: "btn", onclick: move |_| state.write().editing = None, "Done" }
             }
         }
     }
 }
 
-fn signed_lag(minutes: i64) -> String {
+pub fn signed_lag(minutes: i64) -> String {
     if minutes < 0 {
         format!("-{}", format_duration(-minutes))
     } else {
@@ -195,7 +250,7 @@ fn signed_lag(minutes: i64) -> String {
     }
 }
 
-fn parse_signed_lag(text: &str) -> i64 {
+pub fn parse_signed_lag(text: &str) -> i64 {
     let trimmed = text.trim();
     let negative = trimmed.starts_with('-');
     let body = trimmed.trim_start_matches(['-', '+']).trim();
@@ -211,8 +266,40 @@ fn parse_signed_lag(text: &str) -> i64 {
 
 #[component]
 pub fn ResourcePopup(row: usize) -> Element {
+    rsx! {
+        Anchored { width: 460.0,
+            ResourcePicker { row }
+            div { style: "display: flex; justify-content: flex-end; margin-top: 10px;",
+                DonePopup {}
+            }
+        }
+    }
+}
+
+/// The resource picker itself: every resource with a tick box and its units,
+/// plus the typed form Project accepts in the Resource Names cell.
+///
+/// Used both by the popup the grid opens and by the Resources tab of Task
+/// Information, so the two cannot drift apart.
+#[component]
+pub fn ResourcePicker(row: usize) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let mut new_name = use_signal(String::new);
+
+    // Seeded with what the cell already says, so typing edits rather than
+    // starts from nothing.
+    let mut typed = use_signal(|| {
+        let s = state.read();
+        s.project
+            .tasks
+            .get(row)
+            .map(|task| s.project.resource_text(task))
+            .unwrap_or_default()
+    });
+    let mut commit = move || {
+        let text = typed();
+        state.write().commit_cell(row, Column::Resources, &text);
+    };
 
     let (task_name, resources, currency) = {
         let s = state.read();
@@ -237,7 +324,7 @@ pub fn ResourcePopup(row: usize) -> Element {
     };
 
     rsx! {
-        Anchored { width: 460.0,
+        div { class: "picker",
             div { class: "ctxheader", "Resources for {task_name}" }
 
             if resources.is_empty() {
@@ -325,12 +412,20 @@ pub fn ResourcePopup(row: usize) -> Element {
                 }
             }
 
+            div { class: "pred-type",
+                label { "Or type it" }
+                input {
+                    class: "bs-input",
+                    placeholder: "Alice[50%], Bob",
+                    value: "{typed}",
+                    oninput: move |event| typed.set(event.value()),
+                    onkeydown: move |event| if event.key() == Key::Enter { commit() },
+                }
+                button { class: "btn", onclick: move |_| commit(), "Set" }
+            }
+
             div { class: "hint",
                 "Units are the share of a person's time. 50% on a 5 day task books 20 hours of work." }
-
-            div { style: "display: flex; justify-content: flex-end; margin-top: 10px;",
-                button { class: "btn", onclick: move |_| state.write().editing = None, "Done" }
-            }
         }
     }
 }
