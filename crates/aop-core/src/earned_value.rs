@@ -20,11 +20,15 @@
 //! at flat units for the whole task, so an even spread is not an approximation
 //! of what the model says, it is exactly what the model says.
 //!
-//! The second is that resources have a `base_calendar` which the scheduler has
-//! never used. Rather than invent a second opinion about working time here,
-//! everything is spread across the **project** calendar, for everyone. When the
-//! scheduler learns to honour resource calendars this is the other place that
-//! will need to.
+//! The second is about whose calendar the spreading is done against. The
+//! scheduler now works each task to the intersection of its own calendar and
+//! its resources' (see `effective`), but everything here is still spread across
+//! the **project** calendar, for everyone. That is a known gap rather than a
+//! decision: a cost curve for a task somebody is away in the middle of will put
+//! money on days they were not there, even though the task's *dates* now step
+//! over those days correctly. Closing it means threading `EffectiveCalendars`
+//! through `spread`, and it is the one place left that still holds the old
+//! assumption.
 
 use std::collections::BTreeMap;
 

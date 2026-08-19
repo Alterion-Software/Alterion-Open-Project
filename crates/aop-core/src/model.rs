@@ -8,7 +8,7 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
-use crate::calendar::WorkCalendar;
+use crate::calendar::{CalendarException, WorkCalendar};
 use crate::MINUTES_PER_DAY;
 
 pub type TaskId = u32;
@@ -74,6 +74,9 @@ pub enum IssueKind {
     ManuallyScheduled,
     /// Switched off, so the scheduler ignores it.
     Inactive,
+    /// The calendars this task has to satisfy leave no working time at all, so
+    /// there is nowhere for it to be done.
+    NoWorkingTime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,7 +221,16 @@ pub struct Resource {
     pub standard_rate: f64,
     pub overtime_rate: f64,
     pub cost_per_use: f64,
+    /// Which calendar in the plan's library this person keeps to. Empty, or a
+    /// name the library does not hold, means the project calendar, which is
+    /// what every plan written before resource calendars existed says.
     pub base_calendar: String,
+    /// This person's own non-working time on top of that base: leave, a
+    /// sabbatical, the two days a week they are not here. A public holiday is
+    /// not one of these; it belongs on the calendar everybody shares. Empty for
+    /// most people, so it costs nothing in a saved plan.
+    #[serde(default)]
+    pub calendar_exceptions: Vec<CalendarException>,
     /// What the planner wrote about this person. Empty for most, so it costs
     /// nothing in a saved plan.
     #[serde(default)]
@@ -251,6 +263,7 @@ impl Resource {
             overtime_rate: 0.0,
             cost_per_use: 0.0,
             base_calendar: "Standard".into(),
+            calendar_exceptions: Vec::new(),
             notes: String::new(),
             email: String::new(),
             code: String::new(),
@@ -301,6 +314,12 @@ pub struct Scheduled {
     pub duration_minutes: i64,
     pub work_minutes: i64,
     pub cost: f64,
+    /// Set when the calendars this task has to satisfy leave no working time
+    /// at all, so its dates were worked out against the project calendar as a
+    /// stand-in. False for every task in a plan that has not composed itself
+    /// into a corner, so it costs nothing in a saved plan.
+    #[serde(default)]
+    pub no_working_time: bool,
 }
 
 impl Default for Scheduled {
@@ -320,6 +339,7 @@ impl Default for Scheduled {
             duration_minutes: 0,
             work_minutes: 0,
             cost: 0.0,
+            no_working_time: false,
         }
     }
 }
@@ -370,6 +390,17 @@ pub struct Task {
     #[serde(default)]
     pub font_size_pt: f32,
     pub collapsed: bool,
+    /// Which calendar in the plan's library this task is worked to, when it is
+    /// not the project's. Empty means the project's, which is what nearly
+    /// every task wants and what every plan written before this existed says.
+    #[serde(default)]
+    pub calendar: String,
+    /// Whether the people assigned to this task are consulted about when it can
+    /// happen. Only meaningful when `calendar` names one, which is Project's
+    /// own rule: without a task calendar there is nothing left to schedule
+    /// against once the resources are dropped.
+    #[serde(default)]
+    pub ignore_resource_calendars: bool,
     /// Start typed by the user; authoritative only for manually scheduled tasks.
     pub manual_start: Option<NaiveDateTime>,
     pub baseline: Option<Baseline>,
@@ -434,6 +465,8 @@ impl Task {
             font_family: String::new(),
             font_size_pt: 0.0,
             collapsed: false,
+            calendar: String::new(),
+            ignore_resource_calendars: false,
             manual_start: None,
             baseline: None,
             scheduled: Scheduled::default(),
@@ -621,7 +654,15 @@ pub struct Project {
     pub schedule_from: ScheduleFrom,
     pub status_date: Option<NaiveDateTime>,
     pub current_date: NaiveDateTime,
+    /// The calendar everything follows unless it says otherwise. It is one
+    /// entry in the library, and the one every name resolves to when nothing
+    /// else matches.
     pub calendar: WorkCalendar,
+    /// The rest of the library: bases a task or a person can name. Empty in a
+    /// plan that has only ever used the project calendar, which is every plan
+    /// written before this existed.
+    #[serde(default)]
+    pub calendars: Vec<WorkCalendar>,
     pub tasks: Vec<Task>,
     pub links: Vec<Link>,
     pub resources: Vec<Resource>,
@@ -679,6 +720,7 @@ impl Project {
             status_date: None,
             current_date: start,
             calendar: WorkCalendar::standard(),
+            calendars: Vec::new(),
             tasks: Vec::new(),
             links: Vec::new(),
             resources: Vec::new(),
@@ -815,6 +857,83 @@ impl Project {
 
     pub fn resource(&self, id: ResourceId) -> Option<&Resource> {
         self.resources.iter().find(|r| r.id == id)
+    }
+
+    // ---- the calendar library -------------------------------------------
+
+    /// Every calendar the plan knows by name, the project's own first.
+    ///
+    /// The project calendar leads because it is what an unresolved name falls
+    /// back to, and a picker that offers it first is offering the answer that
+    /// changes nothing.
+    pub fn calendar_library(&self) -> impl Iterator<Item = &WorkCalendar> {
+        std::iter::once(&self.calendar).chain(self.calendars.iter())
+    }
+
+    /// The calendar a name refers to, if the library holds one.
+    pub fn calendar_named(&self, name: &str) -> Option<&WorkCalendar> {
+        self.calendar_library().find(|cal| cal.name == name)
+    }
+
+    pub fn calendar_named_mut(&mut self, name: &str) -> Option<&mut WorkCalendar> {
+        if self.calendar.name == name {
+            return Some(&mut self.calendar);
+        }
+        self.calendars.iter_mut().find(|cal| cal.name == name)
+    }
+
+    /// The calendar a name refers to, falling back to the project's.
+    ///
+    /// Falling back rather than failing is deliberate. A name the library has
+    /// lost, through an import, a merge, or a calendar someone deleted, must
+    /// not stop a plan opening or leave a task with nowhere to be done; it has
+    /// to mean what it meant before calendars were named at all.
+    pub fn calendar_or_project(&self, name: &str) -> &WorkCalendar {
+        if name.trim().is_empty() {
+            return &self.calendar;
+        }
+        self.calendar_named(name).unwrap_or(&self.calendar)
+    }
+
+    /// Add a base calendar to the library under a name nothing else uses.
+    ///
+    /// Returns the name it ended up with, which is the one a task or a person
+    /// then has to be pointed at.
+    pub fn add_base_calendar(&mut self, mut calendar: WorkCalendar) -> String {
+        if calendar.name.trim().is_empty() {
+            calendar.name = "Calendar".into();
+        }
+        if self.calendar_named(&calendar.name).is_some() {
+            let stem = calendar.name.clone();
+            let mut suffix = 2u32;
+            while self.calendar_named(&format!("{stem} {suffix}")).is_some() {
+                suffix += 1;
+            }
+            calendar.name = format!("{stem} {suffix}");
+        }
+        let name = calendar.name.clone();
+        self.calendars.push(calendar);
+        name
+    }
+
+    /// Drop a base calendar and put anything that named it back on the project
+    /// calendar, so nothing is left pointing at a name that no longer exists.
+    pub fn remove_base_calendar(&mut self, name: &str) -> bool {
+        let Some(at) = self.calendars.iter().position(|cal| cal.name == name) else {
+            return false;
+        };
+        self.calendars.remove(at);
+        for task in &mut self.tasks {
+            if task.calendar == name {
+                task.calendar.clear();
+            }
+        }
+        for resource in &mut self.resources {
+            if resource.base_calendar == name {
+                resource.base_calendar.clear();
+            }
+        }
+        true
     }
 
     // ---- outline --------------------------------------------------------

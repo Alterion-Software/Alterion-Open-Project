@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 
 use crate::calendar::WorkCalendar;
+use crate::effective::EffectiveCalendars;
 use crate::model::{ConstraintType, Project, ResourceId, ResourceKind, TaskId, TaskMode};
 
 /// How many delays one run will apply before giving up.
@@ -122,6 +123,12 @@ pub fn level(project: &mut Project, options: &LevelingOptions) -> LevelingResult
     let was_over: HashSet<ResourceId> = before.overallocations.iter().map(|o| o.resource).collect();
 
     let candidates = candidate_rows(project, options);
+    let run = Run {
+        options,
+        candidates: &candidates,
+        baseline_finish,
+        calendars: EffectiveCalendars::build(project),
+    };
     let mut delayed: Vec<(usize, i64)> = Vec::new();
     // Conflicts nothing can be done about, so the search moves past them
     // instead of offering them again.
@@ -129,18 +136,10 @@ pub fn level(project: &mut Project, options: &LevelingOptions) -> LevelingResult
     let mut moves = 0usize;
 
     while moves < MAX_MOVES {
-        let Some((resource, date)) = next_conflict(project, options, &stuck) else {
+        let Some((resource, date)) = next_conflict(project, options, &stuck, &run.calendars) else {
             break;
         };
-        if resolve_one(
-            project,
-            resource,
-            date,
-            options,
-            &candidates,
-            baseline_finish,
-            &mut delayed,
-        ) {
+        if resolve_one(project, resource, date, &run, &mut delayed) {
             moves += 1;
             // A move changes every date after it, so a conflict written off
             // earlier may now involve different tasks and deserves another
@@ -225,6 +224,7 @@ fn next_conflict(
     project: &Project,
     options: &LevelingOptions,
     stuck: &HashSet<(ResourceId, NaiveDate)>,
+    calendars: &EffectiveCalendars,
 ) -> Option<(ResourceId, NaiveDate)> {
     let mut best: Option<(ResourceId, NaiveDate)> = None;
     for resource in &project.resources {
@@ -233,7 +233,7 @@ fn next_conflict(
         {
             continue;
         }
-        for date in overloaded_days(project, resource.id) {
+        for date in overloaded_days(project, resource.id, calendars) {
             if stuck.contains(&(resource.id, date)) {
                 continue;
             }
@@ -260,7 +260,11 @@ fn next_conflict(
 /// resource, and levelling has to keep going once that one is cleared, so the
 /// daily load is rebuilt here on exactly the same terms: whole working days,
 /// active leaf rows, work resources only.
-fn overloaded_days(project: &Project, resource: ResourceId) -> Vec<NaiveDate> {
+fn overloaded_days(
+    project: &Project,
+    resource: ResourceId,
+    calendars: &EffectiveCalendars,
+) -> Vec<NaiveDate> {
     let Some(limit) = project
         .resource(resource)
         .filter(|entry| entry.kind == ResourceKind::Work)
@@ -281,11 +285,16 @@ fn overloaded_days(project: &Project, resource: ResourceId) -> Vec<NaiveDate> {
         let Some(task) = project.tasks.get(index) else {
             continue;
         };
+        // The days this task is really worked on, which is the intersection of
+        // the calendars it has to satisfy. Reading the project calendar instead
+        // would book somebody on a day they are away and then move work onto
+        // the days they are not there to clear it.
+        let worked = calendars.for_row(index);
         let mut date = task.scheduled.start.date();
         let last = task.scheduled.finish.date();
         let mut seen = 0u32;
         while date <= last && seen < MAX_TASK_DAYS {
-            if project.calendar.is_working_day(date) {
+            if worked.is_working_day(date) {
                 *load.entry(date).or_insert(0.0) += units;
             }
             date += Duration::days(1);
@@ -364,15 +373,29 @@ fn order_key(
 
 // ---- making the move ----------------------------------------------------
 
+/// What one levelling run knows before it starts and does not change.
+///
+/// Gathered into one place because every step needs all of it and passing the
+/// four separately made the signatures longer than the work they described.
+struct Run<'a> {
+    options: &'a LevelingOptions,
+    /// Rows this run is allowed to touch at all.
+    candidates: &'a HashSet<usize>,
+    /// The finish the plan had before anything moved, which is what
+    /// `only_within_slack` measures a proposed delay against.
+    baseline_finish: NaiveDateTime,
+    /// What each row is worked to. Levelling changes assignments and calendars
+    /// not at all, so this is composed once for the whole run.
+    calendars: EffectiveCalendars,
+}
+
 /// Try to clear one resource's conflict on one day. Reports whether a task was
 /// actually delayed, so the caller can write the conflict off when not.
 fn resolve_one(
     project: &mut Project,
     resource: ResourceId,
     date: NaiveDate,
-    options: &LevelingOptions,
-    candidates: &HashSet<usize>,
-    baseline_finish: NaiveDateTime,
+    run: &Run<'_>,
     delayed: &mut Vec<(usize, i64)>,
 ) -> bool {
     let Some(limit) = project.resource(resource).map(|entry| entry.max_units) else {
@@ -385,7 +408,7 @@ fn resolve_one(
         // it takes the problem with it, so it stays put and gets reported.
         return false;
     }
-    running.sort_by_key(|&index| order_key(project, index, options.order));
+    running.sort_by_key(|&index| order_key(project, index, run.options.order));
 
     let mut booked = 0.0f64;
     let mut kept_finish: Option<NaiveDateTime> = None;
@@ -396,7 +419,7 @@ fn resolve_one(
             .tasks
             .get(index)
             .map(|task| task.scheduled.finish)
-            .unwrap_or(baseline_finish);
+            .unwrap_or(run.baseline_finish);
         // The first task always keeps its dates, even where it alone is over
         // capacity, so that there is something for the rest to wait behind.
         if kept_finish.is_none() || booked + units <= limit + UNIT_TOLERANCE {
@@ -410,16 +433,17 @@ fn resolve_one(
         return false;
     };
 
-    let calendar = project.calendar.clone();
     // Capacity frees up the day after the work that kept its place finishes,
     // and never earlier than the day after the conflict itself, since a load is
-    // counted whole days at a time.
-    let target = first_instant_after(&calendar, kept_finish.date().max(date));
+    // counted whole days at a time. Which instant that lands on is a question
+    // for each delayed task's own calendar, below: two people freed on the same
+    // day do not necessarily start again at the same hour.
+    let free_from = kept_finish.date().max(date);
 
     // Least important first: the queue is in keeping order, so the tail is what
     // the chosen ordering says should yield.
     for &index in overflow.iter().rev() {
-        if !can_be_delayed(project, index, options, candidates) {
+        if !can_be_delayed(project, index, run.options, run.candidates) {
             continue;
         }
         let Some(task) = project.tasks.get(index) else {
@@ -427,6 +451,8 @@ fn resolve_one(
         };
         let previous = (task.constraint, task.constraint_date);
         let was_start = task.scheduled.start;
+        let calendar = run.calendars.for_row(index).clone();
+        let target = first_instant_after(&calendar, free_from);
         if target <= was_start {
             continue;
         }
@@ -448,7 +474,8 @@ fn resolve_one(
             .get(index)
             .map(|task| calendar.work_minutes_between(was_start, task.scheduled.start))
             .unwrap_or(0);
-        let pushed_the_finish = options.only_within_slack && report.finish > baseline_finish;
+        let pushed_the_finish =
+            run.options.only_within_slack && report.finish > run.baseline_finish;
         if pushed_the_finish || moved <= 0 {
             // Either the delay would cost the project its finish date, or the
             // constraint bought nothing and would only clutter the plan.
@@ -583,6 +610,38 @@ mod tests {
         assert!(
             project.tasks[1].scheduled.start > project.tasks[0].scheduled.finish,
             "the delayed task waits for the other to finish"
+        );
+    }
+
+    #[test]
+    fn levelling_does_not_move_work_onto_a_day_nobody_is_there() {
+        // Ana is booked twice over on the Monday and is then away all week.
+        // The delayed task has to land the following Monday: pushing it to a
+        // day she is not there would clear the report and not the problem.
+        let (mut project, ana) = clash();
+        if let Some(resource) = project.resources.iter_mut().find(|r| r.id == ana) {
+            resource.calendar_exceptions.push(crate::CalendarException {
+                name: "Leave".into(),
+                from: NaiveDate::from_ymd_opt(2026, 8, 19).unwrap(),
+                to: NaiveDate::from_ymd_opt(2026, 8, 28).unwrap(),
+                shifts: crate::DayShifts::nonworking(),
+            });
+        }
+        let _ = crate::schedule(&mut project);
+
+        let result = level(&mut project, &LevelingOptions::default());
+        assert_eq!(result.delayed.len(), 1);
+
+        let moved = project.tasks[1].scheduled.start;
+        assert!(
+            moved.date() >= NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
+            "it waits until she is back, landing on {moved} instead"
+        );
+        assert!(
+            project
+                .resource(ana)
+                .is_some_and(|r| r.calendar_exceptions.iter().all(|ex| moved.date() > ex.to)),
+            "and not in the middle of her leave"
         );
     }
 

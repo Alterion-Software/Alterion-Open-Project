@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use dioxus::prelude::*;
 
+use aop_core::holidays;
+use aop_core::sheet::{DateOrder, Field as SheetField, Mapping, Report, Sheet};
 use aop_core::{format_work, persist, templates, Project, APP_NAME};
 use chrono::Datelike;
 
@@ -41,6 +43,7 @@ pub fn Backstage(page: BackstagePage) -> Element {
                     BackstagePage::SaveAs,
                     BackstagePage::Print,
                     BackstagePage::Export,
+                    BackstagePage::Import,
                 ] {
                     {
                         let class = if entry == page { "bs-item active" } else { "bs-item" };
@@ -98,6 +101,7 @@ pub fn Backstage(page: BackstagePage) -> Element {
                     BackstagePage::Save | BackstagePage::SaveAs => rsx! { FileBrowser { saving: true } },
                     BackstagePage::Print => rsx! { PrintPage {} },
                     BackstagePage::Export => rsx! { ExportPage {} },
+                    BackstagePage::Import => rsx! { ImportPage {} },
                     BackstagePage::About => rsx! { AboutPage {} },
                     BackstagePage::Options => rsx! { OptionsPageView {} },
                 }
@@ -485,9 +489,22 @@ fn glyph_for(path: &std::path::Path) -> &'static str {
 }
 
 /// A minimal file browser so Open and Save As work without a native dialog.
+///
+/// `on_pick` is how the Import page borrows it: with a handler the browser
+/// hands the path over instead of opening it, and the page it sits in supplies
+/// its own heading. Sharing the browser is the point, so that a file visible
+/// on the Open page is visible on the Import page as well.
+///
+/// `accept` narrows the list to particular extensions for a page that wants
+/// something Open cannot open, such as a holiday calendar.
 #[component]
-fn FileBrowser(saving: bool) -> Element {
+fn FileBrowser(
+    saving: bool,
+    on_pick: Option<EventHandler<PathBuf>>,
+    accept: Option<Vec<String>>,
+) -> Element {
     let mut state = use_context::<Signal<AppState>>();
+    let embedded = on_pick.is_some();
 
     let initial_dir = {
         let s = state.read();
@@ -519,9 +536,18 @@ fn FileBrowser(saving: bool) -> Element {
                 if name.starts_with('.') {
                     continue;
                 }
+                let offered = match &accept {
+                    Some(wanted) => path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| {
+                            wanted.iter().any(|want| extension.eq_ignore_ascii_case(want))
+                        }),
+                    None => crate::state::offered_in_browser(&path, saving),
+                };
                 if path.is_dir() {
                     folders.push((name, path));
-                } else if crate::state::offered_in_browser(&path, saving) {
+                } else if offered {
                     files.push((name, path));
                 }
             }
@@ -546,10 +572,12 @@ fn FileBrowser(saving: bool) -> Element {
     };
 
     rsx! {
-        h1 { class: "bs-title", "{title}" }
-        Confirmation {}
+        if !embedded {
+            h1 { class: "bs-title", "{title}" }
+            Confirmation {}
+        }
 
-        if !saving && !recent.is_empty() {
+        if !saving && !embedded && !recent.is_empty() {
             h2 { class: "bs-sub", "Recent" }
             div { class: "recent-list",
                 for entry in recent.iter() {
@@ -572,7 +600,9 @@ fn FileBrowser(saving: bool) -> Element {
             }
         }
 
-        h2 { class: "bs-sub", "Browse" }
+        if !embedded {
+            h2 { class: "bs-sub", "Browse" }
+        }
         div { class: "bs-field",
             label { "Folder" }
             input {
@@ -634,7 +664,9 @@ fn FileBrowser(saving: bool) -> Element {
                     rsx! {
                         button { key: "f{name}", class: "recent-row",
                             onclick: move |_| {
-                                if saving {
+                                if let Some(pick) = on_pick {
+                                    pick.call(target.clone());
+                                } else if saving {
                                     filename.set(stem.clone());
                                 } else {
                                     state.write().guard(PendingAction::Open(target.clone()));
@@ -648,6 +680,7 @@ fn FileBrowser(saving: bool) -> Element {
             }
         }
 
+        if !embedded {
         div { class: "hint",
             "{APP_NAME} plans are stored as .{persist::FILE_EXTENSION} files, a compact binary container."
             if !saving {
@@ -656,6 +689,7 @@ fn FileBrowser(saving: bool) -> Element {
                 "They come in as a new plan, so use Save As to keep one as a ."
                 "{persist::FILE_EXTENSION} file."
             }
+        }
         }
     }
 }
@@ -1082,6 +1116,673 @@ fn ExportPage() -> Element {
             "Use Save As to write a .{persist::FILE_EXTENSION} file that this app can reopen." }
         button { class: "btn", onclick: move |_| state.write().backstage = Some(BackstagePage::SaveAs), "Go to Save As" }
     }
+}
+
+// ----------------------------------------------------------------- Import
+
+/// The Import page: a spreadsheet somebody else wrote, and public holidays.
+///
+/// Two imports rather than one, because they are two different things: one
+/// brings in a plan, the other brings in days nobody works. They share a page
+/// because they share an answer to the same question, which is "this came from
+/// somewhere else, how do I get it in".
+#[component]
+fn ImportPage() -> Element {
+    rsx! {
+        h1 { class: "bs-title", "Import" }
+        Confirmation {}
+        SpreadsheetImport {}
+        HolidayImport {}
+    }
+}
+
+/// How many rows of real data are shown under each heading.
+const SAMPLES: usize = 3;
+
+#[component]
+fn SpreadsheetImport() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    let mut source = use_signal(|| Option::<PathBuf>::None);
+    let mut sheets = use_signal(Vec::<Sheet>::new);
+    let mut which = use_signal(|| 0usize);
+    let mut mapping = use_signal(|| Option::<Mapping>::None);
+    let mut trouble = use_signal(|| Option::<String>::None);
+
+    let plan_name = source()
+        .as_ref()
+        .and_then(|path| path.file_stem())
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Imported plan".to_string());
+
+    // Read once, on the click. Every later change of sheet, heading row or
+    // column works on what is already in memory, so correcting a guess never
+    // waits on the disk.
+    let mut choose = move |path: PathBuf| {
+        trouble.set(None);
+        match aop_core::sheet::survey(&path) {
+            Ok(found) => {
+                // The sheet most likely to be the plan is the first one this
+                // can find a name column in. A workbook usually opens on a
+                // cover sheet, and the plan is behind it.
+                let best = found
+                    .iter()
+                    .position(|sheet| {
+                        Mapping::guess(sheet).column_of(SheetField::Name).is_some()
+                    })
+                    .unwrap_or(0);
+                let guess = found.get(best).map(Mapping::guess);
+                sheets.set(found);
+                which.set(best);
+                mapping.set(guess);
+                source.set(Some(path));
+            }
+            Err(error) => {
+                source.set(None);
+                sheets.set(Vec::new());
+                mapping.set(None);
+                trouble.set(Some(error.to_string()));
+            }
+        }
+    };
+
+    let mut show_sheet = move |index: usize| {
+        which.set(index);
+        let guess = sheets.read().get(index).map(Mapping::guess);
+        mapping.set(guess);
+    };
+
+    // Correcting the heading row re-reads the headings under it, since the
+    // whole point of moving it is that the old row was not the headings.
+    let mut use_heading_row = move |row: usize| {
+        let rebuilt = {
+            let held = sheets.read();
+            let Some(sheet) = held.get(which()) else {
+                return;
+            };
+            let mut map = mapping.read().clone().unwrap_or_else(|| Mapping::guess(sheet));
+            map.heading_row = row;
+            map.columns = aop_core::sheet::guess_columns(sheet, row);
+            map
+        };
+        mapping.set(Some(rebuilt));
+    };
+
+    // Worked out from what is chosen, not from what is on screen, so it costs
+    // nothing until something actually changes.
+    let named = plan_name.clone();
+    let outcome = use_memo(move || {
+        let map = mapping.read().clone()?;
+        let held = sheets.read();
+        let sheet = held.get(which())?;
+        Some(
+            aop_core::sheet::read(sheet, &map, &named)
+                .map(|import| import.report)
+                .map_err(|error| error.to_string()),
+        )
+    });
+
+    let chosen = source();
+    let Some(path) = chosen else {
+        return rsx! {
+            h2 { class: "bs-sub", "Spreadsheet" }
+            div { class: "hint", style: "margin: 0 0 10px;",
+                "A plan somebody keeps in a spreadsheet of their own: any headings, any column order, "
+                "and whatever else is in the file. Nothing is imported until the mapping is right and you say so."
+            }
+            if let Some(message) = trouble() {
+                div { class: "info-alert",
+                    span { class: "fix-icon", {icon("warning", 18)} }
+                    div { style: "flex: 1;", "{message}" }
+                }
+            }
+            FileBrowser { saving: false, on_pick: move |path: PathBuf| choose(path) }
+        };
+    };
+
+    let held = sheets.read();
+    let Some(sheet) = held.get(which()) else {
+        return rsx! {};
+    };
+    let Some(map) = mapping.read().clone() else {
+        return rsx! {};
+    };
+
+    let heading_row = map.heading_row;
+    let dates_mapped = map.column_of(SheetField::Start).is_some()
+        || map.column_of(SheetField::Finish).is_some();
+    let evidence = map.evidence(sheet);
+
+    // The first rows, so the heading row can be picked out by eye rather than
+    // counted. Blank rows are skipped: nobody chooses one.
+    let candidates: Vec<(usize, String)> = sheet
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.iter().any(|cell| !cell.is_empty()))
+        .take(12)
+        .map(|(index, row)| {
+            let text = row
+                .iter()
+                .take(8)
+                .map(|cell| cell.text())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("  |  ");
+            (index, text)
+        })
+        .collect();
+
+    let columns: Vec<(usize, String, String, Vec<String>)> = (0..sheet.width)
+        .map(|column| {
+            (
+                column,
+                sheet.heading(heading_row, column),
+                map.columns
+                    .get(column)
+                    .copied()
+                    .flatten()
+                    .map(|field| field.code().to_string())
+                    .unwrap_or_default(),
+                sheet.samples(column, heading_row + 1, SAMPLES),
+            )
+        })
+        .collect();
+
+    let mut field_choices = vec![Choice::new("", "Leave this column out")];
+    field_choices.extend(
+        SheetField::ALL
+            .iter()
+            .map(|field| Choice::new(field.code(), field.label())),
+    );
+
+    let sheet_choices: Vec<Choice> = held
+        .iter()
+        .enumerate()
+        .map(|(index, sheet)| {
+            Choice::new(
+                index.to_string(),
+                format!("{} ({} rows)", sheet.name, sheet.rows.len()),
+            )
+        })
+        .collect();
+    let sheet_count = held.len();
+    let file = path.display().to_string();
+
+    rsx! {
+        h2 { class: "bs-sub", "Spreadsheet" }
+        div { class: "bs-field",
+            label { "File" }
+            input { class: "bs-input", value: "{file}", disabled: true }
+            button { class: "btn",
+                onclick: move |_| {
+                    source.set(None);
+                    sheets.set(Vec::new());
+                    mapping.set(None);
+                },
+                "Choose another"
+            }
+        }
+
+        if sheet_count > 1 {
+            div { class: "bs-field",
+                label { "Sheet" }
+                Dropdown {
+                    value: which().to_string(),
+                    options: sheet_choices,
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        if let Ok(index) = picked.parse::<usize>() {
+                            show_sheet(index);
+                        }
+                    },
+                }
+            }
+        }
+
+        h3 { class: "imp-step", "The heading row" }
+        div { class: "hint", style: "margin: 0 0 8px;",
+            "Guessed from the first row that reads like headings. Title blocks and logos sit above it more often than not."
+        }
+        div { class: "imp-rows",
+            for (index, text) in candidates {
+                {
+                    let class = if index == heading_row { "imp-row on" } else { "imp-row" };
+                    rsx! {
+                        button { key: "r{index}", class: "{class}",
+                            onclick: move |_| use_heading_row(index),
+                            span { class: "imp-rownum", "Row {index + 1}" }
+                            span { class: "imp-rowtext", "{text}" }
+                        }
+                    }
+                }
+            }
+        }
+
+        h3 { class: "imp-step", "The columns" }
+        div { class: "hint", style: "margin: 0 0 8px;",
+            "Every guess can be changed, and a column left out changes nothing in the plan. The rows under each heading are the file's own."
+        }
+        div { class: "imp-cols",
+            for (column, heading, code, samples) in columns {
+                {
+                    let class = if code.is_empty() { "imp-col" } else { "imp-col on" };
+                    let choices = field_choices.clone();
+                    rsx! {
+                        div { key: "c{column}", class: "{class}",
+                            div { class: "imp-head", title: "{heading}", "{heading}" }
+                            Dropdown {
+                                value: code.clone(),
+                                options: choices,
+                                width: 0.0, large: false, disabled: false,
+                                on_pick: move |picked: String| {
+                                    let mut writer = mapping.write();
+                                    if let Some(map) = writer.as_mut() {
+                                        map.assign(column, SheetField::from_code(&picked));
+                                    }
+                                },
+                            }
+                            div { class: "imp-samples",
+                                if samples.is_empty() {
+                                    div { class: "imp-sample", "(no data)" }
+                                }
+                                for (row, value) in samples.iter().enumerate() {
+                                    div { key: "s{row}", class: "imp-sample", "{value}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if dates_mapped {
+            h3 { class: "imp-step", "Dates" }
+            div { class: "bs-field",
+                label { "Read 12/03/2026 as" }
+                Dropdown {
+                    value: map.date_order.code().to_string(),
+                    options: DateOrder::ALL
+                        .iter()
+                        .map(|order| Choice::new(order.code(), order.label()))
+                        .collect(),
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        let mut writer = mapping.write();
+                        if let Some(map) = writer.as_mut()
+                            && let Some(order) = DateOrder::from_code(&picked)
+                        {
+                            map.date_order = order;
+                        }
+                    },
+                }
+            }
+            div { class: "hint", style: "margin: 0 0 10px;",
+                if evidence.contradictory() {
+                    "This sheet contradicts itself: some dates can only be day first and others can only be month first. Whichever you choose, some of them will come in wrong, so it is worth a look at the file."
+                } else if evidence.proves_day_first > 0 {
+                    "{evidence.proves_day_first} date(s) in this sheet can only be day first, so that is what it was written in. "
+                    "{evidence.ambiguous} more could be read either way and follow the setting above."
+                } else if evidence.proves_month_first > 0 {
+                    "{evidence.proves_month_first} date(s) in this sheet can only be month first, so that is what it was written in. "
+                    "{evidence.ambiguous} more could be read either way and follow the setting above."
+                } else if evidence.ambiguous > 0 {
+                    "Nothing in this sheet settles the question: all {evidence.ambiguous} of its numeric dates could be read either way. "
+                    "The setting above decides, and dates written as 2026-03-12 or 12 Mar 2026 ignore it."
+                } else {
+                    "Every date here says which way round it is, so the setting above changes nothing."
+                }
+            }
+        }
+
+        if map.column_of(SheetField::Duration).is_some() {
+            div { class: "bs-field",
+                label { "A bare number in Duration is" }
+                Dropdown {
+                    value: map.duration_unit.plural().to_string(),
+                    options: aop_core::DurationUnit::ALL
+                        .iter()
+                        .map(|unit| Choice::plain(unit.plural()))
+                        .collect(),
+                    width: 0.0, large: true, disabled: false,
+                    on_pick: move |picked: String| {
+                        let mut writer = mapping.write();
+                        if let Some(map) = writer.as_mut()
+                            && let Some(unit) = aop_core::DurationUnit::from_plural(&picked)
+                        {
+                            map.duration_unit = unit;
+                        }
+                    },
+                }
+            }
+        }
+
+        h3 { class: "imp-step", "What will be imported" }
+        match outcome() {
+            None => rsx! {},
+            Some(Err(message)) => rsx! {
+                div { class: "info-alert",
+                    span { class: "fix-icon", {icon("warning", 18)} }
+                    div { style: "flex: 1;", "{message}" }
+                }
+            },
+            Some(Ok(report)) => {
+                let tasks = report.tasks;
+                let target = path.clone();
+                let title = plan_name.clone();
+                rsx! {
+                    Summary { report: report.clone() }
+                    div { class: "hint", style: "margin: 14px 0 8px;",
+                        "Importing replaces the plan that is open. Nothing has happened yet, and if there is unsaved work you will be asked about it first."
+                    }
+                    button { class: "btn primary",
+                        disabled: tasks == 0,
+                        onclick: move |_| {
+                            // Built again here rather than held from the
+                            // preview: the plan that arrives has to be the one
+                            // the numbers on screen describe.
+                            let built = {
+                                let held = sheets.read();
+                                let Some(sheet) = held.get(which()) else { return };
+                                let Some(map) = mapping.read().clone() else { return };
+                                aop_core::sheet::read(sheet, &map, &title)
+                            };
+                            match built {
+                                Ok(import) => {
+                                    let note = format!(
+                                        "Imported {} tasks from {}. Save As to keep it as a .{} file.",
+                                        import.report.tasks,
+                                        target.display(),
+                                        persist::FILE_EXTENSION
+                                    );
+                                    state.write().stage_import(import.project, target.clone(), note);
+                                }
+                                Err(error) => trouble.set(Some(error.to_string())),
+                            }
+                        },
+                        "Import {tasks} task(s)"
+                    }
+                }
+            }
+        }
+
+        if let Some(message) = trouble() {
+            div { class: "info-alert",
+                span { class: "fix-icon", {icon("warning", 18)} }
+                div { style: "flex: 1;", "{message}" }
+            }
+        }
+    }
+}
+
+/// What the import will do, before any of it happens.
+#[component]
+fn Summary(report: Report) -> Element {
+    let figures: Vec<(&str, String)> = vec![
+        ("Tasks", report.tasks.to_string()),
+        ("Resources", report.resources.to_string()),
+        ("Links", report.links.to_string()),
+        ("Rows skipped", (report.blank_rows + report.skipped_rows).to_string()),
+        ("Columns ignored", report.ignored.len().to_string()),
+        ("Deepest level", report.deepest.to_string()),
+    ];
+
+    let notices = report.notices.clone();
+    let ignored = report.ignored.join(", ");
+
+    rsx! {
+        div { class: "stat-row",
+            for (label, value) in figures {
+                div { key: "{label}", class: "stat-tile",
+                    div { class: "stat-value", "{value}" }
+                    div { class: "stat-label", "{label}" }
+                }
+            }
+        }
+
+        div { class: "info-card", style: "margin-top: 14px; max-width: 760px;",
+            div { class: "info-line",
+                span { class: "k", "Outline" }
+                span { class: "v", "{report.structure.label()}" }
+            }
+            if !report.ignored.is_empty() {
+                div { class: "info-line",
+                    span { class: "k", "Left out" }
+                    span { class: "v", "{ignored}" }
+                }
+            }
+            if report.assumed_dates > 0 {
+                div { class: "info-line",
+                    span { class: "k", "Dates assumed" }
+                    span { class: "v",
+                        "{report.assumed_dates} date(s) could be read either way and follow the setting above"
+                    }
+                }
+            }
+            if report.dropped_links > 0 {
+                div { class: "info-line",
+                    span { class: "k", "Dependencies lost" }
+                    span { class: "v", "{report.dropped_links} pointed at rows that are not in this import" }
+                }
+            }
+            if report.work_unplaced > 0 {
+                div { class: "info-line",
+                    span { class: "k", "Work not placed" }
+                    span { class: "v",
+                        "{report.work_unplaced} row(s) give an amount of work with nobody on the task to do it"
+                    }
+                }
+            }
+        }
+
+        if !notices.is_empty() {
+            h3 { class: "imp-step", "Rows and cells that could not be read" }
+            div { class: "imp-list",
+                for (index, notice) in notices.iter().enumerate() {
+                    div { key: "n{index}", class: "imp-notice",
+                        span { class: "imp-where", "Row {notice.row} \u{00b7} {notice.heading}" }
+                        span { class: "imp-value", "{notice.value}" }
+                        span { class: "imp-why", "{notice.why}" }
+                    }
+                }
+                if report.unlisted_notices > 0 {
+                    div { class: "imp-notice",
+                        span { class: "imp-why", "and {report.unlisted_notices} more" }
+                    }
+                }
+            }
+        }
+
+    }
+}
+
+// ------------------------------------------------------- public holidays
+
+#[component]
+fn HolidayImport() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    let mut source = use_signal(|| Option::<PathBuf>::None);
+    let mut found = use_signal(|| Option::<holidays::Found>::None);
+    let mut trouble = use_signal(|| Option::<String>::None);
+
+    // A plan spans a year or two and a downloaded calendar spans ten, so the
+    // range starts on the plan rather than on the file.
+    let planned = {
+        let s = state.read();
+        let start = s.project.start_date.year();
+        let finish = s
+            .report
+            .as_ref()
+            .map(|report| report.finish.year())
+            .unwrap_or(start);
+        (start, finish.max(start))
+    };
+    let mut first_year = use_signal(|| planned.0);
+    let mut last_year = use_signal(|| planned.1);
+
+    let mut choose = move |path: PathBuf| {
+        trouble.set(None);
+        match holidays::read(&path) {
+            Ok(read) => {
+                found.set(Some(read));
+                source.set(Some(path));
+            }
+            Err(error) => {
+                found.set(None);
+                source.set(None);
+                trouble.set(Some(error.to_string()));
+            }
+        }
+    };
+
+    let held = found();
+    let Some(file) = held.as_ref() else {
+        return rsx! {
+            h2 { class: "bs-sub", style: "margin-top: 34px;", "Public holidays" }
+            div { class: "hint", style: "margin: 0 0 10px;",
+                "An iCalendar (.ics) file, which is what governments, Google and Outlook publish holiday calendars as. "
+                "The days in it become non-working days in this plan's calendar, so nothing is scheduled on them."
+            }
+            if let Some(message) = trouble() {
+                div { class: "info-alert",
+                    span { class: "fix-icon", {icon("warning", 18)} }
+                    div { style: "flex: 1;", "{message}" }
+                }
+            }
+            FileBrowser {
+                saving: false,
+                accept: vec!["ics".to_string()],
+                on_pick: move |path: PathBuf| choose(path),
+            }
+        };
+    };
+
+    let list = file.between(first_year(), last_year());
+    let unhandled = file.unhandled();
+    let known: Vec<bool> = {
+        let s = state.read();
+        list.iter()
+            .map(|holiday| holidays::already_held(&s.project.calendar, holiday))
+            .collect()
+    };
+    let fresh = known.iter().filter(|held| !**held).count();
+    let name = file
+        .name
+        .clone()
+        .unwrap_or_else(|| "Holidays".to_string());
+    let path = source().map(|path| path.display().to_string()).unwrap_or_default();
+
+    rsx! {
+        h2 { class: "bs-sub", style: "margin-top: 34px;", "Public holidays" }
+        div { class: "bs-field",
+            label { "File" }
+            input { class: "bs-input", value: "{path}", disabled: true }
+            button { class: "btn",
+                onclick: move |_| {
+                    found.set(None);
+                    source.set(None);
+                },
+                "Choose another"
+            }
+        }
+        div { class: "bs-field",
+            label { "Calendar" }
+            span { class: "recent-name", "{name} \u{00b7} {file.occasions.len()} event(s)" }
+        }
+        div { class: "bs-field",
+            label { "Years" }
+            input {
+                class: "bs-input", style: "max-width: 90px; flex: none;",
+                value: "{first_year}",
+                onchange: move |event| {
+                    if let Ok(year) = event.value().trim().parse::<i32>() {
+                        first_year.set(year);
+                    }
+                },
+            }
+            span { class: "recent-path", "to" }
+            input {
+                class: "bs-input", style: "max-width: 90px; flex: none;",
+                value: "{last_year}",
+                onchange: move |event| {
+                    if let Ok(year) = event.value().trim().parse::<i32>() {
+                        last_year.set(year);
+                    }
+                },
+            }
+            span { class: "recent-path",
+                "A downloaded file often covers ten years and a plan covers one."
+            }
+        }
+
+        if file.timed > 0 {
+            div { class: "hint", style: "margin: 0 0 8px;",
+                "{file.timed} event(s) in this file have a time of day rather than being whole days. "
+                "A public holiday is a day off, so those are left alone: they are meetings somebody saved in the file."
+            }
+        }
+        if !unhandled.is_empty() {
+            div { class: "info-alert",
+                span { class: "fix-icon", {icon("warning", 18)} }
+                div { style: "flex: 1;",
+                    "These repeat in a way this does not work out, so only the dates written in the file come across: "
+                    "{unhandled.join(\", \")}. Yearly repeats are handled, including ones like the fourth Thursday in November."
+                }
+            }
+        }
+
+        if list.is_empty() {
+            div { class: "hint", "Nothing in this file falls between those years." }
+        } else {
+            div { class: "imp-list", style: "margin-top: 10px;",
+                for (index, holiday) in list.iter().enumerate() {
+                    div { key: "h{index}", class: "imp-notice",
+                        span { class: "imp-where",
+                            if holiday.from == holiday.to {
+                                "{holiday.from}"
+                            } else {
+                                "{holiday.from} to {holiday.to}"
+                            }
+                        }
+                        span { class: "imp-value", "{holiday.name}" }
+                        span { class: "imp-why",
+                            if known.get(index).copied().unwrap_or(false) {
+                                "already in the calendar"
+                            } else if holiday.repeating {
+                                "from a yearly rule"
+                            } else {
+                                ""
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        div { class: "hint", style: "margin: 12px 0 8px;",
+            "These are added to this plan's calendar and apply to everybody, which is what a public holiday is. Undo puts it back."
+        }
+        button { class: "btn primary",
+            disabled: fresh == 0,
+            onclick: move |_| {
+                let holidays = file_holidays(&found(), first_year(), last_year());
+                state.write().import_holidays(&holidays);
+            },
+            "Add {fresh} day(s) off"
+        }
+    }
+}
+
+/// The holidays in range, worked out again at the moment of the click.
+///
+/// The list on screen was built for reading; this is built for doing, and the
+/// two must not be able to drift apart.
+fn file_holidays(found: &Option<holidays::Found>, first: i32, last: i32) -> Vec<holidays::Holiday> {
+    found
+        .as_ref()
+        .map(|file| file.between(first, last))
+        .unwrap_or_default()
 }
 
 // ------------------------------------------------------------------ About

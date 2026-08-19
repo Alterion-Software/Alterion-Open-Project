@@ -209,14 +209,22 @@ fn sort_key(project: &Project, index: usize, field: Field, text: &str) -> SortKe
             Some(baseline) => number(baseline.duration_minutes),
             None => words(),
         },
-        Field::StartVariance => match task.start_variance_minutes(&project.calendar) {
-            Some(minutes) => number(minutes),
-            None => words(),
-        },
-        Field::FinishVariance => match task.finish_variance_minutes(&project.calendar) {
-            Some(minutes) => number(minutes),
-            None => words(),
-        },
+        // Measured in the time this task is worked in, matching what the
+        // Variance columns show.
+        Field::StartVariance => {
+            let calendar = crate::effective::effective_calendar(project, index);
+            match task.start_variance_minutes(&calendar) {
+                Some(minutes) => number(minutes),
+                None => words(),
+            }
+        }
+        Field::FinishVariance => {
+            let calendar = crate::effective::effective_calendar(project, index);
+            match task.finish_variance_minutes(&calendar) {
+                Some(minutes) => number(minutes),
+                None => words(),
+            }
+        }
         Field::Start => SortKey::Date(task.scheduled.start),
         Field::Finish => SortKey::Date(task.scheduled.finish),
         Field::LateStart => SortKey::Date(task.scheduled.late_start),

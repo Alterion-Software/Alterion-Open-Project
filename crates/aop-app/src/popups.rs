@@ -3,9 +3,9 @@
 
 use dioxus::prelude::*;
 
+use crate::controls::{Choice, Dropdown};
 use aop_core::{format_duration, parse_duration, LinkType, TaskId};
 
-use crate::controls::{Choice, Dropdown};
 use crate::icons::icon;
 use crate::state::{AppState, Column};
 
@@ -202,6 +202,13 @@ pub fn PredecessorPicker(row: usize) -> Element {
                                     }
 
                                     // Type and lag only matter once it is picked.
+                                    //
+                                    // The type is offered here rather than only in the typed
+                                    // form. It was briefly taken out on the grounds that
+                                    // finish to start covers most dependencies; a planner
+                                    // put it straight back, because the other three are how
+                                    // overlapping work is expressed and hunting for the
+                                    // syntax is not a substitute for a control.
                                     if checked {
                                         div { class: "pred-detail",
                                             Dropdown {

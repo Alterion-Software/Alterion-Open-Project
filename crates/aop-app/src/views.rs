@@ -745,6 +745,209 @@ fn fit_bar_label(name: &str, bar_width: f64) -> String {
 
 // ------------------------------------------------------------ team planner
 
+/// Width of the left column, which holds the resource names.
+///
+/// The same number decides the column, the divider drawn down it and the x of
+/// every bar, so it is named once here rather than repeated at each of those.
+const NAME_COL_W: f64 = 190.0;
+/// Height of one bar, and the clear space below it before the next sub-row.
+const BAR_H: f64 = 18.0;
+const SUB_ROW_GAP: f64 = 4.0;
+/// Space above the first sub-row of a band and below its last.
+const BAND_PAD: f64 = 8.0;
+/// The narrowest a bar is drawn. A milestone spans no time at all and would
+/// otherwise be nothing.
+const MIN_BAR_W: f64 = 3.0;
+/// Clear space kept between a bar and a label drawn beside rather than in it.
+const LABEL_GAP: f64 = 4.0;
+/// How many sub-rows one band may grow to.
+///
+/// Unassigned work in a real plan piles up hundreds deep, and a band a thousand
+/// rows tall is a wall to scroll past rather than a picture of who is busy. The
+/// cap holds every band to a screenful; what it turns away is counted in the
+/// band's own label so that the reader is told rather than quietly shown less
+/// than the plan holds.
+const MAX_SUB_ROWS: usize = 12;
+
+/// A bar wanting a place in a band, in the pixels it will be drawn at.
+///
+/// Packing works in drawn pixels rather than dates because that is what
+/// actually collides on screen: a milestone widened to `MIN_BAR_W` occupies
+/// space its dates say it does not.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    /// Index into the project's tasks, carried through so the caller can draw
+    /// the task once the packing has decided where it goes.
+    task: usize,
+    left: f64,
+    right: f64,
+}
+
+/// A bar once the packing has placed it.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    task: usize,
+    left: f64,
+    right: f64,
+    /// Sub-row within the band, counted from the top of the band.
+    row: usize,
+    /// Clear pixels between this bar and the next one in the same sub-row, or
+    /// infinity when nothing follows it. A bar too narrow to hold its own name
+    /// borrows this space for a label.
+    room_right: f64,
+}
+
+/// A packed band: where each bar goes, how tall the band came out, and what the
+/// row cap turned away.
+struct Packed {
+    slots: Vec<Slot>,
+    rows: usize,
+    turned_away: usize,
+}
+
+/// Stack a band's bars into sub-rows so that none is drawn over another.
+///
+/// This is interval partitioning: bars are taken in start order and each goes
+/// in the first sub-row whose last bar has already finished. Taking them in
+/// start order is what makes first-fit use the fewest rows; out of order it
+/// would open rows it did not need. Bars that merely touch, one finishing where
+/// the next begins, share a row, because a shared edge is not an overlap.
+fn pack_band(spans: &[Span], max_rows: usize) -> Packed {
+    let mut ordered = spans.to_vec();
+    // Ties keep the order they came in, so the same plan always packs the same.
+    ordered.sort_by(|a, b| a.left.total_cmp(&b.left));
+
+    // Where the last bar in each open sub-row finished.
+    let mut ends: Vec<f64> = Vec::new();
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut turned_away = 0;
+
+    for span in ordered {
+        let row = match ends.iter().position(|end| *end <= span.left) {
+            Some(row) => row,
+            None if ends.len() < max_rows => {
+                ends.push(span.right);
+                ends.len() - 1
+            }
+            // Past the cap. Counted rather than dropped in silence: the band
+            // says how much of itself it is not showing.
+            None => {
+                turned_away += 1;
+                continue;
+            }
+        };
+        ends[row] = span.right;
+        slots.push(Slot {
+            task: span.task,
+            left: span.left,
+            right: span.right,
+            row,
+            room_right: f64::INFINITY,
+        });
+    }
+
+    // Slots are in start order, so within a sub-row each is followed by the bar
+    // that crowds it. That distance is the room a narrow bar has for a label.
+    let mut previous: Vec<Option<usize>> = vec![None; ends.len()];
+    for i in 0..slots.len() {
+        let (row, left) = (slots[i].row, slots[i].left);
+        if let Some(before) = previous[row].replace(i) {
+            slots[before].room_right = left - slots[before].right;
+        }
+    }
+
+    Packed { slots, rows: ends.len(), turned_away }
+}
+
+/// How tall a band with this many sub-rows is drawn.
+///
+/// A resource with nothing booked still gets a band: the point of the view is
+/// seeing who is idle as much as who is buried, so an empty resource is drawn
+/// at the height of one row rather than collapsed away.
+fn band_height(rows: usize) -> f64 {
+    let rows = rows.max(1) as f64;
+    BAND_PAD * 2.0 + rows * BAR_H + (rows - 1.0) * SUB_ROW_GAP
+}
+
+/// The y a sub-row's bars sit at, given the top of their band.
+fn row_y(band_y: f64, row: usize) -> f64 {
+    band_y + BAND_PAD + row as f64 * (BAR_H + SUB_ROW_GAP)
+}
+
+/// What the band says about work the row cap kept out of it.
+fn cap_note(turned_away: usize) -> String {
+    if turned_away == 0 {
+        return String::new();
+    }
+    format!("+{turned_away} more, past the {MAX_SUB_ROWS} row cap")
+}
+
+/// One bar, ready to draw.
+struct BarView {
+    task: usize,
+    name: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    fill: &'static str,
+    ink: &'static str,
+    /// The name written in the bar, empty when the bar is too narrow for it.
+    inside: String,
+    /// The name written in the clear space after the bar, used only when it
+    /// will not fit inside.
+    outside: String,
+}
+
+/// One band, ready to draw: every position already worked out.
+struct BandView {
+    key: String,
+    y: f64,
+    height: f64,
+    fill: &'static str,
+    name: String,
+    name_style: &'static str,
+    detail: String,
+    detail_style: &'static str,
+    note: String,
+    bars: Vec<BarView>,
+}
+
+/// Settle where a placed bar's label goes.
+///
+/// A bar with no room for a label used to be an unlabelled stub, which on a
+/// dense plan is most of them: a wall of grey with nothing to read. The packing
+/// already knows how much clear space follows a bar in its sub-row, so the name
+/// is written there instead of being thrown away.
+fn bar_view(
+    name: &str,
+    slot: &Slot,
+    band_y: f64,
+    fill: &'static str,
+    ink: &'static str,
+    chart_right: f64,
+) -> BarView {
+    let w = slot.right - slot.left;
+    let inside = fit_bar_label(name, w);
+    let outside = if inside.is_empty() {
+        // Never past the bar that follows, nor off the end of the chart.
+        let room = slot.room_right.min(chart_right - slot.right) - LABEL_GAP;
+        fit_bar_label(name, room)
+    } else {
+        String::new()
+    };
+    BarView {
+        task: slot.task,
+        name: name.to_string(),
+        x: slot.left,
+        y: row_y(band_y, slot.row),
+        w,
+        fill,
+        ink,
+        inside,
+        outside,
+    }
+}
+
 #[component]
 pub fn TeamPlanner() -> Element {
     let state = use_context::<Signal<AppState>>();
@@ -767,14 +970,7 @@ pub fn TeamPlanner() -> Element {
         px_per_day: s.zoom.px_per_day(),
     };
     let width = ((to - from).num_days() as f64 * scale.px_per_day).max(600.0);
-    let lane = 34.0;
-    // One lane per resource, plus a final lane for unassigned work.
-    let height = (project.resources.len() + 2) as f64 * lane + 20.0;
-
-    let unassigned: Vec<usize> = (0..project.tasks.len())
-        .filter(|&i| !project.is_summary(i) && project.tasks[i].assignments.is_empty())
-        .collect();
-    let unassigned_count = unassigned.len();
+    let total_w = width + NAME_COL_W;
 
     // Which resources are booked past what they have. Spotting this is the
     // reason the view is laid out by resource rather than by task.
@@ -784,125 +980,167 @@ pub fn TeamPlanner() -> Element {
         .map(|report| report.overallocations.iter().map(|o| o.resource).collect())
         .unwrap_or_default();
 
+    // Where a task's bar wants to sit, before anything has decided which
+    // sub-row it lands in. Packing works in drawn pixels rather than dates so
+    // that a bar widened to the minimum still counts as occupying that space.
+    let span_of = |index: usize| {
+        let task = &project.tasks[index];
+        let left = NAME_COL_W + scale.x_work(&project.calendar, task.scheduled.start);
+        let right = NAME_COL_W + scale.x_work(&project.calendar, task.scheduled.finish);
+        Span { task: index, left, right: left + (right - left).max(MIN_BAR_W) }
+    };
+
+    // The whole layout is worked out before anything is drawn: a band's height
+    // depends on how many sub-rows its tasks need, so every band below it sits
+    // at a running total rather than at a fixed multiple of a lane height.
+    let mut bands: Vec<BandView> = Vec::new();
+    let mut y = 0.0;
+
+    for (slot, resource) in project.resources.iter().enumerate() {
+        let spans: Vec<Span> = (0..project.tasks.len())
+            .filter(|&i| {
+                !project.is_summary(i)
+                    && project.tasks[i]
+                        .assignments
+                        .iter()
+                        .any(|a| a.resource == resource.id)
+            })
+            .map(span_of)
+            .collect();
+        let booked = spans.len();
+        let packed = pack_band(&spans, MAX_SUB_ROWS);
+        let height = band_height(packed.rows);
+        let over = overallocated.contains(&resource.id);
+
+        let bars = packed
+            .slots
+            .iter()
+            .map(|slot| {
+                let index = slot.task;
+                let fill = if s.show_critical && aop_core::issues::shows_as_critical(&s.project, index) {
+                    "var(--bar-critical)"
+                } else {
+                    "var(--bar)"
+                };
+                bar_view(&project.tasks[index].name, slot, y, fill, "var(--on-bar)", total_w)
+            })
+            .collect();
+
+        bands.push(BandView {
+            key: format!("tp{slot}"),
+            y,
+            height,
+            // Banded from the theme's own surfaces. Hard coding white here is
+            // what made this view a slab of glare on the dark palette. A
+            // resource booked past its capacity is marked here, since that is
+            // what the whole by-resource layout exists to show.
+            fill: if over {
+                "var(--danger-bg)"
+            } else if slot % 2 == 0 {
+                "var(--surface)"
+            } else {
+                "var(--surface-3)"
+            },
+            name: resource.name.clone(),
+            name_style: "font-size: 11px; fill: var(--ink);",
+            detail: if over {
+                format!("{booked} task(s) \u{00b7} overallocated")
+            } else {
+                format!("{booked} task(s)")
+            },
+            detail_style: if over {
+                "font-size: 9.5px; fill: var(--danger);"
+            } else {
+                "font-size: 9.5px; fill: var(--ink-faint);"
+            },
+            note: cap_note(packed.turned_away),
+            bars,
+        });
+        y += height;
+    }
+
+    // Unassigned tasks get their own band at the bottom, packed the same way.
+    {
+        let spans: Vec<Span> = (0..project.tasks.len())
+            .filter(|&i| !project.is_summary(i) && project.tasks[i].assignments.is_empty())
+            .map(span_of)
+            .collect();
+        let waiting = spans.len();
+        let packed = pack_band(&spans, MAX_SUB_ROWS);
+        let height = band_height(packed.rows);
+        let bars = packed
+            .slots
+            .iter()
+            .map(|slot| {
+                bar_view(
+                    &project.tasks[slot.task].name,
+                    slot,
+                    y,
+                    "var(--bar-inactive)",
+                    "var(--ink)",
+                    total_w,
+                )
+            })
+            .collect();
+        bands.push(BandView {
+            key: "tpun".to_string(),
+            y,
+            height,
+            fill: "var(--surface-2)",
+            name: "Unassigned".to_string(),
+            name_style: "font-size: 11px; fill: var(--ink-soft); font-style: italic;",
+            detail: format!("{waiting} task(s) with nobody booked"),
+            detail_style: "font-size: 9.5px; fill: var(--ink-faint);",
+            note: cap_note(packed.turned_away),
+            bars,
+        });
+        y += height;
+    }
+
+    let height = y + 20.0;
+
     rsx! {
-        div { class: "chart-pane", style: "width: {width + 190.0}px;",
-            svg { width: "{width + 190.0}", height: "{height}",
-                for (slot, resource) in project.resources.iter().enumerate() {
-                    {
-                        let y = slot as f64 * lane;
-                        let over = overallocated.contains(&resource.id);
-                        let assigned: Vec<usize> = (0..project.tasks.len())
-                            .filter(|&i| {
-                                !project.is_summary(i)
-                                    && project.tasks[i]
-                                        .assignments
-                                        .iter()
-                                        .any(|a| a.resource == resource.id)
-                            })
-                            .collect();
-                        rsx! {
-                            g { key: "tp{slot}",
-                                rect { x: "0", y: "{y}", width: "{width + 190.0}", height: "{lane}",
-                                    // Banded from the theme's own surfaces. Hard
-                                    // coding white here is what made this view
-                                    // a slab of glare on the dark palette. A
-                                    // resource booked past its capacity is
-                                    // marked here, since that is what the whole
-                                    // by-resource layout exists to show.
-                                    fill: if over {
-                                        "var(--danger-bg)"
-                                    } else if slot % 2 == 0 {
-                                        "var(--surface)"
-                                    } else {
-                                        "var(--surface-3)"
-                                    } }
-                                line { x1: "0", y1: "{y}", x2: "{width + 190.0}", y2: "{y}",
-                                    stroke: "var(--grid-line)", stroke_width: "1" }
-                                text { x: "8", y: "{y + lane / 2.0}",
-                                    style: "font-size: 11px; fill: var(--ink);", "{resource.name}" }
-                                if over {
-                                    text { x: "8", y: "{y + lane / 2.0 + 12.0}",
-                                        style: "font-size: 9.5px; fill: var(--danger);",
-                                        "{assigned.len()} task(s) \u{00b7} overallocated" }
-                                } else {
-                                    text { x: "8", y: "{y + lane / 2.0 + 12.0}",
-                                        style: "font-size: 9.5px; fill: var(--ink-faint);",
-                                        "{assigned.len()} task(s)" }
+        div { class: "chart-pane", style: "width: {total_w}px;",
+            svg { width: "{total_w}", height: "{height}",
+                for band in bands {
+                    g { key: "{band.key}",
+                        rect { x: "0", y: "{band.y}", width: "{total_w}",
+                            height: "{band.height}", fill: "{band.fill}" }
+                        line { x1: "0", y1: "{band.y}", x2: "{total_w}", y2: "{band.y}",
+                            stroke: "var(--grid-line)", stroke_width: "1" }
+                        // The name sits at the top of the band. Centred, it
+                        // would float away from its own first bar as soon as a
+                        // busy resource grew the band to a dozen rows.
+                        text { x: "8", y: "{band.y + 14.0}",
+                            style: "{band.name_style}", "{band.name}" }
+                        text { x: "8", y: "{band.y + 26.0}",
+                            style: "{band.detail_style}", "{band.detail}" }
+                        if !band.note.is_empty() {
+                            text { x: "8", y: "{band.y + 38.0}",
+                                style: "font-size: 9.5px; fill: var(--warn);",
+                                "{band.note}" }
+                        }
+                        for bar in band.bars {
+                            g { key: "tpb{bar.task}",
+                                title { "{bar.name}" }
+                                rect { x: "{bar.x}", y: "{bar.y}", width: "{bar.w}",
+                                    height: "{BAR_H}", rx: "2", fill: "{bar.fill}" }
+                                if !bar.inside.is_empty() {
+                                    text { x: "{bar.x + 5.0}", y: "{bar.y + 12.0}",
+                                        style: "font-size: 10px; fill: {bar.ink};",
+                                        "{bar.inside}" }
                                 }
-                                line { x1: "185", y1: "0", x2: "185", y2: "{height}",
-                                    stroke: "var(--line)", stroke_width: "1" }
-
-                                for index in assigned {
-                                    {
-                                        let task = &project.tasks[index];
-                                        let left = 190.0 + scale.x_work(&project.calendar, task.scheduled.start);
-                                        let right = 190.0 + scale.x_work(&project.calendar, task.scheduled.finish);
-                                        let w = (right - left).max(3.0);
-                                        let fill = if s.show_critical && aop_core::issues::shows_as_critical(&s.project, index) {
-                                            "var(--bar-critical)"
-                                        } else {
-                                            "var(--bar)"
-                                        };
-                                        // Cut to the bar rather than allowed to
-                                        // run over the one beside it.
-                                        let label = fit_bar_label(&task.name, w);
-                                        rsx! {
-                                            g { key: "tpb{index}",
-                                                title { "{task.name}" }
-                                                rect { x: "{left}", y: "{y + 8.0}", width: "{w}", height: "18",
-                                                    rx: "2", fill: "{fill}" }
-                                                if !label.is_empty() {
-                                                    text { x: "{left + 5.0}", y: "{y + 20.0}",
-                                                        style: "font-size: 10px; fill: var(--on-bar);", "{label}" }
-                                                }
-                                            }
-                                        }
-                                    }
+                                if !bar.outside.is_empty() {
+                                    text { x: "{bar.x + bar.w + LABEL_GAP}", y: "{bar.y + 12.0}",
+                                        style: "font-size: 10px; fill: var(--ink-soft);",
+                                        "{bar.outside}" }
                                 }
                             }
                         }
                     }
                 }
-
-                // Unassigned tasks get their own lane at the bottom.
-                {
-                    let y = project.resources.len() as f64 * lane;
-                    rsx! {
-                        g {
-                            rect { x: "0", y: "{y}", width: "{width + 190.0}", height: "{lane}",
-                                fill: "var(--surface-2)" }
-                            line { x1: "0", y1: "{y}", x2: "{width + 190.0}", y2: "{y}",
-                                stroke: "var(--grid-line)", stroke_width: "1" }
-                            text { x: "8", y: "{y + lane / 2.0}",
-                                style: "font-size: 11px; fill: var(--ink-soft); font-style: italic;",
-                                "Unassigned" }
-                            text { x: "8", y: "{y + lane / 2.0 + 12.0}",
-                                style: "font-size: 9.5px; fill: var(--ink-faint);",
-                                "{unassigned_count} task(s) with nobody booked" }
-                            for index in unassigned {
-                                {
-                                    let task = &project.tasks[index];
-                                    let left = 190.0 + scale.x_work(&project.calendar, task.scheduled.start);
-                                    let right = 190.0 + scale.x_work(&project.calendar, task.scheduled.finish);
-                                    let w = (right - left).max(3.0);
-                                    let label = fit_bar_label(&task.name, w);
-                                    rsx! {
-                                        g { key: "un{index}",
-                                            title { "{task.name}" }
-                                            rect { x: "{left}", y: "{y + 8.0}",
-                                                width: "{w}", height: "18", rx: "2",
-                                                fill: "var(--bar-inactive)" }
-                                            if !label.is_empty() {
-                                                text { x: "{left + 5.0}", y: "{y + 20.0}",
-                                                    style: "font-size: 10px; fill: var(--ink);", "{label}" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                line { x1: "{NAME_COL_W - 5.0}", y1: "0", x2: "{NAME_COL_W - 5.0}", y2: "{height}",
+                    stroke: "var(--line)", stroke_width: "1" }
             }
         }
     }
@@ -990,6 +1228,130 @@ mod tests {
     fn an_axis_names_its_unit_once_and_a_count_names_it_never_twice() {
         assert_eq!(measure_title(Basis::Work, "remaining", 4800), "work remaining (days)");
         assert_eq!(measure_title(Basis::Count, "remaining", 12), "tasks remaining");
+    }
+
+    /// A bar wanting the pixels `left..right`, named by a task index so the
+    /// packing can be read back task by task.
+    fn span(task: usize, left: f64, right: f64) -> Span {
+        Span { task, left, right }
+    }
+
+    /// The sub-row the packing gave one task.
+    fn row_of(packed: &Packed, task: usize) -> usize {
+        packed
+            .slots
+            .iter()
+            .find(|slot| slot.task == task)
+            .map(|slot| slot.row)
+            .unwrap_or_else(|| panic!("task {task} was not placed"))
+    }
+
+    #[test]
+    fn tasks_that_overlap_in_time_are_stacked_rather_than_drawn_on_top_of_each_other() {
+        // The whole bug: one y per resource put every bar on the same line, so
+        // a busy resource read as a single unreadable smear.
+        let packed = pack_band(&[span(0, 0.0, 100.0), span(1, 50.0, 150.0)], MAX_SUB_ROWS);
+        assert_eq!(packed.rows, 2);
+        assert_ne!(row_of(&packed, 0), row_of(&packed, 1));
+    }
+
+    #[test]
+    fn tasks_that_only_touch_share_a_sub_row() {
+        // One finishing exactly where the next starts is not an overlap, and
+        // opening a row for it would waste the height.
+        let packed = pack_band(&[span(0, 0.0, 100.0), span(1, 100.0, 200.0)], MAX_SUB_ROWS);
+        assert_eq!(packed.rows, 1);
+        assert_eq!(row_of(&packed, 0), row_of(&packed, 1));
+    }
+
+    #[test]
+    fn bars_arriving_out_of_order_still_pack_into_the_fewest_rows() {
+        // First-fit only reaches the minimum if the bars are taken in start
+        // order, which the packing does for itself rather than trusting its
+        // caller to have sorted them.
+        let packed = pack_band(
+            &[span(0, 200.0, 300.0), span(1, 0.0, 100.0), span(2, 100.0, 200.0)],
+            MAX_SUB_ROWS,
+        );
+        assert_eq!(packed.rows, 1);
+        assert_eq!(packed.slots.len(), 3);
+    }
+
+    #[test]
+    fn a_resource_with_nothing_booked_still_gets_a_band() {
+        // Seeing who is idle is half the point of the view, so an empty
+        // resource keeps a row's worth of height rather than collapsing.
+        let packed = pack_band(&[], MAX_SUB_ROWS);
+        assert_eq!(packed.rows, 0);
+        assert!(packed.slots.is_empty());
+        assert_eq!(band_height(0), band_height(1));
+    }
+
+    #[test]
+    fn a_band_is_as_tall_as_the_sub_rows_it_used() {
+        let packed = pack_band(
+            &[span(0, 0.0, 100.0), span(1, 10.0, 110.0), span(2, 20.0, 120.0)],
+            MAX_SUB_ROWS,
+        );
+        assert_eq!(packed.rows, 3);
+        assert_eq!(band_height(packed.rows), BAND_PAD * 2.0 + 3.0 * BAR_H + 2.0 * SUB_ROW_GAP);
+        // Every bar sits clear of the one above it.
+        assert_eq!(row_y(0.0, 1) - row_y(0.0, 0), BAR_H + SUB_ROW_GAP);
+    }
+
+    #[test]
+    fn the_row_cap_counts_what_it_turns_away_rather_than_dropping_it_in_silence() {
+        // A band a thousand rows deep is a wall to scroll past, but work that
+        // vanishes without a word is worse than work that is merely off screen.
+        let all: Vec<Span> = (0..MAX_SUB_ROWS + 8)
+            .map(|i| span(i, i as f64, i as f64 + 1000.0))
+            .collect();
+        let packed = pack_band(&all, MAX_SUB_ROWS);
+        assert_eq!(packed.rows, MAX_SUB_ROWS);
+        assert_eq!(packed.slots.len(), MAX_SUB_ROWS);
+        assert_eq!(packed.turned_away, 8);
+        assert!(cap_note(packed.turned_away).contains('8'));
+        assert!(cap_note(0).is_empty());
+    }
+
+    #[test]
+    fn a_bar_knows_how_much_clear_space_follows_it_in_its_own_row() {
+        let packed = pack_band(&[span(0, 0.0, 100.0), span(1, 160.0, 200.0)], MAX_SUB_ROWS);
+        let first = packed.slots.iter().find(|slot| slot.task == 0).map(|slot| slot.room_right);
+        assert_eq!(first, Some(60.0));
+        let last = packed.slots.iter().find(|slot| slot.task == 1).map(|slot| slot.room_right);
+        assert_eq!(last, Some(f64::INFINITY), "nothing follows the last bar in a row");
+    }
+
+    #[test]
+    fn a_bar_too_narrow_for_its_name_writes_it_in_the_space_beside_it() {
+        // Otherwise it is an unlabelled stub, which on a dense plan is most of
+        // them: a wall of grey with nothing to read.
+        let narrow = Slot { task: 0, left: 200.0, right: 204.0, row: 0, room_right: 300.0 };
+        let view = bar_view("Kickoff", &narrow, 0.0, "var(--bar)", "var(--on-bar)", 1000.0);
+        assert!(view.inside.is_empty(), "nothing fits in four pixels");
+        assert_eq!(view.outside, "Kickoff");
+    }
+
+    #[test]
+    fn a_label_beside_a_bar_never_runs_over_the_bar_that_follows_it() {
+        let crowded = Slot { task: 0, left: 200.0, right: 204.0, row: 0, room_right: 6.0 };
+        let view = bar_view("Kickoff", &crowded, 0.0, "var(--bar)", "var(--on-bar)", 1000.0);
+        assert!(view.outside.is_empty());
+        // Nor off the end of the chart, when it is the last bar in its row.
+        let at_edge = Slot { task: 0, left: 200.0, right: 204.0, row: 0, room_right: f64::INFINITY };
+        let view = bar_view("Kickoff", &at_edge, 0.0, "var(--bar)", "var(--on-bar)", 210.0);
+        assert!(view.outside.is_empty());
+    }
+
+    #[test]
+    fn a_bar_wide_enough_keeps_its_name_inside_itself() {
+        let wide = Slot { task: 0, left: 200.0, right: 400.0, row: 2, room_right: 500.0 };
+        let view = bar_view("Kickoff", &wide, 40.0, "var(--bar)", "var(--on-bar)", 1000.0);
+        assert_eq!(view.inside, "Kickoff");
+        assert!(view.outside.is_empty(), "one label, not two");
+        assert_eq!(view.y, row_y(40.0, 2));
+        assert_eq!(view.w, 200.0);
     }
 }
 

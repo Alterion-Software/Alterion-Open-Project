@@ -693,6 +693,12 @@ fn body_for(name: &str) -> String {
              <path d='M4 7V4a2 2 0 0 1 2-2h9l5 5v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-3'/>\
              <path d='M2 15h10'/><path d='m9 18 3-3-3-3'/>",
         ),
+        // The mirror of file-output, so Import and Export read as one pair.
+        "file-input" => String::from(
+            "<path d='M4 22h14a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v4'/>\
+             <path d='M14 2v4a2 2 0 0 0 2 2h4'/>\
+             <path d='M2 15h10'/><path d='m9 18 3-3-3-3'/>",
+        ),
         "info-circle" => String::from(
             "<circle cx='12' cy='12' r='10'/><path d='M12 16v-4'/><path d='M12 8h.01'/>",
         ),

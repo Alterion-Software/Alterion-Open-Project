@@ -54,7 +54,7 @@ impl From<std::io::Error> for ExcelError {
 ///
 /// The headings double as what the import looks for, so a workbook written
 /// here always reads back.
-const COLUMNS: [&str; 11] = [
+pub(crate) const COLUMNS: [&str; 11] = [
     "ID",
     "WBS",
     "Task Name",
@@ -70,7 +70,12 @@ const COLUMNS: [&str; 11] = [
 
 /// Reduce a heading to something matchable, so "Task Name", "task name" and
 /// "TASK_NAME" are all the same column.
-fn key(heading: &str) -> String {
+///
+/// Shared with `sheet`, which matches a stranger's headings against a longer
+/// list of names for the same thing: two rules for what makes two headings the
+/// same would disagree eventually, and the import would then depend on which
+/// reader opened the file.
+pub(crate) fn key(heading: &str) -> String {
     heading
         .chars()
         .filter(|c| c.is_alphanumeric())

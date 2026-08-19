@@ -129,6 +129,7 @@ pub enum BackstagePage {
     SaveAs,
     Print,
     Export,
+    Import,
     About,
     Options,
 }
@@ -144,6 +145,7 @@ impl BackstagePage {
             BackstagePage::SaveAs => "Save As",
             BackstagePage::Print => "Print",
             BackstagePage::Export => "Export",
+            BackstagePage::Import => "Import",
             BackstagePage::About => "About",
             BackstagePage::Options => "Options",
         }
@@ -160,6 +162,7 @@ impl BackstagePage {
             BackstagePage::SaveAs => "save-as",
             BackstagePage::Print => "printer",
             BackstagePage::Export => "file-output",
+            BackstagePage::Import => "file-input",
             BackstagePage::About => "badge-info",
             BackstagePage::Options => "settings",
         }
@@ -659,6 +662,12 @@ pub enum PendingAction {
     NewFromTemplate(String),
     /// Open a file from disk.
     Open(PathBuf),
+    /// Take the plan the Import page has built and made ready.
+    ///
+    /// The plan itself is not carried here: it is held on the state, because
+    /// this has to be comparable and a plan is not. It also has to survive the
+    /// unsaved changes dialog, which is exactly what the staging slot is for.
+    AdoptImport,
 }
 
 impl PendingAction {
@@ -669,6 +678,7 @@ impl PendingAction {
             PendingAction::CloseProject => "closing this plan",
             PendingAction::NewFromTemplate(_) => "starting a new plan",
             PendingAction::Open(_) => "opening another plan",
+            PendingAction::AdoptImport => "importing a spreadsheet",
         }
     }
 }
@@ -1103,6 +1113,11 @@ pub struct AppState {
     pub drop_target: Option<(usize, DropWhere)>,
     /// A confirmation shown on the current Backstage page.
     pub backstage_message: Option<String>,
+    /// A plan the Import page has read out of a spreadsheet, waiting for the
+    /// word. Nothing is imported until somebody says so, and unsaved work in
+    /// the open plan gets its question asked first, so the built plan has to
+    /// wait somewhere that outlives the dialog.
+    pub pending_import: Option<(Project, PathBuf, String)>,
     pub zoom: Zoom,
     pub filter: TaskFilter,
     pub status: String,
@@ -1267,6 +1282,7 @@ impl AppState {
             drag_row: None,
             drop_target: None,
             backstage_message: None,
+            pending_import: None,
             zoom: Zoom::Days,
             filter: TaskFilter::All,
             status: "Ready".into(),
@@ -1759,6 +1775,65 @@ impl AppState {
                 })
             }
         }
+    }
+
+    /// Hold a plan the Import page has built, and ask about unsaved work.
+    ///
+    /// Nothing is imported here. The plan waits in the slot until the question
+    /// about the open plan has been answered, and if the answer is no it is
+    /// dropped and the open plan never knew about it.
+    pub fn stage_import(&mut self, project: Project, source: PathBuf, note: String) {
+        self.pending_import = Some((project, source, note));
+        self.guard(PendingAction::AdoptImport);
+    }
+
+    /// Take the plan the Import page built. Called once the way is clear.
+    fn adopt_import(&mut self) {
+        let Some((project, source, note)) = self.pending_import.take() else {
+            return;
+        };
+        self.project = project;
+        // A spreadsheet is not a plan file, so there is nowhere to save back
+        // to: Save As has to be chosen deliberately.
+        self.file_path = None;
+        self.dirty = true;
+        self.undo.clear();
+        self.redo.clear();
+        self.pending.clear();
+        self.selection = if self.project.tasks.is_empty() {
+            Vec::new()
+        } else {
+            vec![0]
+        };
+        self.push_recent(&source);
+        self.backstage = None;
+        self.plan_changed();
+        self.reschedule();
+        self.status = note;
+    }
+
+    /// Book public holidays off in the project calendar.
+    ///
+    /// A checkpoint first, because this moves dates: a planner who imports the
+    /// wrong country's holidays has to be able to undo it in one step.
+    pub fn import_holidays(&mut self, holidays: &[aop_core::holidays::Holiday]) -> usize {
+        self.checkpoint();
+        let added = aop_core::holidays::add(&mut self.project.calendar, holidays);
+        if added == 0 {
+            // Nothing changed, so the checkpoint would be an empty step in the
+            // undo stack, which is worse than no step at all.
+            self.undo.pop();
+            self.backstage_message =
+                Some("Every one of those days is already in the calendar.".into());
+            return 0;
+        }
+        self.reschedule();
+        self.backstage_message = Some(format!(
+            "Added {added} day(s) off to the {} calendar.",
+            self.project.calendar.name
+        ));
+        self.note(format!("Imported {added} holiday(s)"));
+        added
     }
 
     /// Import a Microsoft Project XML (MSPDI) plan.
@@ -3314,6 +3389,7 @@ impl AppState {
             }
             PendingAction::NewFromTemplate(id) => self.new_from_template(&id),
             PendingAction::Open(path) => self.open_any(path),
+            PendingAction::AdoptImport => self.adopt_import(),
         }
     }
 
@@ -5982,6 +6058,64 @@ mod tests {
         state.project.tasks[2].outline_level = 1;
         state.reschedule();
         state
+    }
+
+    /// A plan built somewhere else, of the shape an import produces.
+    fn brought_in() -> Project {
+        let mut project = Project::blank(
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 2)
+                .and_then(|date| date.and_hms_opt(8, 0, 0))
+                .expect("a valid morning"),
+        );
+        project.tasks.clear();
+        project.name = "From a spreadsheet".into();
+        project.push_task("Survey the site", MINUTES_PER_DAY);
+        project
+    }
+
+    #[test]
+    fn an_import_waits_while_unsaved_work_is_asked_about() {
+        // Nothing is imported until the person says so, and a plan with
+        // unsaved work in it must not be replaced behind their back.
+        let mut state = outlined();
+        state.dirty = true;
+        state.stage_import(brought_in(), std::path::PathBuf::from("plan.xlsx"), "note".into());
+
+        assert_eq!(names(&state).len(), 4, "the open plan is untouched");
+        assert!(matches!(state.dialog, Some(Dialog::UnsavedChanges(_))));
+        assert!(state.pending_import.is_some(), "the built plan is waiting");
+
+        state.carry_out(PendingAction::AdoptImport);
+        assert_eq!(names(&state), vec!["Survey the site"]);
+        assert!(state.pending_import.is_none());
+        assert!(state.file_path.is_none(), "a workbook is not somewhere to save to");
+    }
+
+    #[test]
+    fn an_import_into_a_saved_plan_goes_straight_in() {
+        let mut state = outlined();
+        state.dirty = false;
+        state.stage_import(brought_in(), std::path::PathBuf::from("plan.xlsx"), "note".into());
+        assert_eq!(names(&state), vec!["Survey the site"]);
+        assert_eq!(state.status, "note");
+    }
+
+    #[test]
+    fn holidays_go_in_once_and_can_be_undone() {
+        let mut state = outlined();
+        let holidays = vec![aop_core::holidays::Holiday {
+            name: "Christmas Day".into(),
+            from: chrono::NaiveDate::from_ymd_opt(2026, 12, 25).expect("a date"),
+            to: chrono::NaiveDate::from_ymd_opt(2026, 12, 25).expect("a date"),
+            repeating: false,
+        }];
+        assert_eq!(state.import_holidays(&holidays), 1);
+        // A second pass adds nothing, and must not leave an empty step in the
+        // undo stack for somebody to press through.
+        let steps = state.undo.len();
+        assert_eq!(state.import_holidays(&holidays), 0);
+        assert_eq!(state.undo.len(), steps);
+        assert_eq!(state.project.calendar.exceptions.len(), 1);
     }
 
     fn names(state: &AppState) -> Vec<&str> {

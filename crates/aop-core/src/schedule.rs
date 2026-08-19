@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 
 use crate::calendar::WorkCalendar;
+use crate::effective::{effective_calendar, EffectiveCalendars};
 use crate::model::{
     ConstraintType, Link, LinkType, Project, ResourceId, ResourceKind, ScheduleFrom, TaskId,
     TaskMode,
@@ -341,11 +342,21 @@ fn trace_cycle(
         .collect()
 }
 
-fn forward_pass(project: &mut Project, graph: &Graph, pinned: &HashMap<usize, NaiveDateTime>) {
-    let calendar = project.calendar.clone();
-    let project_start = calendar.next_working_instant(project.start_date);
+fn forward_pass(
+    project: &mut Project,
+    graph: &Graph,
+    pinned: &HashMap<usize, NaiveDateTime>,
+    calendars: &EffectiveCalendars,
+) {
+    let start_date = project.start_date;
 
     for &index in &graph.order {
+        // Every walk below is done in the time this particular task can
+        // actually be worked in: its own calendar, or the project's, narrowed
+        // by everyone assigned to it. A link's lag is measured on the
+        // successor's calendar because the lag is time the successor waits.
+        let calendar = calendars.for_row(index);
+        let project_start = calendar.next_working_instant(start_date);
         let duration = project.tasks[index].duration_minutes;
         let mut start = project_start;
 
@@ -376,7 +387,7 @@ fn forward_pass(project: &mut Project, graph: &Graph, pinned: &HashMap<usize, Na
             if project.tasks[index].mode == TaskMode::Manual {
                 continue;
             }
-            let candidate = driven_start(&calendar, link, pred_start, pred_finish, duration);
+            let candidate = driven_start(calendar, link, pred_start, pred_finish, duration);
             if candidate > start {
                 start = candidate;
             }
@@ -420,17 +431,23 @@ fn forward_pass(project: &mut Project, graph: &Graph, pinned: &HashMap<usize, Na
             let start = calendar.next_working_instant(start);
             (start, calendar.add_minutes(start, duration))
         };
+        let no_working_time = calendars.has_no_working_time(index);
         let slot = &mut project.tasks[index].scheduled;
         slot.start = start;
         slot.finish = finish;
         slot.duration_minutes = duration;
+        slot.no_working_time = no_working_time;
     }
 }
 
-fn backward_pass(project: &mut Project, graph: &Graph, project_finish: NaiveDateTime) {
-    let calendar = project.calendar.clone();
-
+fn backward_pass(
+    project: &mut Project,
+    graph: &Graph,
+    project_finish: NaiveDateTime,
+    calendars: &EffectiveCalendars,
+) {
     for &index in graph.order.iter().rev() {
+        let calendar = calendars.for_row(index);
         let duration = project.tasks[index].duration_minutes;
         let mut late_finish = project_finish;
         let mut constrained = false;
@@ -453,7 +470,7 @@ fn backward_pass(project: &mut Project, graph: &Graph, project_finish: NaiveDate
                 .unwrap_or(succ_late_start);
 
             let candidate = driven_late_finish(
-                &calendar,
+                calendar,
                 link,
                 succ_late_start,
                 succ_late_finish,
@@ -533,13 +550,17 @@ fn scheduled_finish(project: &Project) -> NaiveDateTime {
         .unwrap_or(project.start_date)
 }
 
-fn compute_slack(project: &mut Project, graph: &Graph) {
-    let calendar = project.calendar.clone();
+fn compute_slack(project: &mut Project, graph: &Graph, calendars: &EffectiveCalendars) {
     let project_finish = scheduled_finish(project);
 
     let threshold = critical_slack_threshold(project);
 
     for &index in &graph.order {
+        // Slack is time this task could give away, so it is counted in the time
+        // this task can be worked in. A chain running across two calendars picks
+        // up slack on every link because of it, which is exactly what
+        // `critical_slack_minutes` exists to let a planner absorb.
+        let calendar = calendars.for_row(index);
         let scheduled = project.tasks[index].scheduled;
         // Microsoft's total slack is the smaller of the two slips, not the
         // finish one on its own. They agree whenever a task's late dates sit
@@ -705,7 +726,7 @@ fn roll_up_summaries(project: &mut Project) {
     }
 }
 
-fn find_overallocations(project: &Project) -> Vec<Overallocation> {
+fn find_overallocations(project: &Project, calendars: &EffectiveCalendars) -> Vec<Overallocation> {
     let Some(start) = project.tasks.iter().map(|t| t.scheduled.start).min() else {
         return Vec::new();
     };
@@ -722,11 +743,16 @@ fn find_overallocations(project: &Project) -> Vec<Overallocation> {
         if !task.active || task.assignments.is_empty() {
             continue;
         }
+        // Load is counted on the days this task can actually be worked, which
+        // is the intersection its dates already came from. Counting against the
+        // project calendar instead would book somebody on a day they are away
+        // and report them overloaded on it.
+        let worked = calendars.for_row(index);
         let mut date = task.scheduled.start.date();
         let last = task.scheduled.finish.date();
         let mut guard = 0;
         while date <= last && guard < 4000 {
-            if project.calendar.is_working_day(date) {
+            if worked.is_working_day(date) {
                 for assignment in &task.assignments {
                     let is_work = project
                         .resource(assignment.resource)
@@ -1002,7 +1028,12 @@ pub fn schedule(project: &mut Project) -> Result<ScheduleReport, ScheduleError> 
     let graph = build_graph(project)?;
     let no_pins = HashMap::new();
 
-    forward_pass(project, &graph, &no_pins);
+    // Composed once. What a task is worked to depends on its calendar and who
+    // is on it, never on the dates being worked out, so re-composing between
+    // the passes would buy nothing and the passes run up to twice each.
+    let calendars = EffectiveCalendars::build(project);
+
+    forward_pass(project, &graph, &no_pins, &calendars);
 
     let mut project_finish = scheduled_finish(project);
     // Scheduling backwards from a required finish date targets that date even
@@ -1010,7 +1041,7 @@ pub fn schedule(project: &mut Project) -> Result<ScheduleReport, ScheduleError> 
     if project.schedule_from == ScheduleFrom::ProjectFinishDate {
         project_finish = project_finish.max(project.finish_date);
     }
-    backward_pass(project, &graph, project_finish);
+    backward_pass(project, &graph, project_finish, &calendars);
 
     // As Late As Possible tasks, and every task when the whole plan runs
     // backwards, are re-pinned onto their late dates and the passes repeated so
@@ -1024,7 +1055,7 @@ pub fn schedule(project: &mut Project) -> Result<ScheduleReport, ScheduleError> 
         }
     }
     if !pinned.is_empty() {
-        forward_pass(project, &graph, &pinned);
+        forward_pass(project, &graph, &pinned, &calendars);
         let refreshed = project
             .tasks
             .iter()
@@ -1032,10 +1063,10 @@ pub fn schedule(project: &mut Project) -> Result<ScheduleReport, ScheduleError> 
             .max()
             .unwrap_or(project.start_date)
             .max(project_finish);
-        backward_pass(project, &graph, refreshed);
+        backward_pass(project, &graph, refreshed, &calendars);
     }
 
-    compute_slack(project, &graph);
+    compute_slack(project, &graph, &calendars);
     compute_cost_and_work(project);
     roll_up_summaries(project);
 
@@ -1062,7 +1093,7 @@ pub fn schedule(project: &mut Project) -> Result<ScheduleReport, ScheduleError> 
         critical_task_count,
         total_cost: project.total_cost(),
         total_work_minutes: project.total_work_minutes(),
-        overallocations: find_overallocations(project),
+        overallocations: find_overallocations(project, &calendars),
     })
 }
 
@@ -1087,6 +1118,278 @@ mod tests {
             project.push_task(format!("Task {}", n + 1), duration);
         }
         project
+    }
+
+    // ---- calendars -----------------------------------------------------
+
+    /// The end of a working day, which is where a whole number of days of work
+    /// always lands on the Standard calendar.
+    fn at_five(y: i32, m: u32, d: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(17, 0, 0)
+            .unwrap()
+    }
+
+    fn nonworking(name: &str, from: (i32, u32, u32), to: (i32, u32, u32)) -> crate::CalendarException {
+        crate::CalendarException {
+            name: name.into(),
+            from: NaiveDate::from_ymd_opt(from.0, from.1, from.2).unwrap(),
+            to: NaiveDate::from_ymd_opt(to.0, to.1, to.2).unwrap(),
+            shifts: crate::DayShifts::nonworking(),
+        }
+    }
+
+    /// One two-day task starting Monday 2026-08-17, with `people` on it.
+    fn one_task_with(people: &[&str]) -> Project {
+        let mut project = project_with(&[960]);
+        for name in people {
+            let id = project.allocate_resource_id();
+            project.resources.push(crate::model::Resource::new(id, *name));
+            project.tasks[0].assignments.push(crate::model::Assignment {
+                resource: id,
+                units: 1.0,
+            });
+        }
+        project
+    }
+
+    fn resource_named<'a>(project: &'a mut Project, name: &str) -> &'a mut crate::model::Resource {
+        project
+            .resources
+            .iter_mut()
+            .find(|r| r.name == name)
+            .expect("the test put this person in the plan")
+    }
+
+    #[test]
+    fn a_person_with_no_calendar_schedules_exactly_as_before() {
+        // The whole compatibility promise: a plan that has never named a
+        // calendar must come out of the scheduler byte for byte as it did.
+        let mut without = project_with(&[960]);
+        crate::schedule(&mut without).expect("schedules");
+
+        let mut with_person = one_task_with(&["Ada"]);
+        crate::schedule(&mut with_person).expect("schedules");
+
+        assert_eq!(
+            with_person.tasks[0].scheduled.start,
+            without.tasks[0].scheduled.start
+        );
+        assert_eq!(
+            with_person.tasks[0].scheduled.finish,
+            without.tasks[0].scheduled.finish
+        );
+        assert!(!with_person.tasks[0].scheduled.no_working_time);
+    }
+
+    #[test]
+    fn a_task_waits_for_the_person_it_is_assigned_to() {
+        // Ada is away Tuesday and Wednesday, so two days of work starting
+        // Monday runs Monday and then Thursday.
+        let mut project = one_task_with(&["Ada"]);
+        resource_named(&mut project, "Ada")
+            .calendar_exceptions
+            .push(nonworking("Leave", (2026, 8, 18), (2026, 8, 19)));
+
+        crate::schedule(&mut project).expect("schedules");
+        assert_eq!(project.tasks[0].scheduled.start, day(2026, 8, 17));
+        assert_eq!(
+            project.tasks[0].scheduled.finish,
+            at_five(2026, 8, 20),
+            "the second day of work lands after her leave, not during it"
+        );
+    }
+
+    #[test]
+    fn a_task_with_two_people_waits_for_both() {
+        // Ada is away Tuesday, Ben is away Wednesday. Two days of work starting
+        // Monday therefore runs Monday and Thursday: neither gap is worked.
+        let mut project = one_task_with(&["Ada", "Ben"]);
+        resource_named(&mut project, "Ada")
+            .calendar_exceptions
+            .push(nonworking("Leave", (2026, 8, 18), (2026, 8, 18)));
+        resource_named(&mut project, "Ben")
+            .calendar_exceptions
+            .push(nonworking("Leave", (2026, 8, 19), (2026, 8, 19)));
+
+        crate::schedule(&mut project).expect("schedules");
+        assert_eq!(project.tasks[0].scheduled.start, day(2026, 8, 17));
+        assert_eq!(
+            project.tasks[0].scheduled.finish,
+            at_five(2026, 8, 20)
+        );
+    }
+
+    #[test]
+    fn a_task_starting_on_somebodys_leave_waits_for_them() {
+        // Not just a gap in the middle: the start itself has to move.
+        let mut project = one_task_with(&["Ada"]);
+        resource_named(&mut project, "Ada")
+            .calendar_exceptions
+            .push(nonworking("Leave", (2026, 8, 17), (2026, 8, 18)));
+
+        crate::schedule(&mut project).expect("schedules");
+        assert_eq!(project.tasks[0].scheduled.start, day(2026, 8, 19));
+    }
+
+    #[test]
+    fn the_ignore_flag_takes_the_people_out_of_the_reckoning() {
+        let mut project = one_task_with(&["Ada"]);
+        resource_named(&mut project, "Ada")
+            .calendar_exceptions
+            .push(nonworking("Leave", (2026, 8, 18), (2026, 8, 19)));
+
+        // A task calendar is the precondition: without one there is nothing
+        // left to schedule against, so the flag alone changes nothing.
+        let mut round = crate::WorkCalendar::standard();
+        round.name = "Site".into();
+        project.calendars.push(round);
+        project.tasks[0].calendar = "Site".into();
+        project.tasks[0].ignore_resource_calendars = true;
+
+        crate::schedule(&mut project).expect("schedules");
+        assert_eq!(
+            project.tasks[0].scheduled.finish,
+            at_five(2026, 8, 18),
+            "her leave is not consulted, so the two days run back to back"
+        );
+    }
+
+    #[test]
+    fn a_holiday_on_the_project_calendar_still_moves_everybody() {
+        // A public holiday is not one person's business, and putting resource
+        // calendars in must not have quietly stopped it applying.
+        let mut project = one_task_with(&["Ada", "Ben"]);
+        resource_named(&mut project, "Ada")
+            .calendar_exceptions
+            .push(nonworking("Leave", (2026, 8, 21), (2026, 8, 21)));
+        project
+            .calendar
+            .exceptions
+            .push(nonworking("Bank holiday", (2026, 8, 18), (2026, 8, 18)));
+
+        crate::schedule(&mut project).expect("schedules");
+        assert_eq!(
+            project.tasks[0].scheduled.finish,
+            at_five(2026, 8, 19),
+            "everyone steps over the Tuesday"
+        );
+    }
+
+    #[test]
+    fn a_task_calendar_replaces_the_projects_rather_than_narrowing_it() {
+        // Project's rule: a task calendar is what the task is worked to, so a
+        // seven day one gets the weekend back even though the project's is five.
+        let mut project = project_with(&[2400]);
+        project.calendars.push({
+            let mut round = crate::WorkCalendar::twenty_four_hour();
+            round.name = "Round the clock".into();
+            round.week = vec![crate::DayShifts::standard(); 7];
+            round
+        });
+        project.tasks[0].calendar = "Round the clock".into();
+
+        crate::schedule(&mut project).expect("schedules");
+        assert_eq!(
+            project.tasks[0].scheduled.finish,
+            at_five(2026, 8, 21),
+            "five days of work run Monday to Friday with no weekend to skip"
+        );
+    }
+
+    #[test]
+    fn people_who_are_never_both_there_are_reported_not_hung_on() {
+        // Ada works Monday to Wednesday, Ben Thursday and Friday. There is no
+        // day they can both do the work, and the answer has to be a report
+        // rather than a spin or a date arrived at by giving up.
+        let mut project = one_task_with(&["Ada", "Ben"]);
+
+        let mut first_half = crate::WorkCalendar::standard();
+        first_half.name = "Monday to Wednesday".into();
+        first_half.week[3] = crate::DayShifts::nonworking();
+        first_half.week[4] = crate::DayShifts::nonworking();
+        project.calendars.push(first_half);
+
+        let mut second_half = crate::WorkCalendar::standard();
+        second_half.name = "Thursday and Friday".into();
+        for index in 0..3 {
+            second_half.week[index] = crate::DayShifts::nonworking();
+        }
+        project.calendars.push(second_half);
+
+        resource_named(&mut project, "Ada").base_calendar = "Monday to Wednesday".into();
+        resource_named(&mut project, "Ben").base_calendar = "Thursday and Friday".into();
+
+        crate::schedule(&mut project).expect("it still schedules rather than hanging");
+        assert!(project.tasks[0].scheduled.no_working_time);
+
+        let issues = crate::issues::task_issues(&project, 0);
+        let flagged = issues
+            .iter()
+            .find(|issue| issue.kind == crate::model::IssueKind::NoWorkingTime)
+            .expect("the planner is told");
+        assert!(flagged.fix.is_none(), "which calendar is wrong is not ours to decide");
+
+        // And the stand-in dates are the ones the project calendar gives, so
+        // the row still draws and the rest of the plan still reads.
+        assert_eq!(project.tasks[0].scheduled.start, day(2026, 8, 17));
+        assert_eq!(
+            project.tasks[0].scheduled.finish,
+            at_five(2026, 8, 18)
+        );
+    }
+
+    #[test]
+    fn a_successor_waits_for_its_own_peoples_calendars() {
+        // The link hands over on Tuesday morning, but the person on the
+        // successor is away until Thursday, so that is when it starts.
+        let mut project = project_with(&[480, 480]);
+        let (first, second) = (project.tasks[0].id, project.tasks[1].id);
+        project.add_link(Link {
+            predecessor: first,
+            successor: second,
+            kind: LinkType::FS,
+            lag_minutes: 0,
+        });
+
+        let id = project.allocate_resource_id();
+        let mut ada = crate::model::Resource::new(id, "Ada");
+        ada.calendar_exceptions
+            .push(nonworking("Leave", (2026, 8, 18), (2026, 8, 19)));
+        project.resources.push(ada);
+        project.tasks[1].assignments.push(crate::model::Assignment {
+            resource: id,
+            units: 1.0,
+        });
+
+        crate::schedule(&mut project).expect("schedules");
+        assert_eq!(project.tasks[0].scheduled.finish, at_five(2026, 8, 17));
+        assert_eq!(project.tasks[1].scheduled.start, day(2026, 8, 20));
+    }
+
+    #[test]
+    fn material_resources_have_no_say_in_when_work_happens() {
+        // A pallet of bricks is not away in March, so a material resource must
+        // not narrow anything even if somebody put exceptions on it.
+        let mut project = project_with(&[960]);
+        let id = project.allocate_resource_id();
+        let mut bricks = crate::model::Resource::new(id, "Bricks");
+        bricks.kind = ResourceKind::Material;
+        bricks
+            .calendar_exceptions
+            .push(nonworking("Nonsense", (2026, 8, 18), (2026, 8, 19)));
+        project.resources.push(bricks);
+        project.tasks[0].assignments.push(crate::model::Assignment {
+            resource: id,
+            units: 100.0,
+        });
+
+        crate::schedule(&mut project).expect("schedules");
+        assert_eq!(
+            project.tasks[0].scheduled.finish,
+            at_five(2026, 8, 18)
+        );
     }
 
     #[test]
@@ -1967,7 +2270,11 @@ fn is_driving(project: &Project, link: &Link, pred: usize, succ: usize) -> bool 
     if to.mode == TaskMode::Manual {
         return false;
     }
-    let calendar = &project.calendar;
+    // The successor's own calendar, for the same reason the forward pass uses
+    // it: the date a link hands over is only driving if it is where the
+    // successor, in the time it can be worked, really starts.
+    let calendar = effective_calendar(project, succ);
+    let calendar = calendar.as_ref();
     let duration = to.duration_minutes;
     let handed = driven_start(
         calendar,
@@ -2566,8 +2873,9 @@ mod critical_path_tests {
         );
 
         let graph = build_graph(&project).expect("no loop to report");
+        let calendars = EffectiveCalendars::build(&project);
         project.tasks[0].scheduled.late_start = project.tasks[0].scheduled.start;
-        compute_slack(&mut project, &graph);
+        compute_slack(&mut project, &graph, &calendars);
 
         assert_eq!(
             project.tasks[0].scheduled.total_slack_minutes, 0,
@@ -2614,7 +2922,9 @@ pub fn update_project(
     scope: UpdateScope,
     selected: &[usize],
 ) -> usize {
-    let calendar = project.calendar.clone();
+    // Progress is a share of working time, so it has to be measured in the time
+    // each task is actually worked in rather than the project's.
+    let calendars = EffectiveCalendars::build(project);
     let mut changed = 0;
 
     let rows: Vec<usize> = (0..project.tasks.len())
@@ -2638,6 +2948,7 @@ pub fn update_project(
                     // Part done, in proportion to the working time elapsed
                     // rather than the wall clock, so a weekend does not count
                     // as progress.
+                    let calendar = calendars.for_row(index);
                     let done = calendar.work_minutes_between(task.scheduled.start, through);
                     let total = calendar
                         .work_minutes_between(task.scheduled.start, task.scheduled.finish)

@@ -132,6 +132,24 @@ pub fn task_issues(project: &Project, index: usize) -> Vec<TaskIssue> {
         });
     }
 
+    // Two people whose non-working days do not overlap leave a task with no
+    // time it can be done in. There is no fix to offer: which of the calendars
+    // is wrong, or which person should come off the task, is a judgement about
+    // the plan and not something a button can decide. What matters is that the
+    // dates on the row are said out loud to be a stand-in, because the
+    // scheduler had to fall back to the project calendar to produce any.
+    if task.scheduled.no_working_time {
+        issues.push(TaskIssue {
+            kind: IssueKind::NoWorkingTime,
+            message: "The calendars this task has to fit leave no working time at all, \
+                      so nobody is free to do it. Its dates are worked out against the \
+                      project calendar as a stand-in."
+                .into(),
+            fix: None,
+            ignored: false,
+        });
+    }
+
     for issue in &mut issues {
         issue.ignored = task.ignored_issues.contains(&issue.kind);
     }

@@ -1001,6 +1001,112 @@ button { font: inherit; color: inherit; }
   margin: 12px 0;
 }
 
+/* ---------- import ---------- */
+
+.imp-step {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 22px 0 6px;
+}
+
+/* Picking the heading row by eye rather than by counting: each row is shown
+   as the sheet holds it, so the real headings are obvious among the titles. */
+.imp-rows {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  max-height: 190px;
+  overflow-y: auto;
+  max-width: 860px;
+}
+
+.imp-row {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  cursor: default;
+}
+
+.imp-row:last-child { border-bottom: 0; }
+.imp-row:hover { background: var(--hover); }
+.imp-row.on { background: var(--selection); color: var(--ink); }
+.imp-rownum { color: var(--ink-faint); flex: none; width: 58px; }
+.imp-rowtext { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* One card per column of the sheet. Wide enough for a date and a dropdown,
+   narrow enough that a dozen columns fit on a screen. */
+.imp-cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px;
+  max-width: 1100px;
+}
+
+.imp-col {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 9px 10px 8px;
+  background: var(--surface-3);
+  min-width: 0;
+}
+
+/* A mapped column is doing something, and that has to be visible at a glance
+   across a dozen cards. */
+.imp-col.on { border-color: var(--accent-line); background: var(--accent-dim); }
+
+.imp-head {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.imp-samples { margin-top: 7px; }
+
+.imp-sample {
+  font-size: 11px;
+  color: var(--ink-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.55;
+}
+
+.imp-list {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+  max-width: 860px;
+}
+
+.imp-notice {
+  display: grid;
+  grid-template-columns: 150px 160px 1fr;
+  gap: 10px;
+  font-size: 11.5px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  align-items: baseline;
+}
+
+.imp-notice:last-child { border-bottom: 0; }
+.imp-where { color: var(--ink-faint); }
+.imp-value { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.imp-why { color: var(--ink-soft); }
+
 /* ---------- options ---------- */
 
 .opt-layout { display: flex; gap: 26px; align-items: flex-start; max-width: 940px; }

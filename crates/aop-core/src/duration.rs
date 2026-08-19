@@ -23,7 +23,23 @@ impl DurationUnit {
         }
     }
 
-    fn singular(self) -> &'static str {
+    /// Every unit, in the order a picker should offer them.
+    pub const ALL: [DurationUnit; 5] = [
+        DurationUnit::Minutes,
+        DurationUnit::Hours,
+        DurationUnit::Days,
+        DurationUnit::Weeks,
+        DurationUnit::Months,
+    ];
+
+    /// Read a unit back from its plural, which is what a picker stores.
+    pub fn from_plural(text: &str) -> Option<DurationUnit> {
+        DurationUnit::ALL
+            .into_iter()
+            .find(|unit| unit.plural().eq_ignore_ascii_case(text))
+    }
+
+    pub fn singular(self) -> &'static str {
         match self {
             DurationUnit::Minutes => "min",
             DurationUnit::Hours => "hr",
@@ -33,7 +49,7 @@ impl DurationUnit {
         }
     }
 
-    fn plural(self) -> &'static str {
+    pub fn plural(self) -> &'static str {
         match self {
             DurationUnit::Minutes => "mins",
             DurationUnit::Hours => "hrs",
@@ -62,6 +78,17 @@ fn unit_from_suffix(suffix: &str) -> Option<DurationUnit> {
 /// Accepts `5`, `5d`, `5 days`, `1.5w`, `30 mins`, and a trailing `?` for an
 /// estimated duration (the flag is returned separately).
 pub fn parse_duration(input: &str) -> Option<(i64, bool)> {
+    parse_duration_in(input, DurationUnit::Days)
+}
+
+/// Parse a duration whose bare numbers mean `default_unit`.
+///
+/// The plan's own duration column means days when nothing says otherwise, and
+/// that is what `parse_duration` gives. A work column means hours, and a
+/// column in somebody else's spreadsheet headed "Hours" means what it says, so
+/// the reader of a foreign sheet has to be able to name the unit rather than
+/// inherit Project's default and quietly multiply everything by eight.
+pub fn parse_duration_in(input: &str, default_unit: DurationUnit) -> Option<(i64, bool)> {
     let raw = input.trim();
     if raw.is_empty() {
         return None;
@@ -78,7 +105,7 @@ pub fn parse_duration(input: &str) -> Option<(i64, bool)> {
     if value < 0.0 {
         return None;
     }
-    let unit = unit_from_suffix(suffix).unwrap_or(DurationUnit::Days);
+    let unit = unit_from_suffix(suffix).unwrap_or(default_unit);
 
     Some(((value * unit.minutes() as f64).round() as i64, estimated))
 }
@@ -141,6 +168,15 @@ mod tests {
         assert_eq!(parse_duration("1w"), Some((2400, false)));
         assert_eq!(parse_duration("4 hrs"), Some((240, false)));
         assert_eq!(parse_duration("90 mins"), Some((90, false)));
+    }
+
+    #[test]
+    fn a_bare_number_takes_the_unit_the_caller_names() {
+        // A column headed "Hours" holding 8 means a day of work, not eight of
+        // them. The suffix still wins when there is one.
+        assert_eq!(parse_duration_in("8", DurationUnit::Hours), Some((480, false)));
+        assert_eq!(parse_duration_in("2", DurationUnit::Weeks), Some((4800, false)));
+        assert_eq!(parse_duration_in("3d", DurationUnit::Hours), Some((1440, false)));
     }
 
     #[test]

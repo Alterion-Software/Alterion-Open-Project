@@ -497,12 +497,14 @@ impl Field {
                 .baseline
                 .map(|b| format_duration(b.duration_minutes))
                 .unwrap_or_default(),
+            // Variance is a span of working time, so it is measured in the time
+            // this task is actually worked in rather than the project's.
             Field::StartVariance => task
-                .start_variance_minutes(&project.calendar)
+                .start_variance_minutes(&crate::effective::effective_calendar(project, index))
                 .map(signed)
                 .unwrap_or_default(),
             Field::FinishVariance => task
-                .finish_variance_minutes(&project.calendar)
+                .finish_variance_minutes(&crate::effective::effective_calendar(project, index))
                 .map(signed)
                 .unwrap_or_default(),
             Field::BaselineCost => task

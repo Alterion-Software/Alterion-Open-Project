@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 /// with no working days at all) can never spin forever.
 const MAX_DAY_SCAN: i64 = 365 * 50;
 
+/// Upper bound on the number of dated days a composed calendar will resolve
+/// one at a time. Exceptions beyond it are dropped rather than allowed to turn
+/// a hand-edited file into an unbounded allocation.
+const MAX_COMPOSED_DAYS: usize = 365 * 50;
+
 /// The last representable instant in a day. chrono keeps `end_of_day()`
 /// private, so it is rebuilt here.
 fn end_of_day() -> NaiveTime {
@@ -67,11 +72,41 @@ impl DayShifts {
     pub fn is_working(&self) -> bool {
         self.minutes() > 0
     }
+
+    /// The time that is working in both days.
+    ///
+    /// The shift lists are sorted first because `night()` is not stored in
+    /// clock order, and a sweep over two lists needs both in order to walk them
+    /// once. The result comes out sorted, which is what every walk here wants.
+    pub fn intersect(&self, other: &DayShifts) -> DayShifts {
+        let mut mine = self.shifts.clone();
+        let mut theirs = other.shifts.clone();
+        mine.sort_by_key(|s| (s.start, s.end));
+        theirs.sort_by_key(|s| (s.start, s.end));
+
+        let mut shifts = Vec::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < mine.len() && j < theirs.len() {
+            let start = mine[i].start.max(theirs[j].start);
+            let end = mine[i].end.min(theirs[j].end);
+            if end > start {
+                shifts.push(Shift { start, end });
+            }
+            // Retire whichever shift ends first; the other may still overlap
+            // the one that follows it.
+            if mine[i].end <= theirs[j].end {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        DayShifts { shifts }
+    }
 }
 
 /// A named date range that overrides the normal weekly pattern: holidays,
 /// shutdowns, or extra working weekends.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalendarException {
     pub name: String,
     pub from: NaiveDate,
@@ -79,7 +114,7 @@ pub struct CalendarException {
     pub shifts: DayShifts,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkCalendar {
     pub name: String,
     /// Seven entries, Monday through Sunday.
@@ -332,6 +367,85 @@ impl WorkCalendar {
         (at.date() - origin).num_days() as f64 + self.day_fraction(at)
     }
 
+    /// Whether this calendar has any working time in it at all.
+    ///
+    /// An intersected calendar can end up with none: two people whose
+    /// non-working days do not overlap leave a task with nowhere to be done.
+    /// A weekly pattern with a working day in it always has working time,
+    /// because exceptions cover finite ranges and the pattern applies outside
+    /// them; with a dead week, only a working exception can supply any.
+    pub fn has_working_time(&self) -> bool {
+        self.week.iter().any(DayShifts::is_working)
+            || self.exceptions.iter().any(|ex| ex.shifts.is_working())
+    }
+
+    /// The calendar of time that is working in both this one and `other`.
+    ///
+    /// This is what lets a task be scheduled only when everyone it needs is
+    /// there. Composing a real `WorkCalendar` rather than teaching every walk
+    /// about a list of calendars means `add_minutes` and the rest keep working
+    /// unchanged, and it is the composition, not the walking, that gets cached.
+    ///
+    /// The weekly patterns intersect directly. Exceptions cannot, because an
+    /// exception on one side has to be measured against whatever the other
+    /// side says on those same dates, which may be its ordinary week. So every
+    /// date either side calls out is resolved individually and then runs of
+    /// identical days are merged back into ranges, which keeps the exception
+    /// list short enough that `shifts_on` stays cheap.
+    pub fn intersect(&self, other: &WorkCalendar) -> WorkCalendar {
+        let week: Vec<DayShifts> = (0..7)
+            .map(|index| {
+                let mine = self.week.get(index).cloned().unwrap_or_default();
+                let theirs = other.week.get(index).cloned().unwrap_or_default();
+                mine.intersect(&theirs)
+            })
+            .collect();
+
+        // Every date one side or the other has an opinion about. A date nobody
+        // excepts is already covered by the intersected week above.
+        let mut dates: Vec<NaiveDate> = Vec::new();
+        let mut budget = MAX_COMPOSED_DAYS;
+        for ex in self.exceptions.iter().chain(other.exceptions.iter()) {
+            let mut date = ex.from;
+            while date <= ex.to && budget > 0 {
+                dates.push(date);
+                budget -= 1;
+                date += Duration::days(1);
+            }
+        }
+        dates.sort_unstable();
+        dates.dedup();
+
+        // Runs of days that resolve the same way collapse back into one entry,
+        // so a month of somebody's leave costs one exception, not thirty.
+        let mut exceptions: Vec<CalendarException> = Vec::new();
+        for date in dates {
+            let shifts = self.shifts_on(date).intersect(other.shifts_on(date));
+            match exceptions.last_mut() {
+                Some(last) if last.to + Duration::days(1) == date && last.shifts == shifts => {
+                    last.to = date;
+                }
+                _ => exceptions.push(CalendarException {
+                    name: "Combined".into(),
+                    from: date,
+                    to: date,
+                    shifts,
+                }),
+            }
+        }
+
+        let name = if self.name == other.name {
+            self.name.clone()
+        } else {
+            format!("{} and {}", self.name, other.name)
+        };
+        WorkCalendar {
+            name,
+            week,
+            exceptions,
+        }
+    }
+
     /// Whole working days between two dates, used for timescale drawing.
     pub fn working_days_between(&self, a: NaiveDate, b: NaiveDate) -> i64 {
         let (lo, hi, sign) = if b >= a { (a, b, 1) } else { (b, a, -1) };
@@ -455,6 +569,99 @@ mod tests {
         let friday = cal.day_offset(origin, dt(2026, 8, 21, 17, 0));
         let monday = cal.day_offset(origin, dt(2026, 8, 24, 8, 0));
         assert!((monday - friday - 2.0).abs() < 1e-9, "expected two days of weekend");
+    }
+
+    #[test]
+    fn an_intersection_keeps_only_the_hours_both_sides_work() {
+        let mut early = WorkCalendar::standard();
+        early.name = "Early".into();
+        early.week[0] = DayShifts {
+            shifts: vec![Shift::new(6, 0, 14, 0)],
+        };
+        let mut late = WorkCalendar::standard();
+        late.name = "Late".into();
+        late.week[0] = DayShifts {
+            shifts: vec![Shift::new(12, 0, 20, 0)],
+        };
+
+        let both = early.intersect(&late);
+        assert_eq!(both.week[0].shifts, vec![Shift::new(12, 0, 14, 0)]);
+        assert_eq!(both.minutes_in_day(NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()), 120);
+    }
+
+    #[test]
+    fn an_intersection_takes_both_sides_days_off() {
+        let mut mine = WorkCalendar::standard();
+        mine.name = "Mine".into();
+        mine.exceptions.push(CalendarException {
+            name: "Away".into(),
+            from: NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+            to: NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+            shifts: DayShifts::nonworking(),
+        });
+        let mut theirs = WorkCalendar::standard();
+        theirs.name = "Theirs".into();
+        theirs.exceptions.push(CalendarException {
+            name: "Away".into(),
+            from: NaiveDate::from_ymd_opt(2026, 8, 19).unwrap(),
+            to: NaiveDate::from_ymd_opt(2026, 8, 19).unwrap(),
+            shifts: DayShifts::nonworking(),
+        });
+
+        let both = mine.intersect(&theirs);
+        assert!(!both.is_working_day(NaiveDate::from_ymd_opt(2026, 8, 18).unwrap()));
+        assert!(!both.is_working_day(NaiveDate::from_ymd_opt(2026, 8, 19).unwrap()));
+        assert!(both.is_working_day(NaiveDate::from_ymd_opt(2026, 8, 20).unwrap()));
+        // Monday 08:00 plus one day now steps over both, landing on Thursday.
+        assert_eq!(both.add_minutes(dt(2026, 8, 17, 8, 0), 960), dt(2026, 8, 20, 17, 0));
+    }
+
+    #[test]
+    fn a_run_of_identical_days_collapses_into_one_exception() {
+        // A fortnight of leave has to cost one entry, not fourteen, or every
+        // `shifts_on` in the scheduler pays for it on every lookup.
+        let mut away = WorkCalendar::standard();
+        away.name = "Away".into();
+        away.exceptions.push(CalendarException {
+            name: "Leave".into(),
+            from: NaiveDate::from_ymd_opt(2026, 3, 2).unwrap(),
+            to: NaiveDate::from_ymd_opt(2026, 3, 13).unwrap(),
+            shifts: DayShifts::nonworking(),
+        });
+
+        let both = WorkCalendar::standard().intersect(&away);
+        assert_eq!(
+            both.exceptions.len(),
+            1,
+            "twelve identical days are one entry, not twelve"
+        );
+        assert_eq!(both.exceptions[0].from, NaiveDate::from_ymd_opt(2026, 3, 2).unwrap());
+        assert_eq!(both.exceptions[0].to, NaiveDate::from_ymd_opt(2026, 3, 13).unwrap());
+    }
+
+    #[test]
+    fn a_calendar_nobody_works_is_recognised_rather_than_walked() {
+        // Two people who are never in on the same day. Walking this would burn
+        // the whole day scan and hand back a date arrived at by giving up.
+        let mut first_half = WorkCalendar::standard();
+        first_half.week[3] = DayShifts::nonworking();
+        first_half.week[4] = DayShifts::nonworking();
+        let mut second_half = WorkCalendar::standard();
+        for day in 0..3 {
+            second_half.week[day] = DayShifts::nonworking();
+        }
+
+        assert!(first_half.has_working_time());
+        assert!(second_half.has_working_time());
+        assert!(!first_half.intersect(&second_half).has_working_time());
+    }
+
+    #[test]
+    fn intersecting_a_calendar_with_itself_changes_nothing() {
+        let cal = WorkCalendar::standard();
+        let same = cal.intersect(&cal);
+        assert_eq!(same.week, cal.week);
+        assert_eq!(same.name, cal.name);
     }
 
     #[test]

@@ -332,7 +332,9 @@ pub fn update_project(
     project: &mut Project,
     options: &UpdateOptions,
 ) -> Result<UpdateSummary, ScheduleError> {
-    let calendar = project.calendar.clone();
+    // Completion is a share of working time, so it has to be measured in the
+    // time each task is actually worked in rather than the project's.
+    let calendars = crate::effective::EffectiveCalendars::build(project);
     let mut completed = Vec::new();
     let mut rescheduled = Vec::new();
     let mut skipped = Vec::new();
@@ -351,7 +353,12 @@ pub fn update_project(
         match options.mode {
             UpdateMode::Complete(rule) => {
                 let was = project.tasks[index].percent_complete;
-                match completion_for(&calendar, &project.tasks[index], options.through, rule) {
+                match completion_for(
+                    calendars.for_row(index),
+                    &project.tasks[index],
+                    options.through,
+                    rule,
+                ) {
                     Err(reason) => skipped.push(Skipped { index, id, reason }),
                     Ok(percent) if percent == was => skipped.push(Skipped {
                         index,
@@ -387,9 +394,11 @@ pub fn update_project(
                 }
 
                 let was_start = task.scheduled.start;
+                let calendar = calendars.for_row(index);
                 // Where the unfinished part has to pick up. Snapping forward
                 // matters: a status date of Friday evening means Monday
-                // morning, not a slot in the middle of the weekend.
+                // morning, not a slot in the middle of the weekend, and on a
+                // task somebody is away for it means the day they are back.
                 let resume = calendar.next_working_instant(options.through);
                 let span = calendar.work_minutes_between(was_start, task.scheduled.finish);
                 let done = span * task.percent_complete.min(100) as i64 / 100;
@@ -435,10 +444,17 @@ pub fn update_project(
     // A constraint is a floor, not an instruction: a predecessor can push a
     // task later still. Reporting the date asked for rather than the date given
     // would have the dialog claim something the plan does not say.
+    // Recomposed after the reschedule rather than reused, because the borrow
+    // above ended when the scheduler took the plan mutably. Nothing the
+    // scheduler does changes what a task is worked to, so this is the same
+    // answer, only fetched again.
+    let calendars = crate::effective::EffectiveCalendars::build(project);
     for moved in &mut rescheduled {
         moved.new_start = project.tasks[moved.index].scheduled.start;
         moved.resumes = if moved.completed_minutes > 0 {
-            calendar.add_minutes(moved.new_start, moved.completed_minutes)
+            calendars
+                .for_row(moved.index)
+                .add_minutes(moved.new_start, moved.completed_minutes)
         } else {
             moved.new_start
         };

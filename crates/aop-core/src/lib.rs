@@ -10,9 +10,11 @@ pub mod custom;
 pub mod draw;
 pub mod duration;
 pub mod earned_value;
+pub mod effective;
 pub mod excel;
 pub mod fields;
 pub mod grouping;
+pub mod holidays;
 pub mod history;
 pub mod issues;
 pub mod leveling;
@@ -22,6 +24,7 @@ pub mod mspdi;
 pub mod pdf;
 pub mod persist;
 pub mod schedule;
+pub mod sheet;
 pub mod spelling;
 pub mod subproject;
 pub mod templates;
@@ -30,9 +33,11 @@ pub mod update;
 pub mod versions;
 
 pub use calendar::{CalendarException, DayShifts, Shift, WorkCalendar};
+pub use effective::{effective_calendar, resource_calendar, EffectiveCalendars};
 pub use fields::{Align, Field, FieldGroup};
 pub use duration::{
-    format_duration, format_duration_flagged, format_work, parse_duration, DurationUnit,
+    format_duration, format_duration_flagged, format_work, parse_duration, parse_duration_in,
+    DurationUnit,
 };
 pub use model::{
     Assignment, BarStyles, Baseline, ConstraintType, Link, LinkType, Project, Resource, ResourceId,

@@ -222,10 +222,25 @@ fn TaskInformation(row: usize) -> Element {
             .unwrap_or_default()
     });
     let mut mode = use_signal(|| task.mode);
+    let mut task_calendar = use_signal(|| task.calendar.clone());
+    let mut ignore_resource_calendars = use_signal(|| task.ignore_resource_calendars);
 
-    let (currency, is_summary) = {
+    let (currency, is_summary, calendar_choices) = {
         let s = state.read();
-        (s.project.currency_symbol.clone(), s.project.is_summary(row))
+        // An empty name is what "the project's" is stored as, so the picker
+        // offers it under the project calendar's own name rather than blank.
+        let mut choices = vec![Choice::new(
+            "",
+            format!("Project calendar ({})", s.project.calendar.name),
+        )];
+        for calendar in s.project.calendars.iter() {
+            choices.push(Choice::plain(calendar.name.clone()));
+        }
+        (
+            s.project.currency_symbol.clone(),
+            s.project.is_summary(row),
+            choices,
+        )
     };
 
     let apply = move |_| {
@@ -237,6 +252,8 @@ fn TaskInformation(row: usize) -> Element {
         let new_constraint_date = constraint_date();
         let new_deadline = deadline();
         let new_mode = mode();
+        let new_calendar = task_calendar();
+        let new_ignore = ignore_resource_calendars();
 
         let mut writer = state.write();
         writer.checkpoint();
@@ -258,6 +275,8 @@ fn TaskInformation(row: usize) -> Element {
                 None
             };
             target.deadline = parse_date(&new_deadline);
+            target.calendar = new_calendar;
+            target.ignore_resource_calendars = new_ignore;
         }
         writer.reschedule();
         writer.dialog = None;
@@ -363,6 +382,33 @@ fn TaskInformation(row: usize) -> Element {
                     }
                     div { class: "hint",
                         "A deadline does not move the task. It shows up as negative slack when the schedule runs past it."
+                    }
+
+                    h3 { style: "font-size: 13px; margin: 18px 0 8px;", "Calendar" }
+                    div { class: "form-row",
+                        label { "Work to" }
+                        Dropdown {
+                            value: "{task_calendar}",
+                            options: calendar_choices,
+                            width: 0.0, large: true, disabled: false,
+                            on_pick: move |picked: String| task_calendar.set(picked),
+                        }
+                    }
+                    div { class: "rcheck", style: "height: 24px;",
+                        onclick: move |_| {
+                            let was = ignore_resource_calendars();
+                            ignore_resource_calendars.set(!was);
+                        },
+                        span {
+                            class: if ignore_resource_calendars() { "box on" } else { "box" },
+                            if ignore_resource_calendars() { "\u{2713}" }
+                        }
+                        span { "Scheduling ignores resource calendars" }
+                    }
+                    div { class: "hint",
+                        "The task is worked only in time that is working in both this calendar \
+                         and every assigned person's, unless the box is ticked. The box does \
+                         nothing until a calendar other than the project's is chosen."
                     }
                 },
 
@@ -1747,80 +1793,277 @@ const WEEKDAYS: [&str; 7] = [
     "Sunday",
 ];
 
+/// Which calendar Change Working Time is pointed at.
+///
+/// Encoded as a string so it can ride through the same `Dropdown` every other
+/// picker in this file uses. The three cases are deliberately different things:
+/// a public holiday belongs on the project calendar or a base, where it moves
+/// everybody, and one person's leave belongs on that person, where it moves
+/// only the tasks they are on.
+fn calendar_target_of(value: &str) -> CalendarTarget {
+    if let Some(name) = value.strip_prefix("base:") {
+        return CalendarTarget::Base(name.to_string());
+    }
+    if let Some(id) = value.strip_prefix("resource:")
+        && let Ok(id) = id.parse::<u32>()
+    {
+        return CalendarTarget::Resource(id);
+    }
+    CalendarTarget::Project
+}
+
+enum CalendarTarget {
+    Project,
+    Base(String),
+    Resource(u32),
+}
+
+/// What the dialog is showing, pulled out of the plan in one read.
+struct CalendarView {
+    /// Whether each weekday is worked, and the hours, from the calendar in
+    /// force for the target.
+    week: Vec<(bool, String)>,
+    exceptions: Vec<(String, NaiveDate, NaiveDate)>,
+    /// Set for a person: the week is their base's and is not theirs to edit
+    /// here, so it is shown rather than offered.
+    base_of_resource: Option<String>,
+}
+
+fn read_calendar(state: &AppState, target: &CalendarTarget) -> CalendarView {
+    let project = &state.project;
+    let (calendar, exceptions, base_of_resource) = match target {
+        CalendarTarget::Project => (
+            &project.calendar,
+            project.calendar.exceptions.clone(),
+            None,
+        ),
+        CalendarTarget::Base(name) => {
+            let calendar = project.calendar_or_project(name);
+            (calendar, calendar.exceptions.clone(), None)
+        }
+        CalendarTarget::Resource(id) => {
+            let resource = project.resource(*id);
+            let base = resource.map(|r| r.base_calendar.clone()).unwrap_or_default();
+            let calendar = project.calendar_or_project(&base);
+            (
+                calendar,
+                resource.map(|r| r.calendar_exceptions.clone()).unwrap_or_default(),
+                Some(calendar.name.clone()),
+            )
+        }
+    };
+
+    let week = calendar
+        .week
+        .iter()
+        .map(|day| {
+            let hours = day
+                .shifts
+                .iter()
+                .map(|shift| format!("{} - {}", shift.start.format("%H:%M"), shift.end.format("%H:%M")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                day.is_working(),
+                if hours.is_empty() { "Nonworking".to_string() } else { hours },
+            )
+        })
+        .collect();
+
+    CalendarView {
+        week,
+        exceptions: exceptions
+            .into_iter()
+            .map(|ex| (ex.name, ex.from, ex.to))
+            .collect(),
+        base_of_resource,
+    }
+}
+
 #[component]
 fn ChangeWorkingTime() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let mut holiday_name = use_signal(|| String::from("Holiday"));
-    let mut holiday_date = use_signal(String::new);
+    let mut holiday_from = use_signal(String::new);
+    let mut holiday_to = use_signal(String::new);
+    let mut target_value = use_signal(|| String::from("project"));
 
-    let (week, exceptions, calendar_name) = {
+    let target = calendar_target_of(&target_value());
+    let editable_week = !matches!(target, CalendarTarget::Resource(_));
+
+    let (view, targets, bases) = {
         let s = state.read();
-        let week: Vec<bool> = s.project.calendar.week.iter().map(|d| d.is_working()).collect();
-        let exceptions: Vec<(String, NaiveDate)> = s
+        let view = read_calendar(&s, &target);
+
+        let mut targets = vec![Choice::new(
+            "project",
+            format!("Project calendar ({})", s.project.calendar.name),
+        )];
+        for calendar in s.project.calendars.iter() {
+            targets.push(Choice::new(
+                format!("base:{}", calendar.name),
+                calendar.name.clone(),
+            ));
+        }
+        for resource in s.project.resources.iter().filter(|r| r.kind == ResourceKind::Work) {
+            targets.push(Choice::new(
+                format!("resource:{}", resource.id),
+                format!("{} (person)", resource.name),
+            ));
+        }
+
+        let bases: Vec<Choice> = s
             .project
-            .calendar
-            .exceptions
-            .iter()
-            .map(|e| (e.name.clone(), e.from))
+            .calendar_library()
+            .map(|calendar| Choice::plain(calendar.name.clone()))
             .collect();
-        (week, exceptions, s.project.calendar.name.clone())
+        (view, targets, bases)
     };
+
+    let target_for_week = target_value();
+    let target_for_remove = target_value();
+    let target_for_add = target_value();
+    let target_for_base = target_value();
 
     rsx! {
         Head { title: "Change Working Time".to_string() }
         div { class: "dlg-body",
             div { class: "form-row",
                 label { "For calendar" }
-                input { class: "grow", value: "{calendar_name}", readonly: true }
+                Dropdown {
+                    value: "{target_value}",
+                    options: targets,
+                    width: 0.0,
+                    large: true,
+                    disabled: false,
+                    on_pick: move |picked: String| target_value.set(picked),
+                }
+                button { class: "btn",
+                    onclick: move |_| {
+                        let mut writer = state.write();
+                        writer.checkpoint();
+                        let name = writer.project.add_base_calendar(aop_core::WorkCalendar::standard());
+                        target_value.set(format!("base:{name}"));
+                    },
+                    "New calendar"
+                }
+            }
+
+            if let Some(base) = view.base_of_resource.clone() {
+                div { class: "form-row",
+                    label { "Follows" }
+                    Dropdown {
+                        value: "{base}",
+                        options: bases,
+                        width: 0.0,
+                        large: true,
+                        disabled: false,
+                        on_pick: move |picked: String| {
+                            let CalendarTarget::Resource(id) = calendar_target_of(&target_for_base) else { return };
+                            let mut writer = state.write();
+                            writer.checkpoint();
+                            if let Some(resource) = writer.project.resources.iter_mut().find(|r| r.id == id) {
+                                resource.base_calendar = picked;
+                            }
+                            writer.reschedule();
+                        },
+                    }
+                }
+                div { class: "hint",
+                    "The working week below is this calendar's and is shared. \
+                     Time off for this person alone goes in Exceptions."
+                }
             }
 
             h3 { style: "font-size: 13px; margin: 14px 0 8px;", "Working week" }
             for (index, day) in WEEKDAYS.iter().enumerate() {
                 {
-                    let working = week.get(index).copied().unwrap_or(false);
+                    let (working, hours) = view
+                        .week
+                        .get(index)
+                        .cloned()
+                        .unwrap_or((false, "Nonworking".to_string()));
                     let box_class = if working { "box on" } else { "box" };
+                    let row_class = if editable_week { "rcheck" } else { "rcheck disabled" };
+                    let target_for_day = target_for_week.clone();
                     rsx! {
-                        div { key: "{day}", class: "rcheck", style: "height: 24px;",
+                        div { key: "{day}", class: "{row_class}", style: "height: 24px;",
                             onclick: move |_| {
+                                if !editable_week {
+                                    return;
+                                }
+                                let target = calendar_target_of(&target_for_day);
                                 let mut writer = state.write();
                                 writer.checkpoint();
-                                if let Some(slot) = writer.project.calendar.week.get_mut(index) {
-                                    *slot = if working { DayShifts::nonworking() } else { DayShifts::standard() };
-                                }
+                                let calendar = match &target {
+                                    CalendarTarget::Base(name) => writer.project.calendar_named_mut(name),
+                                    _ => Some(&mut writer.project.calendar),
+                                };
+                                if let Some(calendar) = calendar
+                                    && let Some(slot) = calendar.week.get_mut(index) {
+                                        *slot = if working { DayShifts::nonworking() } else { DayShifts::standard() };
+                                    }
                                 writer.reschedule();
                             },
                             span { class: "{box_class}", if working { "\u{2713}" } }
                             span { style: "width: 100px;", "{day}" }
-                            span { style: "color: var(--ink-soft);",
-                                if working { "08:00 - 12:00, 13:00 - 17:00" } else { "Nonworking" }
-                            }
+                            span { style: "color: var(--ink-soft);", "{hours}" }
                         }
                     }
                 }
             }
 
             h3 { style: "font-size: 13px; margin: 18px 0 8px;", "Exceptions" }
-            if exceptions.is_empty() {
-                div { class: "hint", "No holidays or shutdowns have been added." }
+            if view.exceptions.is_empty() {
+                div { class: "hint",
+                    if view.base_of_resource.is_some() {
+                        "No leave or other time off has been recorded for this person."
+                    } else {
+                        "No holidays or shutdowns have been added."
+                    }
+                }
             } else {
                 table { class: "assign-table",
-                    thead { tr { th { "Name" } th { "Date" } th { style: "width: 60px;", "" } } }
+                    thead { tr { th { "Name" } th { "From" } th { "To" } th { style: "width: 60px;", "" } } }
                     tbody {
-                        for (index, (name, date)) in exceptions.iter().enumerate() {
+                        for (index, (name, from, to)) in view.exceptions.iter().enumerate() {
                             tr { key: "ex{index}",
                                 td { "{name}" }
-                                td { "{date}" }
+                                td { "{from}" }
+                                td { "{to}" }
                                 td {
-                                    button { class: "btn", style: "padding: 1px 8px;",
-                                        onclick: move |_| {
-                                            let mut writer = state.write();
-                                            writer.checkpoint();
-                                            if index < writer.project.calendar.exceptions.len() {
-                                                writer.project.calendar.exceptions.remove(index);
+                                    {
+                                        let target_for_row = target_for_remove.clone();
+                                        rsx! {
+                                            button { class: "btn", style: "padding: 1px 8px;",
+                                                onclick: move |_| {
+                                                    let target = calendar_target_of(&target_for_row);
+                                                    let mut writer = state.write();
+                                                    writer.checkpoint();
+                                                    let list = match &target {
+                                                        CalendarTarget::Resource(id) => writer
+                                                            .project
+                                                            .resources
+                                                            .iter_mut()
+                                                            .find(|r| r.id == *id)
+                                                            .map(|r| &mut r.calendar_exceptions),
+                                                        CalendarTarget::Base(name) => writer
+                                                            .project
+                                                            .calendar_named_mut(name)
+                                                            .map(|c| &mut c.exceptions),
+                                                        CalendarTarget::Project => {
+                                                            Some(&mut writer.project.calendar.exceptions)
+                                                        }
+                                                    };
+                                                    if let Some(list) = list
+                                                        && index < list.len() {
+                                                            list.remove(index);
+                                                        }
+                                                    writer.reschedule();
+                                                },
+                                                "Remove"
                                             }
-                                            writer.reschedule();
-                                        },
-                                        "Remove"
+                                        }
                                     }
                                 }
                             }
@@ -1833,22 +2076,45 @@ fn ChangeWorkingTime() -> Element {
                 label { "Add exception" }
                 input { style: "flex: 1;", placeholder: "Name", value: "{holiday_name}",
                     oninput: move |e| holiday_name.set(e.value()) }
-                input { style: "width: 130px;", placeholder: "YYYY-MM-DD", value: "{holiday_date}",
-                    oninput: move |e| holiday_date.set(e.value()) }
+                input { style: "width: 120px;", placeholder: "From YYYY-MM-DD", value: "{holiday_from}",
+                    oninput: move |e| holiday_from.set(e.value()) }
+                input { style: "width: 120px;", placeholder: "To (optional)", value: "{holiday_to}",
+                    oninput: move |e| holiday_to.set(e.value()) }
                 button { class: "btn",
                     onclick: move |_| {
-                        let Some(date) = parse_date(&holiday_date()) else { return };
+                        let Some(from) = parse_date(&holiday_from()) else { return };
+                        // A single day is the common case, so an empty "to"
+                        // means the same day rather than an error.
+                        let to = parse_date(&holiday_to()).unwrap_or(from);
                         let name = holiday_name();
+                        let entry = aop_core::CalendarException {
+                            name: if name.trim().is_empty() { "Holiday".into() } else { name },
+                            from: from.date(),
+                            to: to.date().max(from.date()),
+                            shifts: DayShifts::nonworking(),
+                        };
+                        let target = calendar_target_of(&target_for_add);
                         let mut writer = state.write();
                         writer.checkpoint();
-                        writer.project.calendar.exceptions.push(aop_core::CalendarException {
-                            name: if name.trim().is_empty() { "Holiday".into() } else { name },
-                            from: date.date(),
-                            to: date.date(),
-                            shifts: DayShifts::nonworking(),
-                        });
+                        let list = match &target {
+                            CalendarTarget::Resource(id) => writer
+                                .project
+                                .resources
+                                .iter_mut()
+                                .find(|r| r.id == *id)
+                                .map(|r| &mut r.calendar_exceptions),
+                            CalendarTarget::Base(name) => writer
+                                .project
+                                .calendar_named_mut(name)
+                                .map(|c| &mut c.exceptions),
+                            CalendarTarget::Project => Some(&mut writer.project.calendar.exceptions),
+                        };
+                        if let Some(list) = list {
+                            list.push(entry);
+                        }
                         writer.reschedule();
-                        holiday_date.set(String::new());
+                        holiday_from.set(String::new());
+                        holiday_to.set(String::new());
                     },
                     "Add"
                 }

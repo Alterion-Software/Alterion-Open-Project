@@ -801,4 +801,94 @@ mod tests {
         let csv = to_csv(&project);
         assert_eq!(csv.lines().count(), project.tasks.len() + 1);
     }
+
+    #[test]
+    fn a_file_written_before_calendars_existed_still_opens() {
+        // Every field the calendar library added is serde-defaulted, so a plan
+        // saved by an older build has to load with the library empty and
+        // nothing naming a calendar. This strips those keys back out of a
+        // freshly written plan to stand in for such a file.
+        const ADDED_SINCE: [&str; 4] = [
+            "calendars",
+            "calendar_exceptions",
+            "ignore_resource_calendars",
+            "no_working_time",
+        ];
+
+        let mut project = sample();
+        let id = project.allocate_resource_id();
+        project
+            .resources
+            .push(crate::model::Resource::new(id, "Ada"));
+
+        let mut value = serde_json::to_value(&project).expect("a plan serialises");
+        // The task-level `calendar` key is stripped by name below rather than
+        // through this list, because `Project` has a `calendar` of its own that
+        // has always been written and must survive.
+        strip(&mut value, &ADDED_SINCE);
+        if let Some(tasks) = value.get_mut("tasks").and_then(|t| t.as_array_mut()) {
+            for task in tasks {
+                if let Some(map) = task.as_object_mut() {
+                    map.remove("calendar");
+                }
+            }
+        }
+
+        // The binary container is what a real `.aprj` is: MessagePack with the
+        // field names kept. Re-encoding the stripped tree through it is as
+        // close to a file from an older build as this can get without keeping
+        // one in the repository.
+        let packed = rmp_serde::to_vec_named(&value).expect("the stripped plan packs");
+        let mut binary = Vec::new();
+        binary.extend_from_slice(b"APRJ");
+        binary.extend_from_slice(&2u16.to_le_bytes());
+        binary.extend_from_slice(&0u16.to_le_bytes());
+        binary.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        binary.extend_from_slice(&packed);
+        let from_binary = from_bytes(&binary).expect("an older binary file still opens");
+        assert!(from_binary.calendars.is_empty());
+        assert!(from_binary.tasks.iter().all(|task| task.calendar.is_empty()));
+
+        let legacy = serde_json::json!({
+            "format": "alterion-open-project",
+            "version": 1,
+            "project": value,
+        });
+        let bytes = serde_json::to_vec(&legacy).expect("a container serialises");
+
+        let back = from_bytes(&bytes).expect("an older file still opens");
+        assert!(back.calendars.is_empty(), "the library starts empty");
+        assert_eq!(back.calendar.name, project.calendar.name);
+        assert!(back.tasks.iter().all(|task| task.calendar.is_empty()));
+        assert!(
+            back.tasks
+                .iter()
+                .all(|task| !task.ignore_resource_calendars)
+        );
+        assert!(
+            back.resources
+                .iter()
+                .all(|r| r.calendar_exceptions.is_empty())
+        );
+    }
+
+    /// Drop a set of keys from every object in a JSON tree.
+    fn strip(value: &mut serde_json::Value, keys: &[&str]) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for key in keys {
+                    map.remove(*key);
+                }
+                for entry in map.values_mut() {
+                    strip(entry, keys);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    strip(item, keys);
+                }
+            }
+            _ => {}
+        }
+    }
 }
