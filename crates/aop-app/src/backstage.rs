@@ -1691,7 +1691,6 @@ fn AboutPage() -> Element {
                 div { class: "about-pills",
                     span { class: "pill accent", "v{env!(\"CARGO_PKG_VERSION\")}" }
                     span { class: "pill", "{persist::FILE_TYPE_NAME}" }
-                    span { class: "pill", "Rust \u{00b7} Dioxus" }
                 }
             }
 
@@ -1701,7 +1700,7 @@ fn AboutPage() -> Element {
                     ("Product", APP_NAME.to_string()),
                     ("Version", format!("v{}", env!("CARGO_PKG_VERSION"))),
                     ("File format", format!(".{} ({})", persist::FILE_EXTENSION, persist::FILE_TYPE_NAME)),
-                    ("Engine", "Critical path method, forward and backward pass".to_string()),
+                    ("Engine", "AOP Project Engine v2".to_string()),
                     ("Calendars", "Working time with shifts, weekends and holidays".to_string()),
                     ("\u{00a9}", format!("{year} Alterion. All rights reserved.")),
                 ] {

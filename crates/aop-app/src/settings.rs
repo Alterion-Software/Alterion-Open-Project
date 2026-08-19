@@ -164,22 +164,38 @@ impl Default for Settings {
 /// with the account. The Unix answer is unchanged, so nobody's existing
 /// settings move.
 pub fn config_root() -> Option<PathBuf> {
-    if cfg!(windows) {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            let appdata = PathBuf::from(appdata);
-            if !appdata.as_os_str().is_empty() {
-                return Some(appdata.join("Alterion Open Project"));
-            }
+    resolve_config_root(
+        cfg!(windows),
+        |name| std::env::var_os(name).map(PathBuf::from),
+        crate::state::home_dir(),
+    )
+}
+
+/// The decision behind [`config_root`], with the platform and the environment
+/// handed in.
+///
+/// Separated so it can be tested at all. `cfg!(windows)` is a constant on any
+/// one machine, so the branch that broke every Windows install could not be
+/// exercised from the machine it was written on, which is exactly how it
+/// shipped. Passing both in means both answers are checked everywhere.
+fn resolve_config_root(
+    windows: bool,
+    var: impl Fn(&str) -> Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let present = |name: &str| var(name).filter(|path| !path.as_os_str().is_empty());
+
+    if windows {
+        if let Some(appdata) = present("APPDATA") {
+            return Some(appdata.join("Alterion Open Project"));
         }
-        // Last resort, and better than forgetting everything: a folder beside
-        // the profile rather than none at all.
-        return crate::state::home_dir()
-            .map(|home| home.join("AppData").join("Roaming").join("Alterion Open Project"));
+        // Last resort, and better than forgetting everything: the usual place
+        // beside the profile rather than nowhere at all.
+        return home.map(|home| {
+            home.join("AppData").join("Roaming").join("Alterion Open Project")
+        });
     }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| crate::state::home_dir().map(|home| home.join(".config")))?;
+    let base = present("XDG_CONFIG_HOME").or_else(|| home.map(|home| home.join(".config")))?;
     Some(base.join("alterion-open-project"))
 }
 
@@ -715,5 +731,92 @@ mod tests {
             assert!(Settings::from_text(&format!("timeline = {value}")).show_timeline);
         }
         assert!(!Settings::from_text("timeline = false").show_timeline);
+    }
+
+    fn no_vars(_: &str) -> Option<PathBuf> {
+        None
+    }
+
+    #[test]
+    fn windows_keeps_its_settings_in_appdata() {
+        // The bug: every path in this application was worked out from
+        // XDG_CONFIG_HOME or HOME/.config, both Unix variables that Windows
+        // does not set, so all of them returned None there and nothing was
+        // ever written. The settings, the recent list, the added dictionary
+        // words, the recovery snapshots and the single instance port file all
+        // forgot themselves on every launch.
+        let appdata = |name: &str| match name {
+            "APPDATA" => Some(PathBuf::from(r"C:\Users\ada\AppData\Roaming")),
+            _ => None,
+        };
+        let home = Some(PathBuf::from(r"C:\Users\ada"));
+
+        let root = resolve_config_root(true, appdata, home.clone())
+            .expect("Windows must resolve a config folder");
+        // Compared by component, not as a string: `join` uses the separator
+        // of whatever platform this is compiled on, so comparing the whole
+        // path here would be testing the separator rather than the decision.
+        assert!(root.ends_with("Alterion Open Project"), "got {root:?}");
+        assert!(
+            root.starts_with(PathBuf::from(r"C:\Users\ada\AppData\Roaming")),
+            "got {root:?}"
+        );
+
+        // And with APPDATA missing, which happens under some service and
+        // container accounts: the profile still gives an answer.
+        let root = resolve_config_root(true, no_vars, home)
+            .expect("a profile is enough on its own");
+        assert!(root.ends_with("Alterion Open Project"), "got {root:?}");
+        assert!(root.to_string_lossy().contains("Roaming"), "got {root:?}");
+
+        // With neither, nothing is invented.
+        assert!(resolve_config_root(true, no_vars, None).is_none());
+    }
+
+    #[test]
+    fn unix_is_unchanged_so_nobodys_settings_move() {
+        let xdg = |name: &str| match name {
+            "XDG_CONFIG_HOME" => Some(PathBuf::from("/home/ada/.config")),
+            _ => None,
+        };
+        let home = Some(PathBuf::from("/home/ada"));
+
+        assert_eq!(
+            resolve_config_root(false, xdg, home.clone()),
+            Some(PathBuf::from("/home/ada/.config/alterion-open-project"))
+        );
+        // Without XDG_CONFIG_HOME it falls to the home folder, as before.
+        assert_eq!(
+            resolve_config_root(false, no_vars, home),
+            Some(PathBuf::from("/home/ada/.config/alterion-open-project"))
+        );
+        // An empty variable is not an answer. Set-but-empty is common in
+        // stripped environments and would otherwise resolve to a bare
+        // "alterion-open-project" relative to wherever it was started.
+        let empty = |name: &str| match name {
+            "XDG_CONFIG_HOME" => Some(PathBuf::from("")),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_config_root(false, empty, Some(PathBuf::from("/home/ada"))),
+            Some(PathBuf::from("/home/ada/.config/alterion-open-project"))
+        );
+        assert!(resolve_config_root(false, no_vars, None).is_none());
+    }
+
+    #[test]
+    fn the_two_platforms_never_agree_on_a_folder() {
+        // Not a style point: if they ever resolved to the same place, one
+        // platform's file layout would silently become the other's.
+        let both = |name: &str| match name {
+            "APPDATA" => Some(PathBuf::from(r"C:\Users\ada\AppData\Roaming")),
+            "XDG_CONFIG_HOME" => Some(PathBuf::from("/home/ada/.config")),
+            _ => None,
+        };
+        let home = Some(PathBuf::from("/home/ada"));
+        assert_ne!(
+            resolve_config_root(true, both, home.clone()),
+            resolve_config_root(false, both, home)
+        );
     }
 }
