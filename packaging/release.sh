@@ -44,6 +44,16 @@ step() { printf '\n\033[36m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$1" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 
+# Hash everything in a directory except the two files that describe it. `*`
+# is expanded before the redirection truncates SHA256SUMS, so hashing `*`
+# blind would list a zero-length SHA256SUMS as though it were an artefact.
+checksum_dir() {
+  local dir="$1"
+  ( cd "$dir" && rm -f SHA256SUMS && \
+    find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name latest -printf '%P\n' \
+    | sort | xargs -r sha256sum -- > SHA256SUMS )
+}
+
 do_build=0 do_tag=0 do_publish=0 do_manifest=0
 for arg in "$@"; do
   case "$arg" in
@@ -86,8 +96,16 @@ if [ "$do_build" = 1 ]; then
   # the msvc target; if either is missing, say so rather than shipping a
   # release that quietly has no Windows download.
   if "$root/packaging/windows/build-installer.sh"; then
-    cp "$root/packaging/windows/dist"/*.exe "$dist/"
-    echo "  $(ls "$dist"/*.exe)"
+    # By name, not by glob: that directory keeps every installer ever built,
+    # and publishing a stale one beside the real one is worse than publishing
+    # none at all.
+    setup="$(ls "$root/packaging/windows/dist"/*"$version"-setup.exe 2>/dev/null | head -1)"
+    if [ -n "$setup" ]; then
+      cp "$setup" "$dist/"
+      echo "  $(basename "$setup")"
+    else
+      warn "the installer built but no file matching $version was found"
+    fi
   else
     warn "Windows installer failed; the release will have no Windows download"
   fi
@@ -214,16 +232,6 @@ if [ "$do_publish" = 1 ]; then
     warn "no authenticated gh and no GITHUB_TOKEN, skipping GitHub"
   fi
 fi
-
-# Hash everything in a directory except the two files that describe it. `*`
-# is expanded before the redirection truncates SHA256SUMS, so hashing `*`
-# blind would list a zero-length SHA256SUMS as though it were an artefact.
-checksum_dir() {
-  local dir="$1"
-  ( cd "$dir" && rm -f SHA256SUMS && \
-    find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name latest -printf '%P\n' \
-    | sort | xargs -r sha256sum -- > SHA256SUMS )
-}
 
 # ---------------------------------------------------------------- manifest
 
