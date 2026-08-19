@@ -573,6 +573,7 @@ pub fn GanttChart(
                         .peek()
                         .chart_pointer(point.x - from_x, point.y - from_y);
                     if at.is_some() && *pointing.peek() != at {
+                        crate::applog::applog_verbose!("chart pointer moved to {at:?}");
                         pointing.set(at);
                     }
                 }

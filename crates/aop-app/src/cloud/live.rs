@@ -25,6 +25,7 @@
 use std::cell::{Cell as MutCell, RefCell};
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -46,6 +47,14 @@ use crate::cloud::collab::{self, CollabError};
 /// millisecond read arrives too late to follow. Twenty wake ups a second on a
 /// socket nobody is using is a cheaper thing to pay for.
 const POLL: Duration = Duration::from_millis(50);
+
+/// How long the connection and the two handshakes on top of it may take.
+///
+/// Long, because a handshake interrupted half way through is a connection
+/// that failed rather than one that is retried, and short enough that a
+/// server which accepts nothing does not hold the worker thread for as long
+/// as the operating system's own patience.
+const HANDSHAKE_WAIT: Duration = Duration::from_secs(20);
 
 /// The shortest gap between two presence messages.
 ///
@@ -339,9 +348,13 @@ impl Live {
     /// where a pointer is would redraw the whole window for it.
     pub fn looking_at(&self, now: &Presence) {
         let Ok(mut told) = self.told.try_borrow_mut() else {
+            // Two announcements at once, which cannot happen from one timer.
+            // If it ever appears, that is the news.
+            crate::applog::applog!("presence: skipped, what was last said is borrowed");
             return;
         };
         if *told == *now {
+            crate::applog::applog_verbose!("presence: nothing has changed, so nothing is sent");
             return;
         }
         // Everything but the pointer is rare and worth saying at once. A
@@ -351,6 +364,9 @@ impl Live {
             && told.draft == now.draft;
         let elapsed = self.told_at.get().map(|when| when.elapsed());
         if only_the_pointer && elapsed.is_some_and(|since| since < PRESENCE_EVERY) {
+            crate::applog::applog_verbose!(
+                "presence: only the pointer moved and {elapsed:?} have passed, so it waits"
+            );
             return;
         }
 
@@ -381,9 +397,27 @@ impl Live {
             fields.insert("draft".into(), draft);
         }
 
-        if self.outgoing.send(Outgoing::Say(message.to_string())).is_ok() {
+        let text = message.to_string();
+        if self.outgoing.send(Outgoing::Say(text)).is_ok() {
+            // A pointer that is the only thing moving goes out eight times a
+            // second, so it is counted rather than written down. Anything else
+            // is rare and is worth a line of its own.
+            if only_the_pointer {
+                static POINTERS: crate::applog::Tally =
+                    crate::applog::Tally::new("presence", crate::applog::PRESENCE_SUMMARY_MILLIS);
+                POINTERS.note(format_args!("{:?}", now.at));
+            } else {
+                crate::applog::applog!(
+                    "presence: row {:?}, editing {:?}, draft {}",
+                    now.row,
+                    now.editing,
+                    if now.draft.is_some() { "yes" } else { "no" },
+                );
+            }
             *told = now.clone();
             self.told_at.set(Some(Instant::now()));
+        } else {
+            crate::applog::applog!("presence: not sent, the socket worker has gone");
         }
     }
 
@@ -394,7 +428,9 @@ impl Live {
     /// point: this is a faster way to move entries, not a way around them.
     pub fn send_changes(&self, after: i64, changes: &[Change]) {
         let message = json!({ "type": "changes", "after": after, "changes": changes });
-        let _ = self.outgoing.send(Outgoing::Say(message.to_string()));
+        if self.outgoing.send(Outgoing::Say(message.to_string())).is_err() {
+            crate::applog::applog!("live out: the work was not queued, the socket worker has gone");
+        }
     }
 }
 
@@ -435,19 +471,16 @@ fn pump(
     stop: &AtomicBool,
     queued: &AtomicBool,
 ) -> String {
-    let mut socket = match tungstenite::connect(url) {
-        Ok((socket, _)) => socket,
+    let mut socket = match open(url) {
+        Ok(socket) => {
+            crate::applog::applog!("socket: the connection is up and reads give up every {POLL:?}");
+            socket
+        }
         // The address carries the token, so it must not reach the message: a
         // connection error's text is the sort of thing that gets pasted into a
         // bug report.
-        Err(error) => return format!("Live editing could not start: {}", plainly(&error)),
+        Err(why) => return format!("Live editing could not start: {why}"),
     };
-
-    // A read that never returns is a thread that never notices the plan was
-    // closed, so the socket is asked to give up regularly and be asked again.
-    if let Err(error) = set_read_timeout(&mut socket, POLL) {
-        return format!("Live editing could not start: {error}");
-    }
 
     if socket.send(Message::Text(hello.into())).is_err() {
         return "Live editing stopped before it started: the server closed the connection.".into();
@@ -465,7 +498,17 @@ fn pump(
         loop {
             match from_ui.try_recv() {
                 Ok(Outgoing::Say(text)) => {
+                    // Counted, not written out: the text is mostly presence,
+                    // and at eight a second it would bury the rest of the log.
+                    // What matters here is that the worker is still draining
+                    // its queue rather than what any one frame said.
+                    static WRITTEN: crate::applog::Tally = crate::applog::Tally::new(
+                        "socket wrote",
+                        crate::applog::PRESENCE_SUMMARY_MILLIS,
+                    );
+                    WRITTEN.note(format_args!("{} bytes", text.len()));
                     if socket.send(Message::Text(text.into())).is_err() {
+                        crate::applog::applog!("socket: the frame could not be written");
                         return "Live editing stopped: the connection was lost.".into();
                     }
                 }
@@ -477,6 +520,11 @@ fn pump(
             }
         }
 
+        {
+            static TURNS: crate::applog::Tally =
+                crate::applog::Tally::new("socket loop", crate::applog::HEARTBEAT_MILLIS);
+            TURNS.note(format_args!("about to read"));
+        }
         match socket.read() {
             Ok(Message::Text(text)) => {
                 if let Some(message) = read_message(&text)
@@ -510,22 +558,94 @@ fn pump(
     }
 }
 
-/// Ask the socket to stop waiting after a while, whichever transport it is on.
-fn set_read_timeout(
-    socket: &mut tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>,
-    timeout: Duration,
-) -> Result<(), String> {
-    let stream = match socket.get_mut() {
-        MaybeTlsStream::Plain(plain) => plain,
-        MaybeTlsStream::Rustls(tls) => &mut tls.sock,
-        // The enum is open ended, and a transport this build does not know
-        // about is not a reason to refuse the connection: it only means the
-        // worker parks on the read until the socket itself ends.
-        _ => return Ok(()),
-    };
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| format!("the connection could not be set up: {error}"))
+/// Connect, and keep hold of the one thing the read timeout has to go on.
+///
+/// The read timeout is not a nicety. The worker alternates between draining
+/// what the interface has queued and reading the socket, so a read that never
+/// gives up is a worker that never writes: presence, and every batch of work
+/// offered over this connection, sit in the queue until the server happens to
+/// send something of its own. That is minutes at a time, and from the outside
+/// it looks exactly like a client that stopped sending.
+///
+/// So the socket is made here rather than by `tungstenite::connect`, and the
+/// timeout goes on before any of it is wrapped in anything. Letting
+/// tungstenite make it meant reaching back through a `MaybeTlsStream` to find
+/// the socket underneath, and that is a match over which TLS implementation
+/// the build ended up with, which is not a thing this crate decides. It asks
+/// for rustls; `dioxus-devtools` asks the same crate for native-tls; cargo
+/// gives every dependency the union of the two, and tungstenite then prefers
+/// native-tls. The socket was a variant that match had no arm for, the
+/// fallthrough set no timeout at all, and nothing said so.
+///
+/// A duplicated descriptor is what makes this work: it refers to the same
+/// socket, and a receive timeout belongs to the socket rather than to the
+/// descriptor, so setting it on the handle sets it for the copy tungstenite
+/// wraps and never lets go of.
+fn open(url: &str) -> Result<tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, String> {
+    use tungstenite::client::IntoClientRequest;
+
+    let request = url.into_client_request().map_err(|error| plainly(&error))?;
+    let (host, port) = server_of(request.uri())?;
+    // Resolved here so the connection itself can be given a deadline.
+    // `TcpStream::connect` has none, and a server that accepts nothing would
+    // otherwise keep the thread for as long as the operating system's own
+    // patience lasts.
+    let address = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|_| "the server's name could not be looked up".to_string())?
+        .next()
+        .ok_or_else(|| "the server's name resolves to nothing".to_string())?;
+    let (stream, handle) = connected(&address)?;
+    let (socket, _) = tungstenite::client_tls(request, stream).map_err(|error| match error {
+        tungstenite::HandshakeError::Failure(error) => plainly(&error),
+        tungstenite::HandshakeError::Interrupted(_) => "the handshake did not finish".to_string(),
+    })?;
+    // Narrowed the moment the handshakes are done, through the descriptor
+    // this side kept: the socket itself now belongs to tungstenite.
+    handle
+        .set_read_timeout(Some(POLL))
+        .map_err(|error| format!("the connection could not be set up ({})", error.kind()))?;
+    Ok(socket)
+}
+
+/// Which machine and port a websocket address names.
+///
+/// The default port comes from the scheme, since an address is usually
+/// written without one and a websocket over TLS is a websocket to 443.
+fn server_of(uri: &tungstenite::http::Uri) -> Result<(String, u16), String> {
+    let mode = tungstenite::client::uri_mode(uri).map_err(|error| plainly(&error))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| "the server address names no host".to_string())?;
+    let port = uri.port_u16().unwrap_or(match mode {
+        tungstenite::stream::Mode::Tls => 443,
+        tungstenite::stream::Mode::Plain => 80,
+    });
+    Ok((host.to_string(), port))
+}
+
+/// The socket the websocket is built on, and a second descriptor for it.
+///
+/// Two descriptors for one socket, and that is the whole point. Tungstenite
+/// takes the first and wraps it in whatever TLS implementation the build
+/// ended up with, after which there is no way back to the socket underneath.
+/// The read timeout has to be changed once the handshakes are over, so the
+/// second descriptor is what it is changed through: a duplicate refers to the
+/// same socket, and a receive timeout belongs to the socket rather than to
+/// the descriptor.
+///
+/// The timeout starts generous, because neither handshake survives being
+/// interrupted half way through.
+fn connected(address: &std::net::SocketAddr) -> Result<(TcpStream, TcpStream), String> {
+    let stream = TcpStream::connect_timeout(address, HANDSHAKE_WAIT)
+        .map_err(|error| format!("the connection failed ({})", error.kind()))?;
+    let handle = stream
+        .try_clone()
+        .map_err(|error| format!("the connection could not be set up ({})", error.kind()))?;
+    handle
+        .set_read_timeout(Some(HANDSHAKE_WAIT))
+        .map_err(|error| format!("the connection could not be set up ({})", error.kind()))?;
+    Ok((stream, handle))
 }
 
 /// A socket failure in words, with nothing in them that came off the wire.
@@ -857,5 +977,129 @@ mod tests {
     #[test]
     fn a_keepalive_is_not_passed_on_as_something_to_show() {
         assert_eq!(parse(r#"{"type":"pong"}"#), None);
+    }
+
+    // ------------------------------------------------- the socket underneath
+
+    #[test]
+    fn a_websocket_address_says_which_machine_and_port_to_reach() {
+        let of = |text: &str| {
+            server_of(&text.parse::<tungstenite::http::Uri>().expect("an address"))
+        };
+        // The default comes from the scheme, because an address is nearly
+        // always written without a port and a socket over TLS is 443.
+        assert_eq!(of("wss://sync.example.org/api/live"), Ok(("sync.example.org".into(), 443)));
+        assert_eq!(of("ws://localhost/api/live"), Ok(("localhost".into(), 80)));
+        assert_eq!(of("ws://127.0.0.1:8090/api/live"), Ok(("127.0.0.1".into(), 8090)));
+        assert!(of("https://sync.example.org/api/live").is_err(), "not a websocket scheme");
+    }
+
+    #[test]
+    fn the_read_timeout_goes_on_the_socket_the_handshake_will_take() {
+        // The failure this exists for. The timeout used to be applied after
+        // the fact, by matching on which TLS implementation tungstenite had
+        // wrapped the socket in, and the fallthrough for one it did not
+        // recognise set no timeout at all and said nothing. The socket then
+        // never gave up reading, and because the worker alternates between
+        // draining what the interface queued and reading, it never wrote
+        // either: presence and every batch of work sat in the queue until the
+        // server happened to send something of its own.
+        //
+        // Nothing here matches on a transport. The timeout goes on a
+        // descriptor this side owns, before anything is wrapped in anything,
+        // and what is checked is that it reaches the descriptor that is handed
+        // away. Two descriptors, one socket, one receive timeout.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a spare port");
+        let address = listener.local_addr().expect("an address");
+        let (stream, handle) = connected(&address).expect("a connection to a listening socket");
+
+        assert_eq!(
+            stream.read_timeout().expect("a readable socket option"),
+            Some(HANDSHAKE_WAIT),
+            "a handshake must not be interrupted, so it starts generous",
+        );
+        handle.set_read_timeout(Some(POLL)).expect("the option can be narrowed");
+        assert_eq!(
+            stream.read_timeout().expect("a readable socket option"),
+            Some(POLL),
+            "narrowed through the duplicate, which is the only handle left \
+             once tungstenite owns the socket",
+        );
+    }
+
+    #[test]
+    fn a_server_that_says_nothing_does_not_stop_this_copy_from_sending() {
+        // The shape of the fault, end to end: a server which accepts the
+        // connection and then stays silent. Everything queued has to go out
+        // anyway, because the reading and the writing share one thread and
+        // only a read that gives up lets the writing happen.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a spare port");
+        let port = listener.local_addr().expect("an address").port();
+        let heard: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let said = Arc::clone(&heard);
+        let server = std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let Ok(mut socket) = tungstenite::accept(stream) else {
+                return;
+            };
+            // Deliberately never sends anything. Reading is all this does.
+            while let Ok(message) = socket.read() {
+                if let Message::Text(text) = message
+                    && let Ok(mut kept) = said.lock()
+                {
+                    kept.push(text.to_string());
+                    if kept.len() >= 2 {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let live = Live::connect(&format!("http://127.0.0.1:{port}"), "t", "p", 0, "Tester", None)
+            .expect("a worker starts");
+
+        // Waited for on purpose. The greeting is sent before the worker ever
+        // reads, so a presence queued straight away would go out on the first
+        // drain and prove nothing. What has to be shown is that one queued
+        // while the worker is already parked in a read still goes out, and
+        // the greeting arriving is how this side knows it is parked.
+        let waited = |count: usize| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if heard.lock().is_ok_and(|kept| kept.len() >= count) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        assert!(waited(1), "the greeting never reached the server");
+        std::thread::sleep(Duration::from_millis(200));
+
+        live.looking_at(&Presence {
+            row: Some(3),
+            at: Some(Pointer::Chart { row: 3, minutes: 90 }),
+            editing: None,
+            draft: None,
+        });
+        assert!(
+            waited(2),
+            "the pointer sat in the queue: a read that does not give up is a worker that \
+             never writes, and a server with nothing to say leaves it there for good",
+        );
+        drop(live);
+        let _ = server.join();
+
+        let kept = heard.lock().expect("nothing panicked while holding it");
+        assert!(kept[0].contains("\"hello\""), "the greeting goes first");
+        assert!(
+            kept[1].contains("\"presence\"") && kept[1].contains("\"minutes\":90"),
+            "the pointer went out without waiting for the server to speak: {}",
+            kept[1],
+        );
     }
 }

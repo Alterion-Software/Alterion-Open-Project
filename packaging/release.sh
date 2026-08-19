@@ -281,5 +281,17 @@ if [ "$do_manifest" = 1 ]; then
   fi
 fi
 
+# ---------------------------------------------------------------- reminder
+
+# The sync server is half of live editing and is deployed separately, by hand.
+# Twice now a release has gone out with the client updated and the server left
+# on an older build, and the symptom is not an error: the socket connects, the
+# client sends into it, and nothing ever comes back. Both times it cost an
+# afternoon before anybody thought to compare the two binaries.
+if [ "$do_build" = 1 ] || [ "$do_publish" = 1 ]; then
+  warn "aop-collaborate is deployed separately. If this release changes it, deploy it too,"
+  warn "and check /api/health reports this version before concluding live editing is broken."
+fi
+
 step "Done"
 echo "Artefacts: $dist"

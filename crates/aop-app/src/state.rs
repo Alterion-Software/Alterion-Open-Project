@@ -2394,6 +2394,7 @@ impl AppState {
         let Some(session) = crate::cloud::restore() else {
             return;
         };
+        crate::applog::applog!("restore: signed in as {}", session.account().name);
         self.account = Some(session.account().clone());
         self.device = describe_device();
         self.session = Some(session);
@@ -3555,6 +3556,16 @@ impl AppState {
             .account
             .as_ref()
             .and_then(|account| account.picture.clone());
+        // The address itself is never written down: it carries the access
+        // token in its query string, which is the one thing that must never
+        // reach a file anybody might paste into a bug report.
+        crate::applog::applog!(
+            "live: opening a connection to {} for plan {} from cursor {}, streaming {}",
+            self.collaborate_server.trim(),
+            link.project,
+            link.cursor,
+            self.stream_out,
+        );
         match crate::cloud::live::Live::connect(
             self.collaborate_server.trim(),
             &token,
@@ -3598,6 +3609,7 @@ impl AppState {
                 }
             }
             Err(error) => {
+                crate::applog::applog!("live: the connection could not be started: {error}");
                 self.live_wanted = false;
                 self.cloud_message = Some(error.to_string());
             }
@@ -3606,6 +3618,16 @@ impl AppState {
 
     /// Close the socket, and say why if there is anything to say.
     pub fn stop_live(&mut self, why: Option<String>) {
+        // Only when there was one. This is also the tidy-up on the way into a
+        // plan that has no live session at all, and a log that says a
+        // connection closed when none was ever open is a log that sends the
+        // next person reading it after the wrong thing.
+        if self.live.is_some() {
+            crate::applog::applog!(
+                "live: the connection is being closed ({})",
+                why.as_deref().unwrap_or("no reason given")
+            );
+        }
         self.live = None;
         self.live_wanted = false;
         // The handle belonged to the connection that has just gone. Sending it
@@ -3661,9 +3683,32 @@ impl AppState {
         let mut gap = false;
         let mut ahead = None;
 
+        // A census rather than a line each: a catch-up can be hundreds of
+        // changes and they are all the same news. The arms below say more
+        // about the ones that decide anything.
+        if crate::applog::on() {
+            let changes = batch
+                .iter()
+                .filter(|one| matches!(one, Incoming::Change { .. }))
+                .count();
+            let presence = batch
+                .iter()
+                .filter(|one| matches!(one, Incoming::Presence(_)))
+                .count();
+            crate::applog::applog!(
+                "live in: {} message(s), {changes} change(s), {presence} presence",
+                batch.len()
+            );
+        }
+
         for message in batch {
             match message {
                 Incoming::Welcome { head, peers, connection } => {
+                    crate::applog::applog!(
+                        "live in: welcome at head {head}, {} other(s) here, \
+                         connection {connection:?}",
+                        peers.len()
+                    );
                     self.peers = peers;
                     // Kept for the REST push to hand back. An older server
                     // says nothing here, and then the push omits the field and
@@ -3674,6 +3719,10 @@ impl AppState {
                 // A catch-up comes before any live change on purpose, so the
                 // order things are applied in is the log's order.
                 Incoming::Catchup { head, changes } => {
+                    crate::applog::applog!(
+                        "live in: catch-up to head {head}, {} change(s)",
+                        changes.len()
+                    );
                     cursor = Some(head.max(cursor.unwrap_or(head)));
                     incoming.extend(changes);
                 }
@@ -3682,6 +3731,11 @@ impl AppState {
                     incoming.push(change);
                 }
                 Incoming::Applied { head, applied, snapshot_wanted } => {
+                    crate::applog::applog!(
+                        "live in: {} change(s) went in, head {head}, \
+                         snapshot wanted {snapshot_wanted}",
+                        applied.len()
+                    );
                     // Marked by the local id the server acknowledged rather
                     // than by counting, because an answer that came back out
                     // of order must not mark work nobody has seen as sent.
@@ -3702,6 +3756,10 @@ impl AppState {
                     self.touch_local_copy();
                 }
                 Incoming::Behind { head, changes, .. } => {
+                    crate::applog::applog!(
+                        "live in: refused as behind, head {head}, {} change(s) came back",
+                        changes.len()
+                    );
                     // Nothing was written, so the work offered is still
                     // unsent and still in the log. What came back is what was
                     // missed, and it goes in the same way a live change does:
@@ -3715,10 +3773,14 @@ impl AppState {
                     self.stream_due = Some(std::time::Instant::now());
                 }
                 Incoming::Ahead { head, cursor: mine } => {
+                    crate::applog::applog!(
+                        "live in: this copy is ahead of the server, head {head} against {mine}"
+                    );
                     self.batch_answered();
                     ahead = Some((head, mine));
                 }
                 Incoming::Refused(why) => {
+                    crate::applog::applog!("live in: the server refused a batch: {why}");
                     // Nothing was written, so the batch is still unsent work
                     // and is offered again after a pause. A pause rather than
                     // at once, because whatever refused it will refuse it
@@ -3735,7 +3797,10 @@ impl AppState {
                         ));
                     }
                 }
-                Incoming::Gap { .. } => gap = true,
+                Incoming::Gap { .. } => {
+                    crate::applog::applog!("live in: the server's log was trimmed past this copy");
+                    gap = true;
+                }
                 Incoming::Presence(peer) => {
                     match self
                         .peers
@@ -3767,7 +3832,10 @@ impl AppState {
                 }
                 Incoming::Joined { name } => self.status = format!("{name} joined this plan"),
                 Incoming::Left { subject } => self.peers.retain(|held| held.subject != subject),
-                Incoming::Closed(why) => ended = Some(why),
+                Incoming::Closed(why) => {
+                    crate::applog::applog!("live in: the connection ended: {why}");
+                    ended = Some(why);
+                }
             }
         }
 
@@ -3800,6 +3868,10 @@ impl AppState {
                 // somebody else's. Held work is applied the moment the answer
                 // is in, and by then the cursor says which of it was this
                 // copy's own all along.
+                crate::applog::applog!(
+                    "live: {} change(s) held until this copy's own push is answered",
+                    incoming.len()
+                );
                 self.held_live.extend(incoming);
             } else {
                 self.take_live_batch(&incoming, cursor);
@@ -3945,6 +4017,10 @@ impl AppState {
             return;
         }
         self.stream_silence_told = true;
+        crate::applog::applog!(
+            "live out: a batch went unanswered for {STREAM_ANSWER_SECONDS}s \
+             and has been given up on"
+        );
         self.cloud_message = Some(format!(
             "The server has not answered work sent over the live connection for \
              {STREAM_ANSWER_SECONDS} seconds. That usually means it is older than this copy \
@@ -3971,12 +4047,15 @@ impl AppState {
             self.working,
             Some(Working::Syncing | Working::Publishing | Working::Fetching)
         ) {
+            crate::applog::applog!("live out: not offering work, a sync is already running");
             return;
         }
         if !self.stream_due() {
+            crate::applog::applog!("live out: not offering work, nothing is due");
             return;
         }
         let Some(after) = self.link.as_ref().map(|link| link.cursor) else {
+            crate::applog::applog!("live out: not offering work, this plan is not linked");
             return;
         };
         // Capped, because the server refuses a batch bigger than one page and
@@ -3989,6 +4068,10 @@ impl AppState {
             .take(STREAM_BATCH)
             .collect();
         if let Some(live) = self.live.as_ref() {
+            crate::applog::applog!(
+                "live out: offering {} change(s) after cursor {after}",
+                batch.len()
+            );
             live.send_changes(after, &batch);
             // The moment it went, not merely that it did. A marker with no
             // moment on it can only be cleared by an answer, and a server that
@@ -6739,6 +6822,11 @@ pub fn from_command_line() -> AppState {
     // hear about it than during a splash screen.
     if state.collaborate {
         state.restore_session();
+    } else {
+        // The setting is off, so nothing is read and nobody is signed in. That
+        // looks exactly like a session that would not open, which is why it
+        // says so rather than leaving the log silent.
+        crate::applog::applog!("restore: Collaborate is switched off, so no session is read");
     }
     // Worked out before anything else can write a preference, since the answer
     // depends on the version this copy last ran as and that is recorded here.

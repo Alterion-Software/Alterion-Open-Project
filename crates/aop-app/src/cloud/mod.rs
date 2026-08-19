@@ -373,6 +373,10 @@ impl Session {
     /// session.
     pub fn access_token(&mut self) -> Result<&str, SignInError> {
         if tokens::needs_refresh(Utc::now(), self.expires_at) {
+            crate::applog::applog!(
+                "session: the access token expires {}, renewing before it is used",
+                self.expires_at.to_rfc3339()
+            );
             self.renew()?;
         }
         Ok(&self.access_token)
@@ -381,11 +385,25 @@ impl Session {
     /// Trade the refresh token for a fresh pair.
     fn renew(&mut self) -> Result<(), SignInError> {
         if self.refresh_token.is_empty() {
+            crate::applog::applog!("session: there is no refresh token, so it cannot be renewed");
             return Err(SignInError::SessionEnded);
         }
 
         let endpoints = self.resolve_endpoints()?;
-        let fresh = oauth::refresh(&endpoints, &self.client_id, &self.refresh_token)?;
+        let fresh = match oauth::refresh(&endpoints, &self.client_id, &self.refresh_token) {
+            Ok(fresh) => fresh,
+            Err(why) => {
+                // The failure that ends a session without anybody asking it
+                // to. Named here because everywhere downstream it turns into
+                // "sign in again" with nothing about which step said no.
+                crate::applog::applog!("session: the renewal was refused: {why}");
+                return Err(why);
+            }
+        };
+        crate::applog::applog!(
+            "session: renewed, a replacement refresh token {}",
+            if fresh.refresh_token.is_empty() { "did not come back" } else { "came back" }
+        );
         self.take(fresh);
 
         // The old refresh token has just been spent, and the server treats a
@@ -393,7 +411,11 @@ impl Session {
         // replacement is written down straight away, and if it cannot be, the
         // stale record is thrown away rather than left to present a spent token
         // on the next start.
-        if tokens::save_session(&self.stored()).is_err() {
+        if let Err(why) = tokens::save_session(&self.stored()) {
+            crate::applog::applog!(
+                "session: the renewed record could not be written ({why}), so it is discarded \
+                 rather than left holding a refresh token that has already been spent"
+            );
             let _ = tokens::clear_session();
         }
         Ok(())
@@ -598,6 +620,7 @@ fn account_from(claims: &oauth::Claims) -> Account {
 /// signed out, and being told the server could not be reached while still
 /// appearing to be signed in would be the worst of both.
 pub fn sign_out(session: &Session) -> Result<(), SignInError> {
+    crate::applog::applog!("sign out: asked for, the tokens will be revoked and forgotten");
     let endpoints = match &session.endpoints {
         Some(endpoints) => Some(endpoints.clone()),
         None => oauth::discover(&session.issuer).ok(),
@@ -621,6 +644,7 @@ pub fn sign_out(session: &Session) -> Result<(), SignInError> {
         ));
     }
 
+    crate::applog::applog!("sign out: the stored session is being cleared");
     let _ = tokens::clear_session();
     outcome
 }
@@ -638,16 +662,37 @@ pub fn sign_out(session: &Session) -> Result<(), SignInError> {
 /// worth a dialog, and a person whose motherboard was replaced simply signs in
 /// again.
 pub fn restore() -> Option<Session> {
-    let stored = tokens::load_session()?;
+    crate::applog::applog!("restore: looking for the last run's sign in");
+    let Some(stored) = tokens::load_session() else {
+        crate::applog::applog!("restore: nobody is signed in");
+        return None;
+    };
     let expires_at = DateTime::from_timestamp(stored.expires_at, 0).unwrap_or_else(Utc::now);
+
+    // Never the tokens, and never their lengths either: whether there is one
+    // is the fact that decides what happens next, and it is the only fact
+    // about them that belongs in a file.
+    let stale = tokens::needs_refresh(Utc::now(), expires_at);
+    crate::applog::applog!(
+        "restore: for {} at {}, access token expires {} ({}), refresh token {}",
+        if stored.subject.is_empty() { "an account with no subject" } else { &stored.subject },
+        stored.issuer,
+        expires_at.to_rfc3339(),
+        if stale { "due for renewal" } else { "still good" },
+        if stored.refresh_token.is_empty() { "absent" } else { "present" },
+    );
 
     // Nothing to renew with and nothing left to use: this is not a session, it
     // is a leftover, and offering it would show somebody as signed in until the
     // first thing they tried failed.
-    if stored.refresh_token.is_empty() && tokens::needs_refresh(Utc::now(), expires_at) {
+    if stored.refresh_token.is_empty() && stale {
+        crate::applog::applog!(
+            "restore: no refresh token and the access token is spent, so the record is discarded"
+        );
         let _ = tokens::clear_session();
         return None;
     }
+    crate::applog::applog!("restore: the session was picked back up");
 
     Some(Session {
         issuer: stored.issuer,

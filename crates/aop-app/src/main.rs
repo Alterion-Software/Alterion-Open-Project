@@ -6,6 +6,7 @@
 // where printing to a console is how anything gets diagnosed.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod applog;
 mod backstage;
 mod brand;
 mod cloud;
@@ -107,6 +108,12 @@ fn main() {
         return;
     }
 
+    // After the handoff, never before it. The log is truncated when it opens,
+    // and a launch that only passes its argument along and exits would
+    // otherwise cut the log of the session that is still running, from
+    // underneath a file handle that copy is still writing through.
+    applog::start(env!("CARGO_PKG_VERSION"));
+
     let window = WindowBuilder::new()
         .with_title(APP_NAME)
         // The title bar, window controls and dragging are all drawn in-app.
@@ -133,6 +140,8 @@ fn main() {
     if handoff::claim(handed_argument().as_ref()) == handoff::Claim::HandedOver {
         return;
     }
+    // After the handoff, for the reason given in the webview build's `main`.
+    applog::start(env!("CARGO_PKG_VERSION"));
     dioxus_native::launch(App);
 }
 
@@ -309,11 +318,20 @@ fn App() -> Element {
     // what it last said, and moving a mouse never redraws the window.
     use_future(move || async move {
         let interval = std::time::Duration::from_millis(crate::state::EPHEMERAL_POLL_MILLIS);
+        // The one line that says this loop is still alive. It is the failure
+        // that cost a day: the loop ran once and then stopped, and every
+        // symptom of that looked like a fault in what it calls rather than in
+        // whether it was called.
+        static TURNS: crate::applog::Tally =
+            crate::applog::Tally::new("live timer", crate::applog::HEARTBEAT_MILLIS);
+        let mut turn: u64 = 0;
         loop {
             tokio::time::sleep(interval).await;
+            turn += 1;
             // Peeked rather than read: a future that subscribed to these
             // would be torn down and started again on every keystroke.
             let (at, draft) = (*pointing.peek(), drafting.peek().clone());
+            TURNS.note(format_args!("turn {turn}, pointer {at:?}"));
             let (held, due, unanswered) = {
                 let live = state.read();
                 if live.live.is_none() {
@@ -330,6 +348,9 @@ fn App() -> Element {
             // up on nothing else can be offered at all. Silence is what an
             // older or mismatched server gives, and without this the session
             // stops streaming for good and says nothing about it.
+            crate::applog::applog_verbose!(
+                "live timer: turn {turn}, held {held}, due {due}, unanswered {unanswered}"
+            );
             if unanswered {
                 state.write().gave_up_on_batch();
             }

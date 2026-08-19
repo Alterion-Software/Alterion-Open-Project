@@ -352,7 +352,19 @@ pub fn seal(material: &[u8], plaintext: &[u8]) -> Option<Vec<u8>> {
 /// the caller, which is that there is no session here.
 pub fn unseal(material: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
     const HEADER: usize = 1 + SALT_BYTES + NONCE_BYTES;
-    if blob.len() < HEADER + TAG_BYTES || blob[0] != SEAL_VERSION {
+    if blob.len() < HEADER + TAG_BYTES {
+        crate::applog::applog!(
+            "unseal: the blob is {} bytes, shorter than the {} a sealed record starts at",
+            blob.len(),
+            HEADER + TAG_BYTES
+        );
+        return None;
+    }
+    if blob[0] != SEAL_VERSION {
+        crate::applog::applog!(
+            "unseal: the blob says format {} and this build writes {SEAL_VERSION}",
+            blob[0]
+        );
         return None;
     }
 
@@ -369,6 +381,13 @@ pub fn unseal(material: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
     // Checked before anything is decrypted: a blob that was not written by this
     // machine is not something to start unpicking.
     if !same_bytes(&hmac_sha256(&signing_key, &signed), tag) {
+        // The one failure that means the machine, rather than the file, is
+        // what changed. Worth naming as such: everything downstream flattens
+        // it into "nobody is signed in", which is what made it invisible.
+        crate::applog::applog!(
+            "unseal: the tag does not match, so this record was sealed to \
+             different device material than this run derived"
+        );
         return None;
     }
 
@@ -918,7 +937,14 @@ pub fn save_into(store: &dyn TokenStore, session: &Stored) -> Result<(), StoreEr
     let sealed = seal(&material, &plaintext).ok_or_else(|| {
         StoreError::NotWritten("the system random number generator could not be read".into())
     })?;
-    store.save(&sealed)
+    let outcome = store.save(&sealed);
+    crate::applog::applog!(
+        "session: written as {} sealed bytes, expiring {} ({:?})",
+        sealed.len(),
+        session.expires_at,
+        outcome.as_ref().err(),
+    );
+    outcome
 }
 
 /// The session from a store, if this machine can still open it.
@@ -927,10 +953,50 @@ pub fn save_into(store: &dyn TokenStore, session: &Stored) -> Result<(), StoreEr
 /// in. A machine whose hardware changed, a store that has nothing in it, a blob
 /// somebody edited. None of them is worth a dialog.
 pub fn load_from(store: &dyn TokenStore) -> Option<Stored> {
-    let material = key_material().ok()?;
-    let sealed = store.load().ok().flatten()?;
+    // Every step says whether it happened, because they all end in the same
+    // `None` and the interface can only ever report the sum of them as
+    // "nobody is signed in". Which of the four it was is the whole diagnosis.
+    let material = match key_material() {
+        Ok(material) => material,
+        Err(why) => {
+            crate::applog::applog!("restore: this machine could not identify itself: {why}");
+            return None;
+        }
+    };
+    // The digest of the material rather than the material, which is a small
+    // hardware inventory. It is the same value the server is already given as
+    // `X-Device-Fingerprint`, and comparing it between two runs is what says
+    // whether the key changed underneath the record.
+    crate::applog::applog!(
+        "restore: device fingerprint {}",
+        crate::cloud::device::fingerprint_hex().unwrap_or_else(|_| "unknown".into())
+    );
+    let sealed = match store.load() {
+        Ok(Some(sealed)) => sealed,
+        Ok(None) => {
+            crate::applog::applog!("restore: the store has nothing in it, {}", store.describe());
+            return None;
+        }
+        Err(why) => {
+            crate::applog::applog!("restore: the store could not be read: {why}");
+            return None;
+        }
+    };
+    crate::applog::applog!("restore: a sealed record of {} bytes was found", sealed.len());
+    // `unseal` says why it refused, so nothing is added here.
     let plaintext = unseal(&material, &sealed)?;
-    serde_json::from_slice(&plaintext).ok()
+    match serde_json::from_slice::<Stored>(&plaintext) {
+        Ok(stored) => {
+            crate::applog::applog!("restore: the record opened and reads as a session");
+            Some(stored)
+        }
+        Err(why) => {
+            // The record opened, so the machine is right and the shape is
+            // wrong: a field an older build wrote, or a newer one added.
+            crate::applog::applog!("restore: the record opened but does not parse: {why}");
+            None
+        }
+    }
 }
 
 /// Keep a session, in the store this platform uses.
@@ -945,6 +1011,7 @@ pub fn load_session() -> Option<Stored> {
 
 /// Forget it.
 pub fn clear_session() -> Result<(), StoreError> {
+    crate::applog::applog!("session: the stored record is being removed");
     store().clear()
 }
 
