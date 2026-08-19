@@ -119,8 +119,12 @@ make_icns() {
 artwork() {
   local base="$root/packaging/linux/$1"
   for candidate in "$base.png" "$base.svg"; do
-    [ -f "$candidate" ] && { printf '%s' "$candidate"; return; }
+    [ -f "$candidate" ] && { printf '%s' "$candidate"; return 0; }
   done
+  # Explicit, because the loop's last act is a test that failed, and under
+  # `set -e` a function returning that status kills the script at the
+  # assignment rather than leaving an empty string to be checked.
+  return 0
 }
 icon_src="$(artwork "$bin_name")"
 make_icns "$icon_src" AppIcon
