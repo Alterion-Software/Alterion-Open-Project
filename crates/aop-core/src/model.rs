@@ -644,6 +644,34 @@ pub enum ScheduleFrom {
     ProjectFinishDate,
 }
 
+/// Which calendar an edit is aimed at.
+///
+/// The three are deliberately different things rather than three ways of
+/// saying the same one. A day the organisation is closed belongs on the project
+/// calendar or a base, where it moves everybody. One person being away belongs
+/// on that person, where it moves only the tasks they are on. Naming the
+/// distinction here rather than in the interface keeps the two from being
+/// confused by anything that edits a calendar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalendarTarget {
+    /// The calendar everything follows unless it says otherwise.
+    Project,
+    /// A named base in the library.
+    Base(String),
+    /// One person's own time, on top of whichever base they follow.
+    Resource(ResourceId),
+}
+
+impl CalendarTarget {
+    /// Whether this is one person rather than a calendar people share.
+    ///
+    /// Worth asking because it changes what an edit means: the same list of
+    /// days is somebody's leave here and a public holiday there.
+    pub fn is_person(&self) -> bool {
+        matches!(self, CalendarTarget::Resource(_))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
@@ -893,6 +921,55 @@ impl Project {
             return &self.calendar;
         }
         self.calendar_named(name).unwrap_or(&self.calendar)
+    }
+
+    /// The exceptions an edit aimed at `target` reads.
+    ///
+    /// A person's are their own rather than their base's: their working week is
+    /// shared and is not theirs to change, and that is exactly why their time
+    /// off has to live somewhere that is.
+    pub fn exceptions_for(&self, target: &CalendarTarget) -> &[CalendarException] {
+        match target {
+            CalendarTarget::Project => &self.calendar.exceptions,
+            CalendarTarget::Base(name) => &self.calendar_or_project(name).exceptions,
+            CalendarTarget::Resource(id) => self
+                .resource(*id)
+                .map(|resource| resource.calendar_exceptions.as_slice())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The exception list an edit aimed at `target` writes into.
+    ///
+    /// `None` when the target names something the plan no longer has, so a
+    /// stale picker cannot quietly write a holiday onto the wrong calendar.
+    pub fn exceptions_for_mut(
+        &mut self,
+        target: &CalendarTarget,
+    ) -> Option<&mut Vec<CalendarException>> {
+        match target {
+            CalendarTarget::Project => Some(&mut self.calendar.exceptions),
+            CalendarTarget::Base(name) => {
+                self.calendar_named_mut(name).map(|cal| &mut cal.exceptions)
+            }
+            CalendarTarget::Resource(id) => self
+                .resources
+                .iter_mut()
+                .find(|resource| resource.id == *id)
+                .map(|resource| &mut resource.calendar_exceptions),
+        }
+    }
+
+    /// What to call the target in a sentence: a calendar's name, a person's.
+    pub fn calendar_target_name(&self, target: &CalendarTarget) -> String {
+        match target {
+            CalendarTarget::Project => self.calendar.name.clone(),
+            CalendarTarget::Base(name) => self.calendar_or_project(name).name.clone(),
+            CalendarTarget::Resource(id) => self
+                .resource(*id)
+                .map(|resource| resource.name.clone())
+                .unwrap_or_default(),
+        }
     }
 
     /// Add a base calendar to the library under a name nothing else uses.
@@ -1357,6 +1434,102 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn day_off(name: &str, y: i32, m: u32, d: u32) -> CalendarException {
+        let date = NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        CalendarException {
+            name: name.into(),
+            from: date,
+            to: date,
+            shifts: crate::calendar::DayShifts::nonworking(),
+        }
+    }
+
+    fn planned() -> Project {
+        Project::blank(
+            NaiveDate::from_ymd_opt(2026, 8, 17)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn an_exception_goes_where_the_target_says_and_nowhere_else() {
+        // The mistake this exists to stop is silent: a national holiday file
+        // landing on one person leaves the plan working everybody else through
+        // it, and nothing on screen says so afterwards.
+        let mut project = planned();
+        let ada = project.add_resource("Ada");
+
+        project
+            .exceptions_for_mut(&CalendarTarget::Resource(ada))
+            .expect("she is in the plan")
+            .push(day_off("Leave", 2026, 3, 3));
+
+        assert_eq!(project.exceptions_for(&CalendarTarget::Resource(ada)).len(), 1);
+        assert!(
+            project.exceptions_for(&CalendarTarget::Project).is_empty(),
+            "her leave is hers, not everybody's"
+        );
+    }
+
+    #[test]
+    fn a_base_calendar_takes_its_own_exceptions() {
+        let mut project = planned();
+        let name = project.add_base_calendar(WorkCalendar::standard());
+        let target = CalendarTarget::Base(name.clone());
+
+        project
+            .exceptions_for_mut(&target)
+            .expect("just added")
+            .push(day_off("Shutdown", 2026, 8, 18));
+
+        assert_eq!(project.exceptions_for(&target).len(), 1);
+        assert!(project.calendar.exceptions.is_empty());
+        assert!(
+            !project
+                .calendar_named(&name)
+                .expect("in the library")
+                .is_working_day(NaiveDate::from_ymd_opt(2026, 8, 18).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_target_the_plan_no_longer_has_writes_nowhere() {
+        // A picker can name a calendar that has since been deleted. Falling
+        // back to the project calendar there would put a day off in front of
+        // everybody, which is the one outcome worth refusing outright.
+        let mut project = planned();
+        assert!(
+            project
+                .exceptions_for_mut(&CalendarTarget::Base("Gone".into()))
+                .is_none()
+        );
+        assert!(
+            project
+                .exceptions_for_mut(&CalendarTarget::Resource(999))
+                .is_none()
+        );
+        assert!(project.exceptions_for(&CalendarTarget::Resource(999)).is_empty());
+    }
+
+    #[test]
+    fn a_target_names_itself_the_way_a_sentence_needs_it() {
+        let mut project = planned();
+        let ada = project.add_resource("Ada Lovelace");
+        assert_eq!(
+            project.calendar_target_name(&CalendarTarget::Project),
+            "Standard"
+        );
+        assert_eq!(
+            project.calendar_target_name(&CalendarTarget::Resource(ada)),
+            "Ada Lovelace"
+        );
+        assert!(CalendarTarget::Resource(ada).is_person());
+        assert!(!CalendarTarget::Project.is_person());
+        assert!(!CalendarTarget::Base("Night Shift".into()).is_person());
+    }
 
     #[test]
     fn a_summary_is_never_a_marker_however_its_own_duration_reads() {

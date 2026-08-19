@@ -40,8 +40,8 @@ pub use duration::{
     DurationUnit,
 };
 pub use model::{
-    Assignment, BarStyles, Baseline, ConstraintType, Link, LinkType, Project, Resource, ResourceId,
-    ResourceKind, ScheduleFrom, Scheduled, Task, TaskId, TaskMode,
+    Assignment, BarStyles, Baseline, CalendarTarget, ConstraintType, Link, LinkType, Project,
+    Resource, ResourceId, ResourceKind, ScheduleFrom, Scheduled, Task, TaskId, TaskMode,
 };
 pub use mspdi::ImportError;
 pub use persist::{FileError, FILE_EXTENSION, FILE_TYPE_NAME};

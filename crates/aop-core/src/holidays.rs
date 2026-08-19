@@ -12,9 +12,13 @@
 //! everybody inside a year, and fetching from an API would put somebody else's
 //! uptime between a planner and their plan.
 //!
-//! These land on the one project calendar and so apply to everybody, which is
-//! right for public holidays. There is no resource calendar in this model to
-//! put anything else on.
+//! Nothing here decides *whose* days these are. It reads a file into
+//! `CalendarException` values and adds the ones a calendar has not already got;
+//! where they land is the caller's choice, and Change Working Time makes it an
+//! explicit one. Aimed at the project calendar or a base they are public
+//! holidays and apply to everybody. Aimed at a person they are that person's
+//! leave, which is what an `.ics` exported from somebody's own calendar
+//! application actually contains.
 
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
 

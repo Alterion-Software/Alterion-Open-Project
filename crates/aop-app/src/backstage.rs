@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use dioxus::prelude::*;
 
-use aop_core::holidays;
 use aop_core::sheet::{DateOrder, Field as SheetField, Mapping, Report, Sheet};
 use aop_core::{format_work, persist, templates, Project, APP_NAME};
 use chrono::Datelike;
@@ -495,10 +494,11 @@ fn glyph_for(path: &std::path::Path) -> &'static str {
 /// its own heading. Sharing the browser is the point, so that a file visible
 /// on the Open page is visible on the Import page as well.
 ///
-/// `accept` narrows the list to particular extensions for a page that wants
-/// something Open cannot open, such as a holiday calendar.
+/// `accept` narrows the list to particular extensions for a caller that wants
+/// something Open cannot open, such as a holiday calendar. Change Working Time
+/// borrows it that way, which is why this is reachable outside this module.
 #[component]
-fn FileBrowser(
+pub(crate) fn FileBrowser(
     saving: bool,
     on_pick: Option<EventHandler<PathBuf>>,
     accept: Option<Vec<String>>,
@@ -1120,19 +1120,18 @@ fn ExportPage() -> Element {
 
 // ----------------------------------------------------------------- Import
 
-/// The Import page: a spreadsheet somebody else wrote, and public holidays.
+/// The Import page: a plan somebody else wrote, as a spreadsheet.
 ///
-/// Two imports rather than one, because they are two different things: one
-/// brings in a plan, the other brings in days nobody works. They share a page
-/// because they share an answer to the same question, which is "this came from
-/// somewhere else, how do I get it in".
+/// Holiday calendars used to sit here too and no longer do. A `.ics` is not a
+/// plan, and importing one is an edit to a calendar rather than a new document,
+/// so it belongs where calendars are edited: Change Working Time, where it can
+/// also be aimed at one person rather than at everybody.
 #[component]
 fn ImportPage() -> Element {
     rsx! {
         h1 { class: "bs-title", "Import" }
         Confirmation {}
         SpreadsheetImport {}
-        HolidayImport {}
     }
 }
 
@@ -1594,195 +1593,6 @@ fn Summary(report: Report) -> Element {
         }
 
     }
-}
-
-// ------------------------------------------------------- public holidays
-
-#[component]
-fn HolidayImport() -> Element {
-    let mut state = use_context::<Signal<AppState>>();
-
-    let mut source = use_signal(|| Option::<PathBuf>::None);
-    let mut found = use_signal(|| Option::<holidays::Found>::None);
-    let mut trouble = use_signal(|| Option::<String>::None);
-
-    // A plan spans a year or two and a downloaded calendar spans ten, so the
-    // range starts on the plan rather than on the file.
-    let planned = {
-        let s = state.read();
-        let start = s.project.start_date.year();
-        let finish = s
-            .report
-            .as_ref()
-            .map(|report| report.finish.year())
-            .unwrap_or(start);
-        (start, finish.max(start))
-    };
-    let mut first_year = use_signal(|| planned.0);
-    let mut last_year = use_signal(|| planned.1);
-
-    let mut choose = move |path: PathBuf| {
-        trouble.set(None);
-        match holidays::read(&path) {
-            Ok(read) => {
-                found.set(Some(read));
-                source.set(Some(path));
-            }
-            Err(error) => {
-                found.set(None);
-                source.set(None);
-                trouble.set(Some(error.to_string()));
-            }
-        }
-    };
-
-    let held = found();
-    let Some(file) = held.as_ref() else {
-        return rsx! {
-            h2 { class: "bs-sub", style: "margin-top: 34px;", "Public holidays" }
-            div { class: "hint", style: "margin: 0 0 10px;",
-                "An iCalendar (.ics) file, which is what governments, Google and Outlook publish holiday calendars as. "
-                "The days in it become non-working days in this plan's calendar, so nothing is scheduled on them."
-            }
-            if let Some(message) = trouble() {
-                div { class: "info-alert",
-                    span { class: "fix-icon", {icon("warning", 18)} }
-                    div { style: "flex: 1;", "{message}" }
-                }
-            }
-            FileBrowser {
-                saving: false,
-                accept: vec!["ics".to_string()],
-                on_pick: move |path: PathBuf| choose(path),
-            }
-        };
-    };
-
-    let list = file.between(first_year(), last_year());
-    let unhandled = file.unhandled();
-    let known: Vec<bool> = {
-        let s = state.read();
-        list.iter()
-            .map(|holiday| holidays::already_held(&s.project.calendar, holiday))
-            .collect()
-    };
-    let fresh = known.iter().filter(|held| !**held).count();
-    let name = file
-        .name
-        .clone()
-        .unwrap_or_else(|| "Holidays".to_string());
-    let path = source().map(|path| path.display().to_string()).unwrap_or_default();
-
-    rsx! {
-        h2 { class: "bs-sub", style: "margin-top: 34px;", "Public holidays" }
-        div { class: "bs-field",
-            label { "File" }
-            input { class: "bs-input", value: "{path}", disabled: true }
-            button { class: "btn",
-                onclick: move |_| {
-                    found.set(None);
-                    source.set(None);
-                },
-                "Choose another"
-            }
-        }
-        div { class: "bs-field",
-            label { "Calendar" }
-            span { class: "recent-name", "{name} \u{00b7} {file.occasions.len()} event(s)" }
-        }
-        div { class: "bs-field",
-            label { "Years" }
-            input {
-                class: "bs-input", style: "max-width: 90px; flex: none;",
-                value: "{first_year}",
-                onchange: move |event| {
-                    if let Ok(year) = event.value().trim().parse::<i32>() {
-                        first_year.set(year);
-                    }
-                },
-            }
-            span { class: "recent-path", "to" }
-            input {
-                class: "bs-input", style: "max-width: 90px; flex: none;",
-                value: "{last_year}",
-                onchange: move |event| {
-                    if let Ok(year) = event.value().trim().parse::<i32>() {
-                        last_year.set(year);
-                    }
-                },
-            }
-            span { class: "recent-path",
-                "A downloaded file often covers ten years and a plan covers one."
-            }
-        }
-
-        if file.timed > 0 {
-            div { class: "hint", style: "margin: 0 0 8px;",
-                "{file.timed} event(s) in this file have a time of day rather than being whole days. "
-                "A public holiday is a day off, so those are left alone: they are meetings somebody saved in the file."
-            }
-        }
-        if !unhandled.is_empty() {
-            div { class: "info-alert",
-                span { class: "fix-icon", {icon("warning", 18)} }
-                div { style: "flex: 1;",
-                    "These repeat in a way this does not work out, so only the dates written in the file come across: "
-                    "{unhandled.join(\", \")}. Yearly repeats are handled, including ones like the fourth Thursday in November."
-                }
-            }
-        }
-
-        if list.is_empty() {
-            div { class: "hint", "Nothing in this file falls between those years." }
-        } else {
-            div { class: "imp-list", style: "margin-top: 10px;",
-                for (index, holiday) in list.iter().enumerate() {
-                    div { key: "h{index}", class: "imp-notice",
-                        span { class: "imp-where",
-                            if holiday.from == holiday.to {
-                                "{holiday.from}"
-                            } else {
-                                "{holiday.from} to {holiday.to}"
-                            }
-                        }
-                        span { class: "imp-value", "{holiday.name}" }
-                        span { class: "imp-why",
-                            if known.get(index).copied().unwrap_or(false) {
-                                "already in the calendar"
-                            } else if holiday.repeating {
-                                "from a yearly rule"
-                            } else {
-                                ""
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        div { class: "hint", style: "margin: 12px 0 8px;",
-            "These are added to this plan's calendar and apply to everybody, which is what a public holiday is. Undo puts it back."
-        }
-        button { class: "btn primary",
-            disabled: fresh == 0,
-            onclick: move |_| {
-                let holidays = file_holidays(&found(), first_year(), last_year());
-                state.write().import_holidays(&holidays);
-            },
-            "Add {fresh} day(s) off"
-        }
-    }
-}
-
-/// The holidays in range, worked out again at the moment of the click.
-///
-/// The list on screen was built for reading; this is built for doing, and the
-/// two must not be able to drift apart.
-fn file_holidays(found: &Option<holidays::Found>, first: i32, last: i32) -> Vec<holidays::Holiday> {
-    found
-        .as_ref()
-        .map(|file| file.between(first, last))
-        .unwrap_or_default()
 }
 
 // ------------------------------------------------------------------ About

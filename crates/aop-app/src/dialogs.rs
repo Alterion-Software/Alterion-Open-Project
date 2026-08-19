@@ -1,11 +1,13 @@
 //! Modal dialogs: Task Information, Project Information, Assign Resources,
 //! Change Working Time, and the message and about boxes.
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use dioxus::prelude::*;
 
+use aop_core::holidays;
 use aop_core::{
-    format_duration, format_work, ConstraintType, DayShifts, ResourceKind, ScheduleFrom, TaskMode,
+    format_duration, format_work, CalendarTarget, ConstraintType, DayShifts, ResourceKind,
+    ScheduleFrom, TaskMode,
 };
 
 use std::path::PathBuf;
@@ -1793,13 +1795,13 @@ const WEEKDAYS: [&str; 7] = [
     "Sunday",
 ];
 
-/// Which calendar Change Working Time is pointed at.
+/// Decode the value the target picker carries.
 ///
 /// Encoded as a string so it can ride through the same `Dropdown` every other
-/// picker in this file uses. The three cases are deliberately different things:
-/// a public holiday belongs on the project calendar or a base, where it moves
-/// everybody, and one person's leave belongs on that person, where it moves
-/// only the tasks they are on.
+/// picker in this file uses. The three cases are deliberately different things,
+/// which is why `CalendarTarget` names them in the core rather than here: a day
+/// the organisation is closed belongs on a shared calendar, and one person
+/// being away belongs on that person.
 fn calendar_target_of(value: &str) -> CalendarTarget {
     if let Some(name) = value.strip_prefix("base:") {
         return CalendarTarget::Base(name.to_string());
@@ -1812,10 +1814,29 @@ fn calendar_target_of(value: &str) -> CalendarTarget {
     CalendarTarget::Project
 }
 
-enum CalendarTarget {
-    Project,
-    Base(String),
-    Resource(u32),
+/// Everything a calendar can be pointed at, in the order a picker offers it.
+///
+/// Built once and used by both the picker at the top of the dialog and the
+/// destination picker in the import step, so the two cannot come to describe
+/// the same calendar differently.
+fn calendar_targets(project: &aop_core::Project) -> Vec<Choice> {
+    let mut targets = vec![Choice::new(
+        "project",
+        format!("Project calendar ({})", project.calendar.name),
+    )];
+    for calendar in project.calendars.iter() {
+        targets.push(Choice::new(
+            format!("base:{}", calendar.name),
+            calendar.name.clone(),
+        ));
+    }
+    for resource in project.resources.iter().filter(|r| r.kind == ResourceKind::Work) {
+        targets.push(Choice::new(
+            format!("resource:{}", resource.id),
+            format!("{} (person)", resource.name),
+        ));
+    }
+    targets
 }
 
 /// What the dialog is showing, pulled out of the plan in one read.
@@ -1831,25 +1852,16 @@ struct CalendarView {
 
 fn read_calendar(state: &AppState, target: &CalendarTarget) -> CalendarView {
     let project = &state.project;
-    let (calendar, exceptions, base_of_resource) = match target {
-        CalendarTarget::Project => (
-            &project.calendar,
-            project.calendar.exceptions.clone(),
-            None,
-        ),
-        CalendarTarget::Base(name) => {
-            let calendar = project.calendar_or_project(name);
-            (calendar, calendar.exceptions.clone(), None)
-        }
+    let (calendar, base_of_resource) = match target {
+        CalendarTarget::Project => (&project.calendar, None),
+        CalendarTarget::Base(name) => (project.calendar_or_project(name), None),
         CalendarTarget::Resource(id) => {
-            let resource = project.resource(*id);
-            let base = resource.map(|r| r.base_calendar.clone()).unwrap_or_default();
+            let base = project
+                .resource(*id)
+                .map(|r| r.base_calendar.clone())
+                .unwrap_or_default();
             let calendar = project.calendar_or_project(&base);
-            (
-                calendar,
-                resource.map(|r| r.calendar_exceptions.clone()).unwrap_or_default(),
-                Some(calendar.name.clone()),
-            )
+            (calendar, Some(calendar.name.clone()))
         }
     };
 
@@ -1872,9 +1884,10 @@ fn read_calendar(state: &AppState, target: &CalendarTarget) -> CalendarView {
 
     CalendarView {
         week,
-        exceptions: exceptions
-            .into_iter()
-            .map(|ex| (ex.name, ex.from, ex.to))
+        exceptions: project
+            .exceptions_for(target)
+            .iter()
+            .map(|ex| (ex.name.clone(), ex.from, ex.to))
             .collect(),
         base_of_resource,
     }
@@ -1888,42 +1901,105 @@ fn ChangeWorkingTime() -> Element {
     let mut holiday_to = use_signal(String::new);
     let mut target_value = use_signal(|| String::from("project"));
 
-    let target = calendar_target_of(&target_value());
-    let editable_week = !matches!(target, CalendarTarget::Resource(_));
+    // ---- the import step ------------------------------------------------
+    //
+    // Its destination is a signal of its own rather than a read of the picker
+    // above. It starts on whatever calendar is being edited, which is nearly
+    // always the one meant, but dropping a national holiday file onto one
+    // person is a real mistake to make and a silent one afterwards: the plan
+    // simply schedules everybody else through Christmas. So the destination is
+    // named and changeable at the moment of import, and the confirm step says
+    // where the days are going before anything is added.
+    let mut importing = use_signal(|| false);
+    let mut import_into = use_signal(|| String::from("project"));
+    let mut source = use_signal(|| Option::<PathBuf>::None);
+    let mut found = use_signal(|| Option::<holidays::Found>::None);
+    let mut trouble = use_signal(|| Option::<String>::None);
 
-    let (view, targets, bases) = {
+    // A plan spans a year or two and a downloaded calendar spans ten, so the
+    // range starts on the plan rather than on the file.
+    let planned = {
+        let s = state.read();
+        let start = s.project.start_date.year();
+        let finish = s
+            .report
+            .as_ref()
+            .map(|report| report.finish.year())
+            .unwrap_or(start);
+        (start, finish.max(start))
+    };
+    let mut first_year = use_signal(|| planned.0);
+    let mut last_year = use_signal(|| planned.1);
+
+    let target = calendar_target_of(&target_value());
+    let into = calendar_target_of(&import_into());
+    let editable_week = !target.is_person();
+
+    let (view, targets, bases, into_name, into_base) = {
         let s = state.read();
         let view = read_calendar(&s, &target);
-
-        let mut targets = vec![Choice::new(
-            "project",
-            format!("Project calendar ({})", s.project.calendar.name),
-        )];
-        for calendar in s.project.calendars.iter() {
-            targets.push(Choice::new(
-                format!("base:{}", calendar.name),
-                calendar.name.clone(),
-            ));
-        }
-        for resource in s.project.resources.iter().filter(|r| r.kind == ResourceKind::Work) {
-            targets.push(Choice::new(
-                format!("resource:{}", resource.id),
-                format!("{} (person)", resource.name),
-            ));
-        }
-
+        let targets = calendar_targets(&s.project);
         let bases: Vec<Choice> = s
             .project
             .calendar_library()
             .map(|calendar| Choice::plain(calendar.name.clone()))
             .collect();
-        (view, targets, bases)
+        let into_name = s.project.calendar_target_name(&into);
+        // Only wanted for a person, to say plainly that their shared week is
+        // not what an import touches.
+        let into_base = match &into {
+            CalendarTarget::Resource(id) => s
+                .project
+                .resource(*id)
+                .map(|r| s.project.calendar_or_project(&r.base_calendar).name.clone()),
+            _ => None,
+        };
+        (view, targets, bases, into_name, into_base)
     };
 
     let target_for_week = target_value();
     let target_for_remove = target_value();
     let target_for_add = target_value();
     let target_for_base = target_value();
+
+    let mut choose = move |path: PathBuf| {
+        trouble.set(None);
+        match holidays::read(&path) {
+            Ok(read) => {
+                found.set(Some(read));
+                source.set(Some(path));
+            }
+            Err(error) => {
+                found.set(None);
+                source.set(None);
+                trouble.set(Some(error.to_string()));
+            }
+        }
+    };
+
+    // Closing the panel throws the file away too, so reopening it starts from
+    // the picker rather than from somebody else's half-finished import.
+    let mut close_import = move || {
+        importing.set(false);
+        found.set(None);
+        source.set(None);
+        trouble.set(None);
+    };
+
+    let file = found();
+    let import_destination = rsx! {
+        div { class: "form-row",
+            label { "Add days off to" }
+            Dropdown {
+                value: "{import_into}",
+                options: targets.clone(),
+                width: 0.0,
+                large: true,
+                disabled: false,
+                on_pick: move |picked: String| import_into.set(picked),
+            }
+        }
+    };
 
     rsx! {
         Head { title: "Change Working Time".to_string() }
@@ -1932,7 +2008,7 @@ fn ChangeWorkingTime() -> Element {
                 label { "For calendar" }
                 Dropdown {
                     value: "{target_value}",
-                    options: targets,
+                    options: targets.clone(),
                     width: 0.0,
                     large: true,
                     disabled: false,
@@ -2040,22 +2116,7 @@ fn ChangeWorkingTime() -> Element {
                                                     let target = calendar_target_of(&target_for_row);
                                                     let mut writer = state.write();
                                                     writer.checkpoint();
-                                                    let list = match &target {
-                                                        CalendarTarget::Resource(id) => writer
-                                                            .project
-                                                            .resources
-                                                            .iter_mut()
-                                                            .find(|r| r.id == *id)
-                                                            .map(|r| &mut r.calendar_exceptions),
-                                                        CalendarTarget::Base(name) => writer
-                                                            .project
-                                                            .calendar_named_mut(name)
-                                                            .map(|c| &mut c.exceptions),
-                                                        CalendarTarget::Project => {
-                                                            Some(&mut writer.project.calendar.exceptions)
-                                                        }
-                                                    };
-                                                    if let Some(list) = list
+                                                    if let Some(list) = writer.project.exceptions_for_mut(&target)
                                                         && index < list.len() {
                                                             list.remove(index);
                                                         }
@@ -2096,20 +2157,7 @@ fn ChangeWorkingTime() -> Element {
                         let target = calendar_target_of(&target_for_add);
                         let mut writer = state.write();
                         writer.checkpoint();
-                        let list = match &target {
-                            CalendarTarget::Resource(id) => writer
-                                .project
-                                .resources
-                                .iter_mut()
-                                .find(|r| r.id == *id)
-                                .map(|r| &mut r.calendar_exceptions),
-                            CalendarTarget::Base(name) => writer
-                                .project
-                                .calendar_named_mut(name)
-                                .map(|c| &mut c.exceptions),
-                            CalendarTarget::Project => Some(&mut writer.project.calendar.exceptions),
-                        };
-                        if let Some(list) = list {
+                        if let Some(list) = writer.project.exceptions_for_mut(&target) {
                             list.push(entry);
                         }
                         writer.reschedule();
@@ -2117,6 +2165,230 @@ fn ChangeWorkingTime() -> Element {
                         holiday_to.set(String::new());
                     },
                     "Add"
+                }
+            }
+
+            // ---- import from a calendar file ---------------------------
+            if !importing() {
+                div { class: "form-row", style: "margin-top: 10px;",
+                    label { "" }
+                    button { class: "btn",
+                        onclick: move |_| {
+                            // Default the destination to whatever is being
+                            // edited, which is the reason this control is here
+                            // rather than on a page of its own.
+                            import_into.set(target_value());
+                            importing.set(true);
+                        },
+                        {icon("open", 15)}
+                        if target.is_person() { "Import time off from a file" } else { "Import holidays from a file" }
+                    }
+                    span { class: "hint", style: "margin: 0;",
+                        if target.is_person() {
+                            "An .ics export from their calendar application."
+                        } else {
+                            "An .ics holiday calendar."
+                        }
+                    }
+                }
+            } else {
+                h3 { style: "font-size: 13px; margin: 18px 0 8px;",
+                    if into.is_person() { "Import time off" } else { "Import public holidays" }
+                }
+
+                {import_destination}
+
+                if let Some(base) = into_base.clone() {
+                    div { class: "hint",
+                        "Days land on {into_name} alone. The {base} calendar they follow is not changed, \
+                         so nobody else is given the time off."
+                    }
+                } else {
+                    div { class: "hint",
+                        "Days land on the {into_name} calendar, so they are non-working for everybody who follows it."
+                    }
+                }
+
+                if let Some(message) = trouble() {
+                    div { class: "info-alert",
+                        span { class: "fix-icon", {icon("warning", 18)} }
+                        div { style: "flex: 1;", "{message}" }
+                    }
+                }
+
+                match file.as_ref() {
+                    None => rsx! {
+                        div { class: "hint", style: "margin-top: 8px;",
+                            if into.is_person() {
+                                "An iCalendar (.ics) file, the export every calendar application can produce. \
+                                 Somebody can send you theirs and their absences come across as their own time off, \
+                                 without any of it being typed in."
+                            } else {
+                                "An iCalendar (.ics) file, which is what governments, Google and Outlook publish \
+                                 holiday calendars as. Whole days in it become non-working days, so nothing is \
+                                 scheduled on them."
+                            }
+                        }
+                        crate::backstage::FileBrowser {
+                            saving: false,
+                            accept: vec!["ics".to_string()],
+                            on_pick: move |path: PathBuf| choose(path),
+                        }
+                        div { class: "form-row",
+                            label { "" }
+                            button { class: "btn", onclick: move |_| close_import(), "Cancel" }
+                        }
+                    },
+                    Some(file) => {
+                        let list = file.between(first_year(), last_year());
+                        let unhandled = file.unhandled();
+                        let known: Vec<bool> = {
+                            let s = state.read();
+                            // Checked against the destination chosen here, not
+                            // against the calendar being edited, so the count
+                            // below is a count of what will really be added.
+                            let carrier = crate::state::target_calendar(&s.project, &into);
+                            list.iter()
+                                .map(|holiday| holidays::already_held(&carrier, holiday))
+                                .collect()
+                        };
+                        let fresh = known.iter().filter(|held| !**held).count();
+                        let name = file.name.clone().unwrap_or_else(|| "Holidays".to_string());
+                        let path = source().map(|p| p.display().to_string()).unwrap_or_default();
+                        // The sentence that has to be read before anything is
+                        // added, in the same words the picker above uses.
+                        let going = if into.is_person() {
+                            format!(
+                                "{fresh} day(s) off will be added to {into_name}, \
+                                 moving only the tasks they are assigned to."
+                            )
+                        } else {
+                            format!(
+                                "{fresh} day(s) off will be added to the {into_name} calendar, \
+                                 and will apply to everybody who follows it."
+                            )
+                        };
+
+                        rsx! {
+                            div { class: "form-row",
+                                label { "File" }
+                                input { class: "grow", value: "{path}", readonly: true }
+                                button { class: "btn",
+                                    onclick: move |_| {
+                                        found.set(None);
+                                        source.set(None);
+                                    },
+                                    "Choose another"
+                                }
+                            }
+                            div { class: "form-row",
+                                label { "Contains" }
+                                span { style: "color: var(--ink-soft);",
+                                    "{name} \u{00b7} {file.occasions.len()} event(s)"
+                                }
+                            }
+                            div { class: "form-row",
+                                label { "Years" }
+                                input {
+                                    style: "width: 80px;",
+                                    value: "{first_year}",
+                                    onchange: move |event| {
+                                        if let Ok(year) = event.value().trim().parse::<i32>() {
+                                            first_year.set(year);
+                                        }
+                                    },
+                                }
+                                span { style: "color: var(--ink-soft);", "to" }
+                                input {
+                                    style: "width: 80px;",
+                                    value: "{last_year}",
+                                    onchange: move |event| {
+                                        if let Ok(year) = event.value().trim().parse::<i32>() {
+                                            last_year.set(year);
+                                        }
+                                    },
+                                }
+                                span { class: "hint", style: "margin: 0;",
+                                    "A downloaded file often covers ten years and a plan covers one."
+                                }
+                            }
+
+                            if file.timed > 0 {
+                                div { class: "hint",
+                                    "{file.timed} event(s) in this file have a time of day rather than being whole days. \
+                                     Those are left alone: a day off is a whole day, and the rest are meetings somebody saved."
+                                }
+                            }
+                            if !unhandled.is_empty() {
+                                div { class: "info-alert",
+                                    span { class: "fix-icon", {icon("warning", 18)} }
+                                    div { style: "flex: 1;",
+                                        "These repeat in a way this does not work out, so only the dates written in the file \
+                                         come across: {unhandled.join(\", \")}. Yearly repeats are handled, including ones \
+                                         like the fourth Thursday in November."
+                                    }
+                                }
+                            }
+
+                            if list.is_empty() {
+                                div { class: "hint", "Nothing in this file falls between those years." }
+                            } else {
+                                div { class: "dlg-list",
+                                    for (index, holiday) in list.iter().enumerate() {
+                                        div { key: "h{index}", class: "dlg-list-row",
+                                            span { style: "width: 170px; color: var(--ink-soft);",
+                                                if holiday.from == holiday.to {
+                                                    "{holiday.from}"
+                                                } else {
+                                                    "{holiday.from} to {holiday.to}"
+                                                }
+                                            }
+                                            span { style: "flex: 1;", "{holiday.name}" }
+                                            span { style: "color: var(--ink-faint);",
+                                                if known.get(index).copied().unwrap_or(false) {
+                                                    "already there"
+                                                } else if holiday.repeating {
+                                                    "from a yearly rule"
+                                                } else {
+                                                    ""
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            div { class: "info-alert", style: "margin-top: 12px;",
+                                span { class: "fix-icon", {icon("warning", 18)} }
+                                div { style: "flex: 1;", "{going} Undo puts it back." }
+                            }
+
+                            div { class: "form-row",
+                                label { "" }
+                                button { class: "btn primary",
+                                    disabled: fresh == 0,
+                                    onclick: move |_| {
+                                        // Worked out again on the click rather
+                                        // than reused from the list above, so
+                                        // what is added cannot drift from what
+                                        // was read.
+                                        let into = calendar_target_of(&import_into());
+                                        let days = found()
+                                            .map(|file| file.between(first_year(), last_year()))
+                                            .unwrap_or_default();
+                                        state.write().import_holidays(&into, &days);
+                                        close_import();
+                                    },
+                                    if into.is_person() {
+                                        "Add {fresh} day(s) off for {into_name}"
+                                    } else {
+                                        "Add {fresh} day(s) off"
+                                    }
+                                }
+                                button { class: "btn", onclick: move |_| close_import(), "Cancel" }
+                            }
+                        }
+                    }
                 }
             }
         }

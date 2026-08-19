@@ -11,8 +11,8 @@ use aop_core::draw::{
 };
 use aop_core::grouping::GroupRow;
 use aop_core::{
-    persist, schedule, templates, ConstraintType, Field, Link, LinkType, Project, ResourceId,
-    ScheduleReport, Task, TaskId, TaskMode, WorkCalendar,
+    persist, schedule, templates, CalendarTarget, ConstraintType, Field, Link, LinkType, Project,
+    ResourceId, ScheduleReport, Task, TaskId, TaskMode, WorkCalendar,
 };
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 
@@ -891,6 +891,25 @@ pub fn offered_in_browser(path: &std::path::Path, saving: bool) -> bool {
         && aop_core::persist::IMPORTED_EXTENSIONS
             .iter()
             .any(|known| extension.eq_ignore_ascii_case(known))
+}
+
+/// The exceptions an import aimed at `target` is measured against, in the shape
+/// `aop_core::holidays` works in.
+///
+/// That module reads and writes a `WorkCalendar`, and a person in this model
+/// has an exception list rather than a calendar of their own: their working
+/// week is their base's and is shared. Lending them one carrying their own
+/// exceptions is what lets the preview and the import ask the same question of
+/// the same list, so the count shown can never be a count of something else.
+///
+/// The week is the Standard one and is never read. Only the exceptions matter
+/// here, and an empty week would be a calendar that panics if anything ever
+/// looked at it.
+pub fn target_calendar(project: &Project, target: &CalendarTarget) -> WorkCalendar {
+    let mut carrier = WorkCalendar::standard();
+    carrier.name = project.calendar_target_name(target);
+    carrier.exceptions = project.exceptions_for(target).to_vec();
+    carrier
 }
 
 /// The places a browser can start from when there is nowhere above the
@@ -1812,27 +1831,49 @@ impl AppState {
         self.status = note;
     }
 
-    /// Book public holidays off in the project calendar.
+    /// Book days off into whichever calendar the import was aimed at.
     ///
     /// A checkpoint first, because this moves dates: a planner who imports the
-    /// wrong country's holidays has to be able to undo it in one step.
-    pub fn import_holidays(&mut self, holidays: &[aop_core::holidays::Holiday]) -> usize {
+    /// wrong country's holidays, or drops a national holiday file onto one
+    /// person, has to be able to undo it in one step.
+    pub fn import_holidays(
+        &mut self,
+        target: &CalendarTarget,
+        holidays: &[aop_core::holidays::Holiday],
+    ) -> usize {
+        let where_to = self.project.calendar_target_name(target);
         self.checkpoint();
-        let added = aop_core::holidays::add(&mut self.project.calendar, holidays);
+
+        let Some(existing) = self.project.exceptions_for_mut(target) else {
+            // The picker is naming something the plan no longer has. Writing
+            // the days onto the project calendar instead would be the one
+            // mistake this whole control is arranged to prevent.
+            self.undo.pop();
+            self.note("That calendar is no longer in the plan.");
+            return 0;
+        };
+
+        // `holidays::add` works on a calendar, and a person in this model has
+        // an exception list rather than a calendar of their own: their working
+        // week is their base's and is shared. Lending them one carrying their
+        // own exceptions keeps a single answer to "is this day already booked
+        // off" rather than growing a second one here that could disagree with
+        // the one doing the adding.
+        let mut carrier = aop_core::WorkCalendar::standard();
+        carrier.exceptions = std::mem::take(existing);
+        let added = aop_core::holidays::add(&mut carrier, holidays);
+        *existing = std::mem::take(&mut carrier.exceptions);
+
         if added == 0 {
             // Nothing changed, so the checkpoint would be an empty step in the
             // undo stack, which is worse than no step at all.
             self.undo.pop();
-            self.backstage_message =
-                Some("Every one of those days is already in the calendar.".into());
+            self.note(format!("Every one of those days is already on {where_to}."));
             return 0;
         }
         self.reschedule();
-        self.backstage_message = Some(format!(
-            "Added {added} day(s) off to the {} calendar.",
-            self.project.calendar.name
-        ));
-        self.note(format!("Imported {added} holiday(s)"));
+        self.plan_changed();
+        self.note(format!("Added {added} day(s) off to {where_to}"));
         added
     }
 
@@ -6109,13 +6150,63 @@ mod tests {
             to: chrono::NaiveDate::from_ymd_opt(2026, 12, 25).expect("a date"),
             repeating: false,
         }];
-        assert_eq!(state.import_holidays(&holidays), 1);
+        assert_eq!(state.import_holidays(&CalendarTarget::Project, &holidays), 1);
         // A second pass adds nothing, and must not leave an empty step in the
         // undo stack for somebody to press through.
         let steps = state.undo.len();
-        assert_eq!(state.import_holidays(&holidays), 0);
+        assert_eq!(state.import_holidays(&CalendarTarget::Project, &holidays), 0);
         assert_eq!(state.undo.len(), steps);
         assert_eq!(state.project.calendar.exceptions.len(), 1);
+    }
+
+    #[test]
+    fn importing_into_a_person_lands_on_them_and_not_on_anybody_else() {
+        // The mistake this guards against is silent: a national holiday file
+        // dropped onto one person leaves the plan scheduling everybody else
+        // straight through Christmas.
+        let mut state = outlined();
+        let ada = state.project.add_resource("Ada Lovelace");
+        let leave = vec![aop_core::holidays::Holiday {
+            name: "Away".into(),
+            from: chrono::NaiveDate::from_ymd_opt(2026, 3, 3).expect("a date"),
+            to: chrono::NaiveDate::from_ymd_opt(2026, 3, 6).expect("a date"),
+            repeating: false,
+        }];
+
+        assert_eq!(
+            state.import_holidays(&CalendarTarget::Resource(ada), &leave),
+            1
+        );
+        let resource = state.project.resource(ada).expect("still there");
+        assert_eq!(resource.calendar_exceptions.len(), 1);
+        assert!(
+            state.project.calendar.exceptions.is_empty(),
+            "their leave is theirs, not everybody's"
+        );
+
+        // And a second run over the same person adds nothing, so an import
+        // repeated by accident cannot double the days up.
+        let steps = state.undo.len();
+        assert_eq!(
+            state.import_holidays(&CalendarTarget::Resource(ada), &leave),
+            0
+        );
+        assert_eq!(state.undo.len(), steps);
+    }
+
+    #[test]
+    fn a_holiday_file_is_not_offered_where_a_plan_is_opened() {
+        // The Open page opens plans. An .ics is a list of days off, and
+        // offering it there would be offering to open something that is not a
+        // plan; it belongs to the import inside Change Working Time.
+        assert!(!offered_in_browser(
+            &std::path::PathBuf::from("holidays.ics"),
+            false
+        ));
+        assert!(!offered_in_browser(
+            &std::path::PathBuf::from("HOLIDAYS.ICS"),
+            false
+        ));
     }
 
     fn names(state: &AppState) -> Vec<&str> {
