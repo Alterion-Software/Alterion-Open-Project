@@ -2,6 +2,68 @@
 
 Notable changes, newest first. Dates are the day a version was tagged.
 
+## 1.0.3-beta
+
+Live editing that is actually live, and Windows keeping what it is told.
+
+### Windows
+
+- **Nothing was remembered between launches.** Every path this application
+  keeps a file at was worked out from `XDG_CONFIG_HOME` or `HOME/.config`,
+  both Unix variables that Windows does not set, so all eight copies of that
+  guess returned nothing there. The settings, the recent list, the added
+  dictionary words, the crash recovery snapshots, the saved versions and the
+  port file the single instance check depends on were silently never written.
+  Nothing failed; everything simply forgot itself.
+- **A console window flashed up** during printing and during sign in. A
+  graphical application that starts a console program is given a window for
+  it, and listing printers, sending a job, reading a stored token and probing
+  the hardware are all console programs.
+- **Updating no longer needs administrator rights.** It installs per user, to
+  where the account can already write, which is what lets an application
+  update itself at all. A machine wide option is still there and switches the
+  install location, registry hive, shortcut scope and uninstaller together.
+- The Open pane started in the directory the application happened to be
+  launched from, and had no way off the drive it started on.
+
+### Live collaborate
+
+- **Changes stream.** Nothing pushed automatically before: a live session
+  received other people's work and sent none of its own until somebody
+  pressed Sync. Both transports now call one decision function, so the
+  protocol cannot mean two things.
+- **Two channels over one socket.** A change is durable: logged, sequenced,
+  authored, replayable. A pointer, a selection, an open cell and a half typed
+  word are ephemeral: broadcast and forgotten. Putting an interaction in the
+  log would pollute the audit trail and make undo ambiguous.
+- **Cursors glide** rather than jumping three times a second, and carry the
+  person's name and picture. Moving a mouse cannot redraw the window.
+- **A clean rebase happens quietly**, because with streaming "behind" is the
+  ordinary state rather than an event. A batch that would touch the cell
+  somebody has open is held until they close it, so the ground never moves
+  under their fingers.
+- **Pull Changes**, which always shows what it would do before it does it.
+- **A plan opened from a server has a file.** It existed only in memory, so
+  closing the application lost the plan, its log and any unsent work. It now
+  opens at file speed and catches up from its cursor, and Save As keeps it
+  syncing rather than silently unlinking it.
+
+### Also
+
+- **Save As asked nothing before writing over an existing file.** It offers
+  to replace, to keep both with a numbered name, or to stop.
+- Previewing somebody else's change replayed it for real, which closed the
+  open cell editor and threw away a half typed word.
+- Per resource calendars, so leave has somewhere to live, with public
+  holidays importable from an iCalendar file into whichever calendar you
+  choose.
+- An Import page for spreadsheets nobody here wrote: pick the sheet, the
+  heading row and what each column means, with real data shown under each.
+- The Team Planner drew every bar in a lane at the same height, so a plan
+  with unassigned work was one unreadable smear.
+- Sharing a plan means something: an owner invites an address and whoever
+  opens the link claims it by proving that address.
+
 ## 1.0.2-beta
 
 Windows fixes, found by running it on Windows.
