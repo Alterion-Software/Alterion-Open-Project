@@ -266,14 +266,15 @@ fn band_row(project: &Project, band: &Band, depth: usize) -> GroupRow {
 /// * `Start` and `Finish` live in `Scheduled`, which the scheduler owns. Typing
 ///   a date there is really asking for a constraint, and a fill that wrote the
 ///   date straight in would be overwritten by the next reschedule anyway.
-/// * `Predecessors` reads as row numbers, which mean a different task in every
-///   row. Copying the cell down would point the whole selection at one task and
-///   could make a row its own predecessor; building links is `add_link`'s job.
+/// * `Predecessors` and `Successors` read as row numbers, which mean a
+///   different task in every row. Copying the cell down would point the whole
+///   selection at one task and could make a row its own predecessor; building
+///   links is `add_link`'s job.
 pub fn is_fillable(field: Field) -> bool {
     field.editable()
         && !matches!(
             field,
-            Field::Start | Field::Finish | Field::Predecessors
+            Field::Start | Field::Finish | Field::Predecessors | Field::Successors
         )
 }
 

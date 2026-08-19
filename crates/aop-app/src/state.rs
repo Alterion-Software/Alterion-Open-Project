@@ -763,6 +763,10 @@ pub enum Column {
     Start,
     Finish,
     Predecessors,
+    /// The other end of the same links `Predecessors` edits. Nothing about a
+    /// successor is stored separately, so this column reads and writes
+    /// `Project::links` from the far side rather than a list of its own.
+    Successors,
     Resources,
 }
 
@@ -3854,6 +3858,7 @@ impl AppState {
                     | (Field::Start, Column::Start)
                     | (Field::Finish, Column::Finish)
                     | (Field::Predecessors, Column::Predecessors)
+                    | (Field::Successors, Column::Successors)
                     | (Field::ResourceNames, Column::Resources)
             )
         })?;
@@ -5165,6 +5170,7 @@ impl AppState {
             Column::Start => task.scheduled.start.format("%Y-%m-%d").to_string(),
             Column::Finish => task.scheduled.finish.format("%Y-%m-%d").to_string(),
             Column::Predecessors => self.project.predecessor_text(task.id),
+            Column::Successors => self.project.successor_text(task.id),
             Column::Resources => self.project.resource_text(task),
         }
     }
@@ -5243,6 +5249,10 @@ impl AppState {
                 let id = self.project.tasks[row].id;
                 self.project.set_predecessor_text(id, &value);
             }
+            Column::Successors => {
+                let id = self.project.tasks[row].id;
+                self.project.set_successor_text(id, &value);
+            }
             Column::Resources => {
                 self.project.set_resource_text(row, &value);
             }
@@ -5252,7 +5262,8 @@ impl AppState {
         self.reschedule();
 
         // A link edit is the one cell that can create a loop; roll it back.
-        if column == Column::Predecessors
+        // Either end of a link can close one, so both cells are checked.
+        if matches!(column, Column::Predecessors | Column::Successors)
             && let Some(error) = self.schedule_error() {
                 self.roll_back();
                 self.dialog = Some(Dialog::Message {
@@ -5309,6 +5320,41 @@ impl AppState {
         self.checkpoint();
         self.project.unlink(predecessor, successor);
         self.reschedule();
+    }
+
+    /// Add or replace the link that runs from the task on `row` into
+    /// `successor`.
+    ///
+    /// Deliberately no more than a turn of the same handle: adding a successor
+    /// to A is creating the link that makes A a predecessor of B, so this
+    /// resolves which row B is on and hands the work to `set_link`. One
+    /// representation, one rollback on a loop, one entry in the log, whichever
+    /// end the planner was looking at when they made the change.
+    pub fn set_successor_link(
+        &mut self,
+        row: usize,
+        successor: TaskId,
+        kind: LinkType,
+        lag_minutes: i64,
+    ) {
+        let Some(predecessor) = self.project.tasks.get(row).map(|t| t.id) else {
+            return;
+        };
+        let Some(into) = self.row_of(successor) else {
+            return;
+        };
+        self.set_link(into, predecessor, kind, lag_minutes);
+    }
+
+    /// Take off the link that runs from the task on `row` into `successor`.
+    pub fn remove_successor_link(&mut self, row: usize, successor: TaskId) {
+        let Some(predecessor) = self.project.tasks.get(row).map(|t| t.id) else {
+            return;
+        };
+        let Some(into) = self.row_of(successor) else {
+            return;
+        };
+        self.remove_link(into, predecessor);
     }
 
     /// Book or unbook a resource against an explicit row, with units.
@@ -6352,6 +6398,7 @@ impl AppState {
         };
         match column {
             Column::Predecessors => self.project.predecessor_text(task.id),
+            Column::Successors => self.project.successor_text(task.id),
             Column::Resources => self.project.resource_text(task),
             _ => String::new(),
         }
@@ -6696,20 +6743,25 @@ pub fn from_command_line() -> AppState {
     // Worked out before anything else can write a preference, since the answer
     // depends on the version this copy last ran as and that is recorded here.
     state.begin_greetings();
-    // One argument, and what it is decides what happens to it. A link is told
-    // from a path by its scheme rather than by guessing, because a guess about
-    // this is a guess about whether a network request is made.
-    match std::env::args().nth(1) {
-        Some(argument) if crate::cloud::share::looks_like_a_link(&argument) => {
+    // One argument, and what it is decides what happens to it. Read the same
+    // way the handoff reads it, so that opening a plan on a launch of its own
+    // and handing one to a launch already running cannot disagree about what
+    // the argument was.
+    //
+    // No question about unsaved work here, and none is needed: this runs
+    // before there is anything on screen to lose.
+    match std::env::args()
+        .nth(1)
+        .as_deref()
+        .and_then(crate::handoff::Handed::from_argument)
+    {
+        Some(crate::handoff::Handed::Link(link)) => {
             state.splash = false;
-            state.open_link_asked(&argument);
+            state.open_link_asked(&link);
         }
-        Some(argument) => {
-            let path = PathBuf::from(argument);
-            if path.is_file() {
-                state.splash = false;
-                state.open_any(path);
-            }
+        Some(crate::handoff::Handed::Path(path)) => {
+            state.splash = false;
+            state.open_any(path);
         }
         None => {}
     }
@@ -6800,6 +6852,7 @@ fn field_of(column: Column) -> Field {
         Column::Start => Field::Start,
         Column::Finish => Field::Finish,
         Column::Predecessors => Field::Predecessors,
+        Column::Successors => Field::Successors,
         Column::Resources => Field::ResourceNames,
     }
 }
@@ -8298,6 +8351,26 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_handed_over_by_another_launch_still_asks_about_unsaved_work() {
+        // A plan double clicked in the file manager goes to the copy that is
+        // already running, and it arrives by a different road from every other
+        // way of opening one. It must not arrive by a road that goes around
+        // the question: an afternoon's unsaved work is no less at stake for
+        // having been interrupted from outside the window.
+        let mut state = AppState::new();
+        state.dirty = true;
+        let handed = PathBuf::from("/home/ada/plans/bridge.aprj");
+        state.guard(PendingAction::Open(handed.clone()));
+        assert!(
+            matches!(
+                &state.dialog,
+                Some(Dialog::UnsavedChanges(PendingAction::Open(path))) if *path == handed
+            ),
+            "the question is asked, and remembers which plan it was asked about"
+        );
+    }
+
+    #[test]
     fn declining_to_save_goes_ahead_with_what_was_asked_for() {
         let mut state = AppState::new();
         state.dirty = true;
@@ -9287,5 +9360,129 @@ mod tests {
         // Documents when it is there, the home folder when it is not, but
         // always somewhere that exists rather than a guess.
         assert!(start.is_dir(), "the start folder must exist: {start:?}");
+    }
+
+    // ---- successors -----------------------------------------------------
+    //
+    // A successor is not stored. Every test here checks that editing one end
+    // moves the very link the other end is showing, because the moment there
+    // are two representations a plan can contradict itself.
+
+    /// Three unnested rows, so nothing is excluded for being somebody's child.
+    fn three() -> AppState {
+        let mut state = AppState::new();
+        state.project.tasks.clear();
+        state.project.links.clear();
+        for name in ["A", "B", "C"] {
+            state.project.push_task(name, MINUTES_PER_DAY);
+        }
+        state.reschedule();
+        state
+    }
+
+    #[test]
+    fn adding_a_successor_is_adding_the_predecessor_from_the_far_end() {
+        let mut state = three();
+        let (a, b) = (state.project.tasks[0].id, state.project.tasks[1].id);
+
+        state.set_successor_link(0, b, LinkType::FS, 0);
+
+        assert_eq!(state.project.links.len(), 1, "one link, not one per end");
+        assert!(state.project.link_exists(a, b));
+        // What B's own Predecessors view reads, unchanged code path.
+        assert_eq!(state.cell_text(1, Column::Predecessors), "1");
+        assert_eq!(state.cell_text(0, Column::Successors), "2");
+    }
+
+    #[test]
+    fn the_same_relationship_cannot_be_added_twice_from_opposite_ends() {
+        let mut state = three();
+        let (a, b) = (state.project.tasks[0].id, state.project.tasks[1].id);
+
+        state.set_successor_link(0, b, LinkType::FS, 0);
+        state.set_link(1, a, LinkType::FS, 0);
+
+        assert_eq!(state.project.links.len(), 1);
+    }
+
+    #[test]
+    fn editing_the_type_or_lag_from_either_end_moves_one_link() {
+        let mut state = three();
+        let (a, b) = (state.project.tasks[0].id, state.project.tasks[1].id);
+        state.set_link(1, a, LinkType::FS, 0);
+
+        // From the successor end.
+        state.set_successor_link(0, b, LinkType::SS, MINUTES_PER_DAY * 2);
+        assert_eq!(state.project.links.len(), 1);
+        assert_eq!(state.cell_text(1, Column::Predecessors), "1SS+2 days");
+
+        // And from the predecessor end, over the top of it.
+        state.set_link(1, a, LinkType::FF, -MINUTES_PER_DAY);
+        assert_eq!(state.project.links.len(), 1);
+        assert_eq!(state.cell_text(0, Column::Successors), "2FF-1 day");
+    }
+
+    #[test]
+    fn removing_a_successor_removes_the_link_rather_than_orphaning_it() {
+        let mut state = three();
+        let (a, b) = (state.project.tasks[0].id, state.project.tasks[1].id);
+
+        state.set_link(1, a, LinkType::FS, 0);
+        state.remove_successor_link(0, b);
+        assert!(state.project.links.is_empty(), "gone from both views at once");
+
+        // And the other way round: made from the successor end, taken off from
+        // the predecessor end.
+        state.set_successor_link(0, b, LinkType::FS, 0);
+        state.remove_link(1, a);
+        assert!(state.project.links.is_empty());
+    }
+
+    #[test]
+    fn a_successor_that_would_close_a_loop_is_refused() {
+        // Adding a successor closes a loop exactly as readily as adding a
+        // predecessor does, and a plan whose links form one cannot be
+        // scheduled at all. It has to be rolled back and said out loud.
+        let mut state = three();
+        let (a, b) = (state.project.tasks[0].id, state.project.tasks[1].id);
+        state.set_link(1, a, LinkType::FS, 0);
+        assert!(state.dialog.is_none());
+
+        // B before A, on top of A before B.
+        state.set_successor_link(1, a, LinkType::FS, 0);
+
+        assert!(!state.project.link_exists(b, a), "the loop was rolled back");
+        assert!(state.project.link_exists(a, b), "and the good link survives");
+        assert_eq!(state.project.links.len(), 1);
+        assert!(
+            matches!(&state.dialog, Some(Dialog::Message { title, .. }) if title.contains("link")),
+            "the refusal is reported the same way either end reports it"
+        );
+    }
+
+    #[test]
+    fn a_typed_successor_cell_reads_the_same_language_as_a_predecessor_cell() {
+        let mut state = three();
+        state.commit_cell(0, Column::Successors, "2FS+2d,3SS");
+
+        assert_eq!(state.project.links.len(), 2);
+        assert_eq!(state.cell_text(1, Column::Predecessors), "1FS+2 days");
+        assert_eq!(state.cell_text(2, Column::Predecessors), "1SS");
+    }
+
+    #[test]
+    fn a_typed_successor_cell_that_would_close_a_loop_is_refused() {
+        let mut state = three();
+        state.commit_cell(0, Column::Successors, "2");
+        assert!(state.dialog.is_none());
+
+        state.commit_cell(1, Column::Successors, "1");
+
+        assert_eq!(state.project.links.len(), 1, "rolled back to what worked");
+        assert!(state.project.link_exists(
+            state.project.tasks[0].id,
+            state.project.tasks[1].id
+        ));
+        assert!(matches!(state.dialog, Some(Dialog::Message { .. })));
     }
 }

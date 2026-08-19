@@ -98,12 +98,12 @@ fn close_behaviour() -> WindowCloseBehaviour {
 fn main() {
     steady_rendering();
 
-    // A link clicked while this application is already open belongs in the
-    // window that is already open. Two copies of one plan, each with its own
-    // change log and its own sync cursor, is the drift the sync protocol has a
-    // whole case for detecting, and starting one on purpose would be making it
-    // happen.
-    if handoff::claim(link_argument().as_deref()) == handoff::Claim::HandedOver {
+    // A link clicked, or a plan double clicked, while this application is
+    // already open belongs in the window that is already open. Two copies of
+    // one plan, each with its own change log and its own sync cursor, is the
+    // drift the sync protocol has a whole case for detecting, and starting one
+    // from the file manager would be making it happen.
+    if handoff::claim(handed_argument().as_ref()) == handoff::Claim::HandedOver {
         return;
     }
 
@@ -130,21 +130,21 @@ fn main() {
 /// so this build keeps the operating system's decorations.
 #[cfg(all(feature = "native", not(feature = "desktop")))]
 fn main() {
-    if handoff::claim(link_argument().as_deref()) == handoff::Claim::HandedOver {
+    if handoff::claim(handed_argument().as_ref()) == handoff::Claim::HandedOver {
         return;
     }
     dioxus_native::launch(App);
 }
 
-/// The link this launch was asked to open, if it was asked to open one.
+/// The plan this launch was asked to open, if it was asked to open one.
 ///
-/// Told from a file path by its scheme and by nothing else. Guessing would be
-/// guessing about whether a network request gets made, and the desktop hands
-/// over a URL and a path through the same argument.
-fn link_argument() -> Option<String> {
+/// A relative path is resolved here, in the process that was handed it, since
+/// the copy already running has a working directory of its own.
+fn handed_argument() -> Option<handoff::Handed> {
     std::env::args()
         .nth(1)
-        .filter(|argument| cloud::share::looks_like_a_link(argument))
+        .as_deref()
+        .and_then(handoff::Handed::from_argument)
 }
 
 /// The stylesheet, in a component of its own so it is written once.
@@ -421,21 +421,34 @@ fn App() -> Element {
         updates::ask_in_background(state);
     });
 
-    // Links handed over by later launches. Looked for on a timer because they
+    // Plans handed over by later launches. Looked for on a timer because they
     // arrive on a thread of its own and the plan may only be written where the
     // interface runs, which is the same arrangement the live socket uses.
     // Nothing is written unless something actually arrived, so an application
-    // nobody is sending links to is not redrawn by this.
+    // nobody is sending anything to is not redrawn by this.
     use_future(move || async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(HANDOFF_POLL_MILLIS)).await;
             // The last one, because they are all a request to open a plan and
             // only one plan is open at a time. Asking about three in a row
             // would be three dialogs for one intention.
-            if let Some(link) = handoff::arrivals().pop() {
-                state.write().open_link_asked(&link);
-                come_forward();
+            let Some(handed) = handoff::arrivals().pop() else {
+                continue;
+            };
+            match handed {
+                // Nothing is fetched here. The link names a server, and which
+                // server that is belongs in front of the person before a
+                // request goes to it.
+                handoff::Handed::Link(link) => state.write().open_link_asked(&link),
+                // Through the guard, not around it. Opening a plan discards
+                // whatever is on screen, and a plan arriving from the file
+                // manager is no more entitled to throw away an afternoon's
+                // unsaved work than one opened from the menu is.
+                handoff::Handed::Path(path) => {
+                    state.write().guard(crate::state::PendingAction::Open(path))
+                }
             }
+            come_forward();
         }
     });
 
@@ -545,6 +558,7 @@ fn App() -> Element {
         if let Some((row, column)) = editing {
             match column {
                 Column::Predecessors => rsx! { popups::PredecessorPopup { row } },
+                Column::Successors => rsx! { popups::SuccessorPopup { row } },
                 Column::Resources => rsx! { popups::ResourcePopup { row } },
                 _ => rsx! {},
             }
@@ -587,6 +601,14 @@ const HANDOFF_POLL_MILLIS: u64 = 250;
 
 /// Bring this window to the front, for when something outside it asked for
 /// something to happen in it.
+///
+/// Best effort, and it has to be said plainly: this asks, and a window manager
+/// is entitled to refuse. Wayland compositors in particular will not let a
+/// window that is not being interacted with raise itself, and will mark it as
+/// wanting attention instead. There is nothing this side of the toolkit that
+/// can do better, so what is here is the ask, and where it is declined the
+/// plan still opens in the window that was already running rather than in a
+/// second copy, which is the part that matters.
 #[cfg(feature = "desktop")]
 fn come_forward() {
     let window = dioxus::desktop::window();

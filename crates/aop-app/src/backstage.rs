@@ -1093,6 +1093,7 @@ fn ExportPage() -> Element {
 
     let mut excel_target = use_signal(|| format!("{}.xlsx", base.display()));
     let mut csv_target = use_signal(|| format!("{}.csv", base.display()));
+    let mut project_xml_target = use_signal(|| format!("{}.xml", base.display()));
     let mut html_target = use_signal(|| format!("{}.html", base.display()));
 
     rsx! {
@@ -1124,6 +1125,19 @@ fn ExportPage() -> Element {
             }
         }
 
+        h2 { class: "bs-sub", "Microsoft Project XML" }
+        div { class: "hint", style: "margin: 0 0 10px;",
+            "The whole plan in Microsoft's own interchange format: the outline, links with their lag, constraints, deadlines, resources, assignments and the calendars they are worked to. Microsoft Project opens it with File then Open, and can save it as .mpp itself." }
+        div { class: "bs-field",
+            label { "Save to" }
+            input { class: "bs-input", value: "{project_xml_target}",
+                oninput: move |event| project_xml_target.set(event.value()) }
+            button { class: "btn primary",
+                onclick: move |_| export_project_xml(&mut state, PathBuf::from(project_xml_target())),
+                "Export Project XML"
+            }
+        }
+
         h2 { class: "bs-sub", "Web page" }
         div { class: "hint", style: "margin: 0 0 10px;",
             "A standalone page with the chart drawn as SVG and the full task table. Opens in any browser." }
@@ -1140,6 +1154,34 @@ fn ExportPage() -> Element {
         div { class: "hint", style: "margin: 0 0 10px;",
             "Use Save As to write a .{persist::FILE_EXTENSION} file that this app can reopen." }
         button { class: "btn", onclick: move |_| state.write().backstage = Some(BackstagePage::SaveAs), "Go to Save As" }
+    }
+}
+
+/// Write the plan as Microsoft Project XML.
+///
+/// Reporting matches the other exports: a line on the page when it worked, a
+/// dialog when it did not. The plan is only borrowed for as long as the
+/// document takes to build, so the write itself is not holding the state open.
+fn export_project_xml(state: &mut Signal<AppState>, path: PathBuf) {
+    let path = path.with_extension("xml");
+    let written = {
+        let app = state.read();
+        aop_core::mspdi_write::save(&path, &app.project)
+    };
+    let mut app = state.write();
+    match written {
+        Ok(()) => {
+            let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            app.status = format!("Exported {}", path.display());
+            app.backstage_message = Some(format!("Saved {} ({bytes} bytes)", path.display()));
+        }
+        Err(error) => {
+            app.backstage_message = None;
+            app.dialog = Some(Dialog::Message {
+                title: "Could not export".into(),
+                body: format!("{}: {error}", path.display()),
+            });
+        }
     }
 }
 
@@ -1172,6 +1214,16 @@ fn SpreadsheetImport() -> Element {
     let mut which = use_signal(|| 0usize);
     let mut mapping = use_signal(|| Option::<Mapping>::None);
     let mut trouble = use_signal(|| Option::<String>::None);
+    // Whether to draw a card for every column of the sheet.
+    //
+    // Off by default, and that is not a detail of the drawing. A plan kept in
+    // a spreadsheet often has a weekly timeline drawn across it, which is
+    // dozens of columns of date headings and no data: this file runs out to
+    // column CU. Somebody mapping a sheet cares about the handful of columns
+    // that mean something, and putting a hundred cards in front of them buries
+    // those columns in noise as well as costing a dropdown and three rows of
+    // sampled data each, every time anything on the page changes.
+    let mut every_column = use_signal(|| false);
 
     let plan_name = source()
         .as_ref()
@@ -1297,7 +1349,23 @@ fn SpreadsheetImport() -> Element {
         })
         .collect();
 
-    let columns: Vec<(usize, String, String, Vec<String>)> = (0..sheet.width)
+    let placed = map.columns.iter().filter(|field| field.is_some()).count();
+    // Nothing mapped means nothing to show, and an empty step with a button
+    // under it is worse than the long list. That only happens on a sheet this
+    // could make no sense of at all, which is exactly when every column is
+    // worth looking at.
+    let all_columns = every_column() || placed == 0;
+    let shown: Vec<usize> = (0..sheet.width)
+        .filter(|column| {
+            all_columns || map.columns.get(*column).copied().flatten().is_some()
+        })
+        .collect();
+    let hidden = sheet.width.saturating_sub(shown.len());
+    // Sampled here rather than for the whole sheet, which is the other half of
+    // the saving: reading three values out of a column means walking it until
+    // three turn up, and an empty column is walked to the end.
+    let columns: Vec<(usize, String, String, Vec<String>)> = shown
+        .into_iter()
         .map(|column| {
             (
                 column,
@@ -1386,6 +1454,26 @@ fn SpreadsheetImport() -> Element {
         h3 { class: "imp-step", "The columns" }
         div { class: "hint", style: "margin: 0 0 8px;",
             "Every guess can be changed, and a column left out changes nothing in the plan. The rows under each heading are the file's own."
+        }
+        if hidden > 0 || every_column() {
+            div { class: "bs-field",
+                button { class: "btn",
+                    onclick: move |_| {
+                        let showing = every_column();
+                        every_column.set(!showing);
+                    },
+                    if all_columns {
+                        "Show only the columns with a guess"
+                    } else {
+                        "Show all {sheet.width} columns"
+                    }
+                }
+                if hidden > 0 {
+                    span { class: "hint",
+                        "{hidden} column(s) this made nothing of are not shown. A timeline drawn across the sheet lands here."
+                    }
+                }
+            }
         }
         div { class: "imp-cols",
             for (column, heading, code, samples) in columns {
@@ -1586,7 +1674,15 @@ fn Summary(report: Report) -> Element {
             if report.dropped_links > 0 {
                 div { class: "info-line",
                     span { class: "k", "Dependencies lost" }
-                    span { class: "v", "{report.dropped_links} pointed at rows that are not in this import" }
+                    span { class: "v", "{report.dropped_links} named a row that is not in this import, or were the other dependency column contradicting itself" }
+                }
+            }
+            if report.looped_links > 0 {
+                div { class: "info-line",
+                    span { class: "k", "Dependency loops" }
+                    span { class: "v",
+                        "{report.looped_links} would have made a task wait for itself. A plan with one of those in it cannot be scheduled at all, so they were left out and listed below"
+                    }
                 }
             }
             if report.work_unplaced > 0 {

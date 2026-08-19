@@ -1247,10 +1247,14 @@ impl Project {
         parts.join(",")
     }
 
-    /// Parse a Predecessors cell back into links. Row numbers are 1-based
-    /// positions in the current outline, matching what the grid displays.
-    pub fn parse_predecessor_text(&self, id: TaskId, text: &str) -> Vec<Link> {
-        let mut links = Vec::new();
+    /// Read a dependency cell into the task it names and the terms of the link.
+    ///
+    /// Shared by the Predecessors and the Successors cells, because the cell
+    /// text is the same language at both ends: a row number, an optional type
+    /// and an optional lag. Only which end of the `Link` the named task lands
+    /// on differs, and that is the caller's business.
+    fn parse_link_tokens(&self, text: &str) -> Vec<(TaskId, LinkType, i64)> {
+        let mut parsed = Vec::new();
         for token in text.split(&[',', ';'][..]) {
             let token = token.trim();
             if token.is_empty() {
@@ -1260,12 +1264,9 @@ impl Project {
             let Ok(row) = digits.parse::<usize>() else {
                 continue;
             };
-            let Some(predecessor) = self.tasks.get(row.saturating_sub(1)).map(|t| t.id) else {
+            let Some(named) = self.tasks.get(row.saturating_sub(1)).map(|t| t.id) else {
                 continue;
             };
-            if predecessor == id {
-                continue;
-            }
 
             let rest = &token[digits.len()..];
             let (kind_part, lag_part) = match rest.find(['+', '-']) {
@@ -1287,20 +1288,88 @@ impl Project {
                 }
             };
 
-            links.push(Link {
+            parsed.push((named, kind, lag_minutes));
+        }
+        parsed
+    }
+
+    /// Parse a Predecessors cell back into links. Row numbers are 1-based
+    /// positions in the current outline, matching what the grid displays.
+    pub fn parse_predecessor_text(&self, id: TaskId, text: &str) -> Vec<Link> {
+        self.parse_link_tokens(text)
+            .into_iter()
+            .filter(|(named, _, _)| *named != id)
+            .map(|(predecessor, kind, lag_minutes)| Link {
                 predecessor,
                 successor: id,
                 kind,
                 lag_minutes,
-            });
-        }
-        links
+            })
+            .collect()
     }
 
     /// Replace every incoming link of `id` with the ones described by `text`.
     pub fn set_predecessor_text(&mut self, id: TaskId, text: &str) {
         let parsed = self.parse_predecessor_text(id, text);
         self.links.retain(|l| l.successor != id);
+        for link in parsed {
+            if !self.link_exists(link.predecessor, link.successor) {
+                self.links.push(link);
+            }
+        }
+    }
+
+    /// The Successors cell text, in the same shape the Predecessors cell uses.
+    ///
+    /// A successor is not a second kind of thing to store: it is the very same
+    /// `Link`, read from the other end. The row number names the task on the
+    /// far side, and the type and lag belong to the link, so they read
+    /// identically whichever end the planner is looking from.
+    pub fn successor_text(&self, id: TaskId) -> String {
+        let mut parts = Vec::new();
+        for link in self.successors_of(id) {
+            let Some(index) = self.index_of(link.successor) else {
+                continue;
+            };
+            let row = index + 1;
+            let mut text = row.to_string();
+            if link.kind != LinkType::FS || link.lag_minutes != 0 {
+                text.push_str(link.kind.code());
+            }
+            if link.lag_minutes != 0 {
+                let sign = if link.lag_minutes > 0 { "+" } else { "-" };
+                text.push_str(sign);
+                text.push_str(&crate::duration::format_duration(link.lag_minutes.abs()));
+            }
+            parts.push(text);
+        }
+        parts.join(",")
+    }
+
+    /// Parse a Successors cell back into links, the mirror of
+    /// `parse_predecessor_text`: the row numbers name the tasks that wait on
+    /// `id`, so `id` is the predecessor of every link this returns.
+    pub fn parse_successor_text(&self, id: TaskId, text: &str) -> Vec<Link> {
+        self.parse_link_tokens(text)
+            .into_iter()
+            .filter(|(named, _, _)| *named != id)
+            .map(|(successor, kind, lag_minutes)| Link {
+                predecessor: id,
+                successor,
+                kind,
+                lag_minutes,
+            })
+            .collect()
+    }
+
+    /// Replace every outgoing link of `id` with the ones described by `text`.
+    ///
+    /// Outgoing, because that is what a Successors cell lists. Editing it
+    /// leaves what `id` waits for untouched, exactly as editing a Predecessors
+    /// cell leaves what waits on `id` untouched.
+    pub fn set_successor_text(&mut self, id: TaskId, text: &str) {
+        let parsed = self.parse_successor_text(id, text);
+        self.links.retain(|l| l.predecessor != id);
         for link in parsed {
             if !self.link_exists(link.predecessor, link.successor) {
                 self.links.push(link);
@@ -1781,5 +1850,90 @@ mod drawing_tests {
         let back: Project = serde_json::from_value(json).expect("an older plan still opens");
         assert!(back.drawings.is_empty());
         assert_eq!(back.tasks.len(), project.tasks.len());
+    }
+}
+
+/// Successors, which are predecessors read backwards.
+///
+/// Nothing here builds a successor list. There is none to build: every one of
+/// these reads `Project.links` from the far end, which is the whole reason the
+/// two views cannot contradict each other.
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+
+    fn linked() -> Project {
+        let start = NaiveDate::from_ymd_opt(2026, 1, 5)
+            .and_then(|d| d.and_hms_opt(8, 0, 0))
+            .expect("a real date");
+        let mut project = Project::blank(start);
+        project.push_task("A", MINUTES_PER_DAY);
+        project.push_task("B", MINUTES_PER_DAY);
+        project.push_task("C", MINUTES_PER_DAY);
+        project
+    }
+
+    #[test]
+    fn a_successor_is_the_same_link_read_from_the_other_end() {
+        let mut project = linked();
+        let (a, b) = (project.tasks[0].id, project.tasks[1].id);
+
+        // Written as A's successor.
+        project.set_successor_text(a, "2FS+2d");
+
+        // Read back as B's predecessor, because there is only the one link.
+        assert_eq!(project.links.len(), 1);
+        assert_eq!(project.predecessor_text(b), "1FS+2 days");
+        assert_eq!(project.successor_text(a), "2FS+2 days");
+        assert!(project.link_exists(a, b));
+    }
+
+    #[test]
+    fn each_end_edits_its_own_links_and_leaves_the_others_alone() {
+        // A Successors cell lists what waits on the task. Setting it must not
+        // disturb what the task itself waits for, or a planner tidying one
+        // column would silently cut the other.
+        let mut project = linked();
+        let (a, b, c) = (
+            project.tasks[0].id,
+            project.tasks[1].id,
+            project.tasks[2].id,
+        );
+        project.set_predecessor_text(b, "1");
+        project.set_successor_text(b, "3");
+        assert_eq!(project.links.len(), 2);
+
+        project.set_successor_text(b, "");
+        assert!(project.link_exists(a, b), "what B waits for is untouched");
+        assert!(!project.link_exists(b, c));
+
+        project.set_predecessor_text(b, "");
+        assert!(project.links.is_empty());
+    }
+
+    #[test]
+    fn a_successor_cell_cannot_name_its_own_row() {
+        let mut project = linked();
+        let a = project.tasks[0].id;
+        project.set_successor_text(a, "1,2");
+        assert_eq!(project.links.len(), 1, "only B survives");
+        assert_eq!(project.successor_text(a), "2");
+    }
+
+    #[test]
+    fn the_type_and_lag_belong_to_the_link_not_to_either_end() {
+        // The same characters mean the same thing in both cells, so a planner
+        // can type `2SS-1d` at either end and describe one relationship.
+        let mut project = linked();
+        let (a, b) = (project.tasks[0].id, project.tasks[1].id);
+
+        project.set_predecessor_text(b, "1SS-1d");
+        assert_eq!(project.successor_text(a), "2SS-1 day");
+
+        project.set_successor_text(a, "2FF+3d");
+        assert_eq!(project.links.len(), 1, "edited, not doubled");
+        assert_eq!(project.predecessor_text(b), "1FF+3 days");
     }
 }

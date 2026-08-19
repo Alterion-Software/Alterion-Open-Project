@@ -329,7 +329,7 @@ fn TaskInformation(row: usize) -> Element {
     rsx! {
         Head { title: "Task Information".to_string() }
         div { class: "dlg-tabs",
-            for (index, label) in ["General", "Predecessors", "Resources", "Advanced", "Notes"].iter().enumerate() {
+            for (index, label) in ["General", "Predecessors", "Successors", "Resources", "Advanced", "Notes"].iter().enumerate() {
                 {
                     let class = if tab() == index { "dlg-tab active" } else { "dlg-tab" };
                     rsx! {
@@ -382,16 +382,24 @@ fn TaskInformation(row: usize) -> Element {
                 // The same picker the grid opens, so there is one way to set a
                 // dependency rather than two that behave differently.
                 1 => rsx! {
-                    crate::popups::PredecessorPicker { row }
+                    crate::popups::LinkPicker { row, end: crate::popups::LinkEnd::Predecessors }
+                },
+
+                // ---- Successors -----------------------------------------
+                // The same picker again, pointed the other way. A successor is
+                // the link this task is the predecessor of, so the tab that
+                // sets one is the tab that sets a predecessor read backwards.
+                2 => rsx! {
+                    crate::popups::LinkPicker { row, end: crate::popups::LinkEnd::Successors }
                 },
 
                 // ---- Resources ------------------------------------------
-                2 => rsx! {
+                3 => rsx! {
                     crate::popups::ResourcePicker { row }
                 },
 
                 // ---- Advanced -------------------------------------------
-                3 => rsx! {
+                4 => rsx! {
                     div { class: "form-row",
                         label { "Constrain task" }
                         Dropdown {

@@ -12,7 +12,7 @@ name = "alterion-open-project"
 path = "src/main.rs"
 
 [dependencies]
-aop-core = { version = "1.0.3-beta", path = "../aop-core" }
+aop-core = { version = "1.0.4-beta", path = "../aop-core" }
 chrono.workspace = true
 dioxus = { version = "0.7.10" }
 serde.workspace = true

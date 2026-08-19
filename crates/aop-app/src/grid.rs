@@ -36,6 +36,7 @@ fn editor_for(field: Field) -> Option<Column> {
         Field::Start => Some(Column::Start),
         Field::Finish => Some(Column::Finish),
         Field::Predecessors => Some(Column::Predecessors),
+        Field::Successors => Some(Column::Successors),
         Field::ResourceNames => Some(Column::Resources),
         _ => None,
     }
@@ -43,11 +44,24 @@ fn editor_for(field: Field) -> Option<Column> {
 
 /// Fields edited by a floating picker rather than by a text box in the cell.
 ///
-/// Both of these name other rows, so a list with the outline visible is the
-/// only way to pick one without knowing its number by heart. The picker still
-/// takes typed numbers, for planners who do.
+/// Every one of these names other rows, so a list with the outline visible is
+/// the only way to pick one without knowing its number by heart. The picker
+/// still takes typed numbers, for planners who do.
 fn edits_in_a_popup(field: Field) -> bool {
-    matches!(field, Field::Predecessors | Field::ResourceNames)
+    popup_column(field).is_some()
+}
+
+/// The cell editor a picker field opens.
+///
+/// One place says which column a field belongs to, so the grid cannot open the
+/// predecessor picker over a Successors cell.
+fn popup_column(field: Field) -> Option<Column> {
+    match field {
+        Field::Predecessors => Some(Column::Predecessors),
+        Field::Successors => Some(Column::Successors),
+        Field::ResourceNames => Some(Column::Resources),
+        _ => None,
+    }
 }
 
 fn align_class(align: Align) -> &'static str {
@@ -62,7 +76,7 @@ fn align_class(align: Align) -> &'static str {
 #[component]
 /// The editor for a cell that a picker also writes to.
 ///
-/// Two things edit a predecessor cell: this box, and the tick list floating
+/// Two things edit a dependency cell: this box, and the tick list floating
 /// under it. Both read and write `AppState::cell_draft`, so whichever moves
 /// last is what the cell says. Committing happens on Enter or when the picker
 /// is dismissed, never on blur, since clicking a tick box blurs this input.
@@ -485,14 +499,9 @@ pub fn TaskGrid() -> Element {
                                                                 // Predecessors and resources name other
                                                                 // rows, so one click opens the list rather
                                                                 // than making the planner recall a number.
-                                                                if edits_in_a_popup(field) {
+                                                                if let Some(column) = popup_column(field) {
                                                                     event.stop_propagation();
                                                                     let point = event.client_coordinates();
-                                                                    let column = if field == Field::Predecessors {
-                                                                        Column::Predecessors
-                                                                    } else {
-                                                                        Column::Resources
-                                                                    };
                                                                     let mut writer = state.write();
                                                                     writer.select(index);
                                                                     writer.edit_cell_at(index, column, point.x, point.y);
@@ -511,14 +520,11 @@ pub fn TaskGrid() -> Element {
 
                                                             ondoubleclick: move |event| match field {
                                                                 // These open a picker, not a text box.
-                                                                Field::Predecessors | Field::ResourceNames => {
+                                                                field if edits_in_a_popup(field) => {
                                                                     let point = event.client_coordinates();
-                                                                    let column = if field == Field::Predecessors {
-                                                                        Column::Predecessors
-                                                                    } else {
-                                                                        Column::Resources
-                                                                    };
-                                                                    state.write().edit_cell_at(index, column, point.x, point.y);
+                                                                    if let Some(column) = popup_column(field) {
+                                                                        state.write().edit_cell_at(index, column, point.x, point.y);
+                                                                    }
                                                                 }
                                                                 Field::TaskMode => {
                                                                     let next = if state.read().project.tasks[index].mode
@@ -647,12 +653,7 @@ fn cell_body(
     // shared state so ticking a box in the picker and typing here cannot
     // disagree, and it does not commit on blur, because clicking the picker
     // blurs it.
-    if is_editing && edits_in_a_popup(field) {
-        let column = if field == Field::Predecessors {
-            Column::Predecessors
-        } else {
-            Column::Resources
-        };
+    if is_editing && let Some(column) = popup_column(field) {
         return rsx! { PickerCellEditor { row: index, column } };
     }
 

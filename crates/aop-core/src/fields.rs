@@ -421,6 +421,7 @@ impl Field {
                 | Field::Start
                 | Field::Finish
                 | Field::Predecessors
+                | Field::Successors
                 | Field::ResourceNames
                 | Field::PercentComplete
                 | Field::FixedCost
@@ -462,13 +463,10 @@ impl Field {
             Field::FreeSlack => signed(task.scheduled.free_slack_minutes),
             Field::Critical => yes_no(task.scheduled.critical),
             Field::Predecessors => project.predecessor_text(task.id),
-            Field::Successors => project
-                .successors_of(task.id)
-                .into_iter()
-                .filter_map(|link| project.index_of(link.successor))
-                .map(|i| (i + 1).to_string())
-                .collect::<Vec<_>>()
-                .join(","),
+            // The same links the Predecessors cell shows, read from the other
+            // end, and written in the same language so that a planner can type
+            // `5FS+2d` into either cell and mean the one relationship.
+            Field::Successors => project.successor_text(task.id),
             Field::ConstraintType => task.constraint.label().to_string(),
             Field::ConstraintDate => task
                 .constraint_date

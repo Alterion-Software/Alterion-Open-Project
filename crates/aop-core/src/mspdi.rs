@@ -15,8 +15,10 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use crate::calendar::{CalendarException, DayShifts, Shift, WorkCalendar};
+use crate::earned_value::EarnedValueMethod;
 use crate::model::{
-    Assignment, ConstraintType, Link, LinkType, Project, Resource, ResourceKind, Task, TaskMode,
+    Assignment, Baseline, ConstraintType, Link, LinkType, Project, Resource, ResourceKind,
+    ScheduleFrom, Task, TaskMode,
 };
 use crate::MINUTES_PER_DAY;
 
@@ -82,12 +84,39 @@ struct RawTask {
     summary: bool,
     manual: bool,
     active: bool,
+    estimated: bool,
     notes: String,
     fixed_cost: f64,
     constraint_type: u8,
     constraint_date: Option<NaiveDateTime>,
     deadline: Option<NaiveDateTime>,
+    /// The calendar this task is worked to, when the file names one.
+    calendar_uid: Option<u32>,
+    ignore_resource_calendars: bool,
+    /// What really happened, for a plan that has been tracked.
+    actual_start: Option<NaiveDateTime>,
+    actual_finish: Option<NaiveDateTime>,
+    actual_work_minutes: i64,
+    actual_cost: f64,
+    remaining_work_minutes: i64,
+    physical_percent_complete: Option<u8>,
+    earned_value_method: u8,
+    /// Baseline zero. Project keeps eleven; this model keeps the one that
+    /// every variance in it is measured against.
+    baseline: Option<Baseline>,
     predecessors: Vec<(u32, u8, i64, u8)>,
+}
+
+/// One `<Baseline>` as the file states it. Every part is optional there, and a
+/// baseline with no dates is not one this model can hold.
+#[derive(Default)]
+struct RawBaseline {
+    number: u8,
+    start: Option<NaiveDateTime>,
+    finish: Option<NaiveDateTime>,
+    duration_minutes: i64,
+    work_minutes: i64,
+    cost: f64,
 }
 
 /// One `<Calendar>` as the file states it, before inheritance is resolved.
@@ -114,10 +143,16 @@ struct RawResource {
     initials: String,
     group: String,
     kind: u8,
+    /// Project 2007 has no resource type for money, so a cost resource is a
+    /// work resource carrying this flag instead.
+    is_cost: bool,
     max_units: f64,
     standard_rate: f64,
     overtime_rate: f64,
     cost_per_use: f64,
+    notes: String,
+    email: String,
+    code: String,
 }
 
 /// Project's ConstraintType codes.
@@ -145,7 +180,7 @@ fn link_from(code: u8) -> LinkType {
 }
 
 /// Project writes durations as an ISO 8601 period, for example `PT40H0M0S`.
-fn parse_iso_duration(text: &str) -> Option<i64> {
+pub(crate) fn parse_iso_duration(text: &str) -> Option<i64> {
     let text = text.trim();
     let rest = text.strip_prefix('P')?;
     let (date_part, time_part) = match rest.split_once('T') {
@@ -200,6 +235,45 @@ fn parse_datetime(text: &str) -> Option<NaiveDateTime> {
                 .ok()
                 .and_then(|d| d.and_hms_opt(8, 0, 0))
         })
+}
+
+/// The text an element collected, with the whitespace a pretty printer put
+/// around it taken off. The trim happens once over the whole run rather than
+/// per piece, because a name split at an entity has real spaces inside it.
+fn take_text(buffer: &mut String) -> String {
+    let trimmed = buffer.trim();
+    if trimmed.len() == buffer.len() {
+        return std::mem::take(buffer);
+    }
+    let value = trimmed.to_string();
+    buffer.clear();
+    value
+}
+
+/// Put back the character an `&...;` reference stood for.
+///
+/// A reference this does not know is written back as it was found rather than
+/// dropped: losing a run of text silently is what this whole path is here to
+/// stop, and a file carrying its own entity declarations is better read
+/// slightly wrong than read short.
+fn push_reference(buffer: &mut String, reference: &quick_xml::events::BytesRef<'_>) {
+    if let Ok(Some(resolved)) = reference.resolve_char_ref() {
+        buffer.push(resolved);
+        return;
+    }
+    let name = reference.decode().unwrap_or_default();
+    match name.as_ref() {
+        "amp" => buffer.push('&'),
+        "lt" => buffer.push('<'),
+        "gt" => buffer.push('>'),
+        "quot" => buffer.push('"'),
+        "apos" => buffer.push('\''),
+        other => {
+            buffer.push('&');
+            buffer.push_str(other);
+            buffer.push(';');
+        }
+    }
 }
 
 fn parse_bool(text: &str) -> bool {
@@ -301,11 +375,21 @@ fn resolve_calendars(raws: &[RawCalendar]) -> HashMap<u32, WorkCalendar> {
 /// Parse an MSPDI document into a plan.
 pub fn from_xml(text: &str) -> Result<Project, ImportError> {
     let mut reader = Reader::from_str(text);
-    reader.config_mut().trim_text(true);
+    // Deliberately not trimming each text event. The parser breaks a run of
+    // text at every entity, and trimming the pieces would eat the spaces
+    // either side of an `&` in a task name. The whitespace a pretty printer
+    // leaves between elements is taken off once, in `take_text`, where the
+    // whole run is back in one piece.
+    reader.config_mut().trim_text(false);
 
     let mut seen_project = false;
     let mut project_name = String::new();
     let mut project_start: Option<NaiveDateTime> = None;
+    let mut project_finish: Option<NaiveDateTime> = None;
+    let mut status_date: Option<NaiveDateTime> = None;
+    let mut current_date: Option<NaiveDateTime> = None;
+    let mut schedule_from_start = true;
+    let mut critical_slack_days: i64 = 0;
     let mut author = String::new();
     let mut company = String::new();
     let mut currency = String::new();
@@ -323,6 +407,7 @@ pub fn from_xml(text: &str) -> Result<Project, ImportError> {
 
     // Scratch rows for whichever element is open.
     let mut task = RawTask::default();
+    let mut baseline = RawBaseline::default();
     let mut resource = RawResource::default();
     let mut predecessor: (u32, u8, i64, u8) = (0, 1, 0, 7);
     let mut assignment: (u32, u32, f64) = (0, 0, 1.0);
@@ -364,6 +449,7 @@ pub fn from_xml(text: &str) -> Result<Project, ImportError> {
                         };
                     }
                     "PredecessorLink" => predecessor = (0, 1, 0, 7),
+                    "Baseline" => baseline = RawBaseline::default(),
                     "Assignment" => assignment = (0, 0, 1.0),
                     "Calendar" if path.last().map(String::as_str) == Some("Calendars") => {
                         calendar = RawCalendar::default();
@@ -393,13 +479,27 @@ pub fn from_xml(text: &str) -> Result<Project, ImportError> {
                 text_buffer.clear();
             }
 
+            // An element's text arrives in pieces rather than in one event:
+            // the parser breaks the run at every `&...;`, so a task named
+            // "R&D" comes through as "R", a reference, then "D". Appending
+            // rather than replacing is what keeps the first two.
             Ok(Event::Text(bytes)) => {
-                text_buffer = bytes.decode().map(|c| c.to_string()).unwrap_or_default();
+                if let Ok(chunk) = bytes.decode() {
+                    text_buffer.push_str(&chunk);
+                }
+            }
+            Ok(Event::CData(bytes)) => {
+                if let Ok(chunk) = bytes.decode() {
+                    text_buffer.push_str(&chunk);
+                }
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                push_reference(&mut text_buffer, &reference);
             }
 
             Ok(Event::End(element)) => {
                 let name = String::from_utf8_lossy(element.local_name().as_ref()).to_string();
-                let value = std::mem::take(&mut text_buffer);
+                let value = take_text(&mut text_buffer);
                 path.pop();
                 let parent = path.last().map(String::as_str).unwrap_or("");
 
@@ -411,6 +511,13 @@ pub fn from_xml(text: &str) -> Result<Project, ImportError> {
                         }
                     }
                     ("Project", "StartDate") => project_start = parse_datetime(&value),
+                    ("Project", "FinishDate") => project_finish = parse_datetime(&value),
+                    ("Project", "StatusDate") => status_date = parse_datetime(&value),
+                    ("Project", "CurrentDate") => current_date = parse_datetime(&value),
+                    ("Project", "ScheduleFromStart") => schedule_from_start = parse_bool(&value),
+                    ("Project", "CriticalSlackLimit") => {
+                        critical_slack_days = value.trim().parse().unwrap_or(0)
+                    }
                     ("Project", "CalendarUID") => {
                         project_calendar_uid = value.trim().parse().ok()
                     }
@@ -438,6 +545,27 @@ pub fn from_xml(text: &str) -> Result<Project, ImportError> {
                     ("Task", "Summary") => task.summary = parse_bool(&value),
                     ("Task", "Manual") => task.manual = parse_bool(&value),
                     ("Task", "Active") => task.active = parse_bool(&value),
+                    ("Task", "Estimated") => task.estimated = parse_bool(&value),
+                    ("Task", "CalendarUID") => task.calendar_uid = value.trim().parse().ok(),
+                    ("Task", "IgnoreResourceCalendar") => {
+                        task.ignore_resource_calendars = parse_bool(&value)
+                    }
+                    ("Task", "ActualStart") => task.actual_start = parse_datetime(&value),
+                    ("Task", "ActualFinish") => task.actual_finish = parse_datetime(&value),
+                    ("Task", "ActualWork") => {
+                        task.actual_work_minutes = parse_iso_duration(&value).unwrap_or(0)
+                    }
+                    ("Task", "ActualCost") => task.actual_cost = value.trim().parse().unwrap_or(0.0),
+                    ("Task", "RemainingWork") => {
+                        task.remaining_work_minutes = parse_iso_duration(&value).unwrap_or(0)
+                    }
+                    ("Task", "PhysicalPercentComplete") => {
+                        task.physical_percent_complete =
+                            value.trim().parse::<u8>().ok().map(|p| p.min(100))
+                    }
+                    ("Task", "EarnedValueMethod") => {
+                        task.earned_value_method = value.trim().parse().unwrap_or(0)
+                    }
                     ("Task", "Notes") => task.notes = value,
                     ("Task", "FixedCost") => task.fixed_cost = value.trim().parse().unwrap_or(0.0),
                     ("Task", "ConstraintType") => {
@@ -445,6 +573,33 @@ pub fn from_xml(text: &str) -> Result<Project, ImportError> {
                     }
                     ("Task", "ConstraintDate") => task.constraint_date = parse_datetime(&value),
                     ("Task", "Deadline") => task.deadline = parse_datetime(&value),
+                    ("Baseline", "Number") => baseline.number = value.trim().parse().unwrap_or(0),
+                    ("Baseline", "Start") => baseline.start = parse_datetime(&value),
+                    ("Baseline", "Finish") => baseline.finish = parse_datetime(&value),
+                    ("Baseline", "Duration") => {
+                        baseline.duration_minutes = parse_iso_duration(&value).unwrap_or(0)
+                    }
+                    ("Baseline", "Work") => {
+                        baseline.work_minutes = parse_iso_duration(&value).unwrap_or(0)
+                    }
+                    ("Baseline", "Cost") => baseline.cost = value.trim().parse().unwrap_or(0.0),
+                    ("Task", "Baseline") => {
+                        // Project keeps eleven baselines; this model keeps the
+                        // first, which is the one every variance is measured
+                        // against, and ignores the interim saves.
+                        let raw = std::mem::take(&mut baseline);
+                        if raw.number == 0
+                            && let (Some(start), Some(finish)) = (raw.start, raw.finish)
+                        {
+                            task.baseline = Some(Baseline {
+                                start,
+                                finish,
+                                duration_minutes: raw.duration_minutes,
+                                work_minutes: raw.work_minutes,
+                                cost: raw.cost,
+                            });
+                        }
+                    }
                     ("Tasks", "Task") => tasks.push(std::mem::take(&mut task)),
 
                     // ---- links ------------------------------------------
@@ -469,6 +624,10 @@ pub fn from_xml(text: &str) -> Result<Project, ImportError> {
                     ("Resource", "Initials") => resource.initials = value,
                     ("Resource", "Group") => resource.group = value,
                     ("Resource", "Type") => resource.kind = value.trim().parse().unwrap_or(1),
+                    ("Resource", "IsCostResource") => resource.is_cost = parse_bool(&value),
+                    ("Resource", "Notes") => resource.notes = value,
+                    ("Resource", "EmailAddress") => resource.email = value,
+                    ("Resource", "Code") => resource.code = value,
                     ("Resource", "MaxUnits") => {
                         resource.max_units = value.trim().parse().unwrap_or(1.0)
                     }
@@ -569,11 +728,18 @@ pub fn from_xml(text: &str) -> Result<Project, ImportError> {
     }
 
     Ok(assemble(
-        project_name,
-        project_start,
-        author,
-        company,
-        currency,
+        Header {
+            name: project_name,
+            start: project_start,
+            finish: project_finish,
+            status_date,
+            current_date,
+            schedule_from_start,
+            critical_slack_days,
+            author,
+            company,
+            currency,
+        },
         tasks,
         resources,
         assignments,
@@ -582,19 +748,41 @@ pub fn from_xml(text: &str) -> Result<Project, ImportError> {
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn assemble(
+/// What the file said about the plan itself, before any of its rows.
+struct Header {
     name: String,
     start: Option<NaiveDateTime>,
+    finish: Option<NaiveDateTime>,
+    status_date: Option<NaiveDateTime>,
+    current_date: Option<NaiveDateTime>,
+    schedule_from_start: bool,
+    critical_slack_days: i64,
     author: String,
     company: String,
     currency: String,
+}
+
+fn assemble(
+    header: Header,
     raw_tasks: Vec<RawTask>,
     raw_resources: Vec<RawResource>,
     assignments: Vec<(u32, u32, f64)>,
     raw_calendars: Vec<RawCalendar>,
     project_calendar_uid: Option<u32>,
 ) -> Project {
+    let Header {
+        name,
+        start,
+        finish,
+        status_date,
+        current_date,
+        schedule_from_start,
+        critical_slack_days,
+        author,
+        company,
+        currency,
+    } = header;
+
     let fallback_start = start
         .or_else(|| raw_tasks.iter().filter_map(|t| t.start).min())
         .unwrap_or_else(|| {
@@ -615,6 +803,19 @@ fn assemble(
     if !currency.trim().is_empty() {
         project.currency_symbol = currency;
     }
+    if let Some(finish) = finish {
+        project.finish_date = finish;
+    }
+    project.status_date = status_date;
+    if let Some(current) = current_date {
+        project.current_date = current;
+    }
+    project.schedule_from = if schedule_from_start {
+        ScheduleFrom::ProjectStartDate
+    } else {
+        ScheduleFrom::ProjectFinishDate
+    };
+    project.critical_slack_minutes = critical_slack_days.max(0) * MINUTES_PER_DAY;
 
     // ---- the calendar library -------------------------------------------
     //
@@ -678,6 +879,20 @@ fn assemble(
         task.notes = raw.notes.clone();
         task.fixed_cost = raw.fixed_cost;
         task.active = raw.active;
+        task.estimated = raw.estimated;
+        task.ignore_resource_calendars = raw.ignore_resource_calendars;
+        task.actual_start = raw.actual_start;
+        task.actual_finish = raw.actual_finish;
+        task.actual_work_minutes = raw.actual_work_minutes;
+        task.actual_cost = raw.actual_cost;
+        task.remaining_work_minutes = raw.remaining_work_minutes;
+        task.physical_percent_complete = raw.physical_percent_complete;
+        task.earned_value_method = if raw.earned_value_method == 1 {
+            EarnedValueMethod::PhysicalPercentComplete
+        } else {
+            EarnedValueMethod::PercentComplete
+        };
+        task.baseline = raw.baseline;
         task.mode = if raw.manual { TaskMode::Manual } else { TaskMode::Auto };
         task.manual_start = if raw.manual { raw.start } else { None };
         task.constraint = constraint_from(raw.constraint_type);
@@ -718,10 +933,14 @@ fn assemble(
         }
         resource.group = raw.group.clone();
         resource.kind = match raw.kind {
+            _ if raw.is_cost => ResourceKind::Cost,
             0 => ResourceKind::Material,
             2 => ResourceKind::Cost,
             _ => ResourceKind::Work,
         };
+        resource.notes = raw.notes.clone();
+        resource.email = raw.email.clone();
+        resource.code = raw.code.clone();
         resource.max_units = if raw.max_units > 0.0 { raw.max_units } else { 1.0 };
         resource.standard_rate = raw.standard_rate;
         resource.overtime_rate = raw.overtime_rate;
@@ -759,6 +978,21 @@ fn assemble(
         }
 
         project.resources.push(resource);
+    }
+
+    // Task calendars come after the people, because a task can be worked to a
+    // calendar that only became a library entry when the person who keeps to
+    // it was read. A task pointed at somebody's personal calendar is left
+    // alone: that is one person's leave, not a working week a task can follow.
+    for raw in &rows {
+        let Some(uid) = raw.calendar_uid else { continue };
+        let (Some(&id), Some(name)) = (uid_to_id.get(&raw.uid), library_name.get(&uid)) else {
+            continue;
+        };
+        let name = name.clone();
+        if let Some(task) = project.task_mut(id) {
+            task.calendar = name;
+        }
     }
 
     for (task_uid, resource_uid, units) in assignments {

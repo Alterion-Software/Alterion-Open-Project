@@ -217,6 +217,15 @@ pub fn survey(path: &std::path::Path) -> Result<Vec<Sheet>, SheetError> {
 /// Excel counts days from this, which it treats as day zero.
 const SERIAL_EPOCH: (i32, u32, u32) = (1899, 12, 30);
 
+/// The earliest date this will believe somebody typed.
+///
+/// An empty or zeroed date cell comes out of a workbook as a serial at or near
+/// zero, which lands in the last two days of 1899. Nobody plans work then, and
+/// one of them getting through is not a wrong date on one task: the plan's own
+/// start is the earliest start in the sheet, so a single zero drags the whole
+/// timescale back a century and every report with it.
+const EARLIEST_REAL_DATE: (i32, u32, u32) = (1900, 1, 2);
+
 fn convert(data: &calamine::Data) -> Cell {
     use calamine::Data;
     match data {
@@ -282,9 +291,12 @@ fn parse_iso(text: &str) -> Option<Cell> {
 ///
 /// The list is what `excel::COLUMNS` writes out, plus the two the exporter
 /// carries in the shape of the sheet rather than in a column of its own:
-/// outline level, which it writes as indentation, and notes. WBS is not here
-/// because a WBS code is a rendering of the outline level rather than a second
-/// fact, so a column of them maps to Outline Level and is read for its depth.
+/// outline level, which it writes as indentation, and notes. WBS is not a
+/// field of its own because a WBS code is a rendering of the outline level
+/// rather than a second fact, so a column of them maps to Outline Level and is
+/// read for its depth. It is read for its identity as well: the codes in that
+/// column are what a Predecessors column full of `4.2.31.1` is citing, and a
+/// sheet that cites them has no other identifier to offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     /// The sheet's own row numbers, which is what its Predecessors column
@@ -298,6 +310,9 @@ pub enum Field {
     Finish,
     PercentComplete,
     Predecessors,
+    /// The other end of the same relationship, which some sheets keep beside
+    /// the first. Importing one means creating the link on the other task.
+    Successors,
     Resources,
     Work,
     Cost,
@@ -305,7 +320,7 @@ pub enum Field {
 }
 
 impl Field {
-    pub const ALL: [Field; 12] = [
+    pub const ALL: [Field; 13] = [
         Field::Id,
         Field::Name,
         Field::OutlineLevel,
@@ -314,6 +329,7 @@ impl Field {
         Field::Finish,
         Field::PercentComplete,
         Field::Predecessors,
+        Field::Successors,
         Field::Resources,
         Field::Work,
         Field::Cost,
@@ -330,6 +346,7 @@ impl Field {
             Field::Finish => "Finish",
             Field::PercentComplete => "% Complete",
             Field::Predecessors => "Predecessors",
+            Field::Successors => "Successors",
             Field::Resources => "Resources",
             Field::Work => "Work",
             Field::Cost => "Cost",
@@ -347,7 +364,8 @@ impl Field {
             Field::Start => "When it starts",
             Field::Finish => "When it ends",
             Field::PercentComplete => "How much of it is done",
-            Field::Predecessors => "What it waits for, as row numbers",
+            Field::Predecessors => "What it waits for, by row number or WBS code",
+            Field::Successors => "What waits for it, by row number or WBS code",
             Field::Resources => "Who is on it",
             Field::Work => "Effort, spread over whoever is on the task",
             Field::Cost => "Money booked against the task",
@@ -366,6 +384,7 @@ impl Field {
             Field::Finish => "finish",
             Field::PercentComplete => "percent",
             Field::Predecessors => "predecessors",
+            Field::Successors => "successors",
             Field::Resources => "resources",
             Field::Work => "work",
             Field::Cost => "cost",
@@ -416,6 +435,11 @@ impl Field {
                 "Elapsed",
                 "Working Days",
                 "Duration Days",
+                // A whole heading, so it beats the trimming pass below, which
+                // would otherwise drop "Days" and call this column Work. A
+                // sheet that counts a task in work days is counting how long
+                // it takes, not how much effort it carries.
+                "Work Days",
             ],
             Field::Start => &[
                 "Start",
@@ -456,6 +480,15 @@ impl Field {
                 "Blocked By",
                 "After",
             ],
+            Field::Successors => &[
+                "Successors",
+                "Successor",
+                "Followed By",
+                "Feeds",
+                "Blocks",
+                "Leads To",
+                "Precedes",
+            ],
             Field::Resources => &[
                 "Resources",
                 "Resource Names",
@@ -483,11 +516,21 @@ impl Field {
 
     /// Which field a heading names, if any.
     ///
-    /// The whole heading first, then the heading with an aside in brackets and
-    /// a trailing unit or qualifier taken off, so "Duration (hours)" is a
-    /// duration and "Start Date" is a start. Only those: matching any word
-    /// anywhere would make a Cost Centre column a Cost column, and a wrong
-    /// guess that looks deliberate is worse than no guess at all.
+    /// A heading is tried whole, then as the shorter headings it is a longer
+    /// way of writing: the words before a bracket, the words inside it, and
+    /// each side of a slash. Every one of those is matched whole against the
+    /// alias lists first, and only then with a trailing unit or qualifier
+    /// taken off.
+    ///
+    /// The order is the whole point, because the useful word is on either side
+    /// of the bracket depending on the sheet. "Duration (hours)" is settled by
+    /// the words outside, and has to be, or the word inside would make it
+    /// Work. "In Dependencies (Predecessors)" is settled only by the words
+    /// inside, because nothing outside names a field.
+    ///
+    /// What none of this does is match a word anywhere in a heading. That is
+    /// what would make a Cost Centre column a Cost column, and a wrong guess
+    /// that looks deliberate is worse than no guess at all.
     pub fn for_heading(heading: &str) -> Option<Field> {
         /// Words that qualify a heading without changing what it names.
         const QUALIFIERS: [&str; 22] = [
@@ -508,23 +551,45 @@ impl Field {
             })
         };
 
-        if let Some(field) = named(&crate::excel::key(heading)) {
-            return Some(field);
+        // The heading itself, then the ways it can be read as a longer way of
+        // naming one column. Outside the bracket before inside it, for the
+        // reason above.
+        let mut readings: Vec<&str> = vec![heading];
+        if let Some(open) = heading.find('(') {
+            readings.push(&heading[..open]);
+            let inside = &heading[open + 1..];
+            let close = inside.find(')').unwrap_or(inside.len());
+            readings.push(&inside[..close]);
         }
-        let head = heading.split('(').next().unwrap_or(heading);
-        let mut words: Vec<String> = head
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .map(|word| word.to_lowercase())
-            .collect();
-        while !words.is_empty() {
-            if let Some(field) = named(&words.concat()) {
+        // A heading that offers two words for one column names it twice, and
+        // either word will do: "Notes / Comments" is the Notes column.
+        if heading.contains('/') {
+            readings.extend(heading.split('/'));
+        }
+
+        for reading in &readings {
+            if let Some(field) = named(&crate::excel::key(reading)) {
                 return Some(field);
             }
-            if words.len() == 1 || !QUALIFIERS.contains(&words[words.len() - 1].as_str()) {
-                return None;
+        }
+
+        // Only now the trailing units and qualifiers, so an exact name always
+        // beats a trimmed one.
+        for reading in &readings {
+            let mut words: Vec<String> = reading
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .map(|word| word.to_lowercase())
+                .collect();
+            while words.len() > 1 {
+                if !QUALIFIERS.contains(&words[words.len() - 1].as_str()) {
+                    break;
+                }
+                words.pop();
+                if let Some(field) = named(&words.concat()) {
+                    return Some(field);
+                }
             }
-            words.pop();
         }
         None
     }
@@ -713,6 +778,27 @@ fn full_year(value: i64, digits: usize) -> i32 {
 /// Text is tried in the unambiguous shapes first, and only a bare three number
 /// date whose own digits settle nothing falls back on the chosen order.
 pub fn read_date(cell: &Cell, order: DateOrder) -> DateRead {
+    match read_any_date(cell, order) {
+        DateRead::Certain { at, .. } | DateRead::Assumed { at, .. } if !is_real_date(at) => {
+            // Absent rather than unreadable: there was nothing in the cell to
+            // read, only a zero the spreadsheet stored for an empty one.
+            DateRead::Blank
+        }
+        other => other,
+    }
+}
+
+/// Whether a date is one somebody could have meant.
+fn is_real_date(at: NaiveDateTime) -> bool {
+    NaiveDate::from_ymd_opt(
+        EARLIEST_REAL_DATE.0,
+        EARLIEST_REAL_DATE.1,
+        EARLIEST_REAL_DATE.2,
+    )
+    .is_none_or(|floor| at.date() >= floor)
+}
+
+fn read_any_date(cell: &Cell, order: DateOrder) -> DateRead {
     match cell {
         Cell::Empty => return DateRead::Blank,
         Cell::Stamp { at, date_only } => {
@@ -722,9 +808,14 @@ pub fn read_date(cell: &Cell, order: DateOrder) -> DateRead {
             };
         }
         Cell::Number(serial) => {
-            // The same range `excel.rs` accepts, which reaches to 2064 and
-            // keeps a duration or a percentage from being read as a date.
-            if !(1.0..60_000.0).contains(serial) {
+            // A serial at or before the spreadsheet's own day zero is what an
+            // empty or zeroed cell holds, so it is absent rather than wrong.
+            if *serial < 1.0 {
+                return DateRead::Blank;
+            }
+            // The same upper bound `excel.rs` uses, which reaches to 2064 and
+            // keeps a duration from being read as a date.
+            if *serial >= 60_000.0 {
                 return DateRead::Unreadable;
             }
             let Some(epoch) =
@@ -902,6 +993,154 @@ impl Mapping {
     }
 }
 
+/// The deepest outline a plan can really have.
+///
+/// Twenty is already deeper than anybody reads, and the cap is here for a
+/// reason beyond taste: a plan cannot be indented past what its own grid can
+/// show, and a depth that runs away is how an import turns a hundred rows into
+/// a hundred levels with one task each.
+pub const MAX_OUTLINE_DEPTH: u16 = 20;
+
+/// The largest number that can plausibly be a level, or a top level WBS
+/// branch.
+///
+/// This is the guard that matters. `1230258` in the outline column is an issue
+/// number somebody kept there, not a level and not a branch, and reading it as
+/// one is what used to set every following row climbing a level at a time.
+const IMPLAUSIBLE_ABOVE: i64 = 999;
+
+/// How many of a column's values are worth reading before its shape is clear.
+const SHAPE_SAMPLE: usize = 400;
+
+/// What a column's own values say it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shaped {
+    /// Dotted codes at more than one depth. That is an outline, whatever the
+    /// heading over it happens to say.
+    Wbs,
+    /// Plain numbers that climb. That is an identifier, and nothing else.
+    Counter,
+    /// Neither shape is clear, so the heading is left to decide.
+    Unsettled,
+}
+
+/// How deep a WBS code is, if the text is one at all.
+///
+/// `1.2.3` is three deep, `DM33.1.1` is three deep, and a bare `4` is a top
+/// level branch, so one. A value with a space in it is a sentence rather than
+/// a code, and a bare number too large to be a branch is a reference number
+/// somebody kept in the same column.
+fn wbs_depth(text: &str) -> Option<i64> {
+    let trimmed = text.trim().trim_end_matches('.');
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    let coded = |part: &&str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if !parts.iter().all(coded) {
+        return None;
+    }
+    if parts.len() == 1 {
+        let only = parts[0];
+        if only.chars().all(|c| c.is_ascii_digit()) {
+            return only
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value <= IMPLAUSIBLE_ABOVE)
+                .map(|_| 1);
+        }
+    }
+    Some(parts.len() as i64)
+}
+
+/// Read a column's values to work out whether it is a WBS or an identifier.
+///
+/// A heading cannot answer this and should not be asked to. "No." heads a
+/// column of `1`, `1.1`, `1.1.1` in one sheet and a column of `1`, `2`, `3` in
+/// the next, and the difference between those two readings is the difference
+/// between a plan with an outline and a flat list of fifteen hundred rows.
+///
+/// So the values decide. Dotted codes at more than one depth are an outline:
+/// nothing else varies its own depth down a column. Plain numbers that only
+/// climb are an identifier. Anything else is left unsettled, which means the
+/// heading keeps whatever it guessed and the person importing can say
+/// otherwise on the page.
+fn column_shape(sheet: &Sheet, heading_row: usize, column: usize) -> Shaped {
+    let mut depths: Vec<i64> = Vec::new();
+    let mut dotted = 0usize;
+    let mut plain = 0usize;
+    let mut climbing = true;
+    let mut highest: Option<i64> = None;
+    let mut looked = 0usize;
+
+    for row in sheet.rows.iter().skip(heading_row + 1) {
+        let Some(cell) = row.get(column) else { continue };
+        if cell.is_empty() {
+            continue;
+        }
+        looked += 1;
+        if looked > SHAPE_SAMPLE {
+            break;
+        }
+        let value = cell.text();
+        let digits = !value.is_empty() && value.chars().all(|c| c.is_ascii_digit());
+        match wbs_depth(&value) {
+            Some(depth) if depth > 1 => {
+                dotted += 1;
+                if !depths.contains(&depth) {
+                    depths.push(depth);
+                }
+            }
+            Some(_) if digits => {
+                plain += 1;
+                if !depths.contains(&1) {
+                    depths.push(1);
+                }
+            }
+            _ => {}
+        }
+        if digits {
+            let value: i64 = value.parse().unwrap_or(0);
+            if highest.is_some_and(|held| value <= held) {
+                climbing = false;
+            }
+            highest = Some(value);
+        } else {
+            // A column of identifiers is numbers all the way down. One value
+            // that is not a number is enough to say it is not counting.
+            climbing = false;
+        }
+    }
+
+    // A quarter of the numbers being dotted is enough: a plan's top level is
+    // undotted by definition, and a deep plan has plenty of both.
+    if dotted >= 3 && depths.len() >= 2 && dotted * 4 >= dotted + plain {
+        return Shaped::Wbs;
+    }
+    if dotted == 0 && plain >= 3 && climbing {
+        return Shaped::Counter;
+    }
+    Shaped::Unsettled
+}
+
+/// The column that holds the sheet's WBS codes, if one does.
+///
+/// Worked out from the values every time rather than remembered on the
+/// mapping, so a column chosen by hand on the Import page reads exactly the
+/// same way as one this guessed.
+fn wbs_column(sheet: &Sheet, mapping: &Mapping) -> Option<usize> {
+    let column = mapping.column_of(Field::OutlineLevel)?;
+    match column_shape(sheet, mapping.heading_row, column) {
+        Shaped::Wbs => Some(column),
+        Shaped::Counter | Shaped::Unsettled => None,
+    }
+}
+
 /// Guess which row holds the headings.
 ///
 /// A heading row is mostly words, and a plan's heading row usually names at
@@ -942,6 +1181,33 @@ pub fn guess_columns(sheet: &Sheet, heading_row: usize) -> Vec<Option<Field>> {
         {
             taken.push(field);
             *slot = Some(field);
+        }
+    }
+
+    // Now the values, for the one question a heading cannot answer. A column
+    // of dotted codes at varying depth is the outline, whatever it is called,
+    // and the cost of missing it is the whole hierarchy: a sheet whose "No."
+    // column is read as an identifier imports as fifteen hundred rows at level
+    // zero.
+    if !taken.contains(&Field::OutlineLevel) {
+        let found = (0..sheet.width).find(|column| {
+            // Only a column nothing else wants, or one the heading placed as
+            // an identifier, which is the mistake being corrected. A column
+            // already holding names or dates is not up for reconsideration.
+            matches!(columns.get(*column).copied().flatten(), None | Some(Field::Id))
+                && column_shape(sheet, heading_row, *column) == Shaped::Wbs
+        });
+        if let Some(column) = found {
+            // Nothing is lost by taking it off Id. A WBS column is also the
+            // identity a Predecessors column cites, and the reader looks it up
+            // there, so the codes still resolve.
+            if columns.get(column).copied().flatten() == Some(Field::Id) {
+                taken.retain(|field| *field != Field::Id);
+            }
+            taken.push(Field::OutlineLevel);
+            if let Some(slot) = columns.get_mut(column) {
+                *slot = Some(Field::OutlineLevel);
+            }
         }
     }
 
@@ -1059,7 +1325,12 @@ pub struct Report {
     /// Dates that only the chosen day and month order settles.
     pub assumed_dates: usize,
     pub links: usize,
+    /// References that name nothing this import holds, or that the two
+    /// dependency columns disagree about.
     pub dropped_links: usize,
+    /// Links refused because taking them would have made a plan that cannot be
+    /// scheduled at all.
+    pub looped_links: usize,
     pub resources: usize,
     /// Work figures with nobody to carry them.
     pub work_unplaced: usize,
@@ -1080,6 +1351,7 @@ impl Report {
             assumed_dates: 0,
             links: 0,
             dropped_links: 0,
+            looped_links: 0,
             resources: 0,
             work_unplaced: 0,
             structure: Structure::Flat,
@@ -1117,6 +1389,11 @@ pub struct Import {
 struct Draft {
     row: usize,
     id: String,
+    /// The row's WBS code, when the outline column holds codes rather than
+    /// numbers. Kept beside the id because it is an identity as much as a
+    /// depth: it is what a Predecessors column full of `4.2.31.1` is citing,
+    /// and in a sheet like that it is the only identity there is.
+    code: String,
     name: String,
     indent: usize,
     level: Option<i64>,
@@ -1125,6 +1402,7 @@ struct Draft {
     finish: Option<(NaiveDateTime, bool)>,
     percent: Option<u8>,
     predecessors: String,
+    successors: String,
     resources: String,
     notes: String,
     cost: Option<f64>,
@@ -1171,9 +1449,18 @@ fn read_money(cell: &Cell) -> Option<f64> {
     }
 }
 
+/// The longest a task can plausibly be, in working minutes: a hundred years.
+///
+/// Nothing in a plan lasts that long, and a number in a duration column that
+/// says so is a date serial or a rolled up total that landed in the wrong
+/// column. Believing one does not stretch a single bar: every summary above it
+/// stretches too, and so does the plan's own finish, so one bad cell can put
+/// the timescale a century out.
+const IMPLAUSIBLE_MINUTES: i64 = 100 * 260 * 480;
+
 /// A duration cell, in whatever shape the sheet holds it.
 fn read_span(cell: &Cell, default_unit: DurationUnit) -> Option<(i64, bool)> {
-    match cell {
+    let read = match cell {
         Cell::Number(value) => {
             Some(((value * default_unit.minutes() as f64).round() as i64, false))
         }
@@ -1181,13 +1468,29 @@ fn read_span(cell: &Cell, default_unit: DurationUnit) -> Option<(i64, bool)> {
         Cell::Elapsed(minutes) => Some((*minutes, false)),
         Cell::Text(text) => crate::parse_duration_in(text, default_unit),
         _ => None,
-    }
+    };
+    read.filter(|(minutes, _)| minutes.abs() <= IMPLAUSIBLE_MINUTES)
 }
 
 /// An outline level, as a number or as the depth of a WBS code.
-fn read_level(cell: &Cell) -> Option<i64> {
+///
+/// `wbs` says the column was read as a column of codes, in which case every
+/// value in it is one and the answer is how deep it is. Otherwise the value is
+/// a level as it stands, and a dotted one is still counted for its depth.
+///
+/// Either way a value too large to be a level is refused rather than believed.
+/// The caller reads `None` as "this row says nothing", and a row that says
+/// nothing keeps the level of the row above it, which is the only safe answer:
+/// believing `1230258` is how a sheet ends up eighty levels deep.
+fn read_level(cell: &Cell, wbs: bool) -> Option<i64> {
+    if wbs {
+        return wbs_depth(&cell.text());
+    }
     match cell {
-        Cell::Number(value) => Some(*value as i64),
+        Cell::Number(value) => {
+            let value = *value as i64;
+            (0..=IMPLAUSIBLE_ABOVE).contains(&value).then_some(value)
+        }
         Cell::Text(text) => {
             let trimmed = text.trim();
             if trimmed.is_empty() {
@@ -1200,7 +1503,10 @@ fn read_level(cell: &Cell) -> Option<i64> {
                 // outline level does, in a different alphabet.
                 return Some(trimmed.split('.').filter(|part| !part.is_empty()).count() as i64);
             }
-            trimmed.parse().ok()
+            trimmed
+                .parse::<i64>()
+                .ok()
+                .filter(|value| (0..=IMPLAUSIBLE_ABOVE).contains(value))
         }
         _ => None,
     }
@@ -1237,6 +1543,10 @@ pub fn read(sheet: &Sheet, mapping: &Mapping, plan_name: &str) -> Result<Import,
     let name_at = mapping.column_of(Field::Name).ok_or(SheetError::NoName)?;
     let first_row = mapping.heading_row + 1;
     let mut report = Report::new(sheet.name.clone());
+    // Settled once for the sheet rather than row by row, because it is a fact
+    // about the column and reading it per row would be reading the same four
+    // hundred cells for every one of fifteen hundred rows.
+    let coded = wbs_column(sheet, mapping);
 
     // Which columns are being left behind, said out loud: a column quietly
     // dropped is the failure this page exists to prevent.
@@ -1294,6 +1604,10 @@ pub fn read(sheet: &Sheet, mapping: &Mapping, plan_name: &str) -> Result<Import,
         let mut draft = Draft {
             row: number,
             id: cell_of(Field::Id).text(),
+            code: coded
+                .and_then(|column| row.get(column))
+                .map(Cell::text)
+                .unwrap_or_default(),
             name: raw_name.trim().to_string(),
             indent: indent_of(&raw_name),
             level: None,
@@ -1302,6 +1616,7 @@ pub fn read(sheet: &Sheet, mapping: &Mapping, plan_name: &str) -> Result<Import,
             finish: None,
             percent: None,
             predecessors: cell_of(Field::Predecessors).text(),
+            successors: cell_of(Field::Successors).text(),
             resources: cell_of(Field::Resources).text(),
             notes: cell_of(Field::Notes).text(),
             cost: None,
@@ -1311,7 +1626,7 @@ pub fn read(sheet: &Sheet, mapping: &Mapping, plan_name: &str) -> Result<Import,
         if let Some(column) = column_of(Field::OutlineLevel) {
             let cell = row.get(column).unwrap_or(&Cell::Empty);
             if !cell.is_empty() {
-                draft.level = read_level(cell);
+                draft.level = read_level(cell, coded.is_some());
                 if draft.level.is_none() {
                     report.note(number, &heading_of(column), &cell.text(), "Not a level or a WBS code, so this row keeps the level of the row above it.");
                 }
@@ -1555,13 +1870,291 @@ fn apply_work(project: &mut Project, drafts: &[Draft], report: &mut Report) {
     }
 }
 
-/// Turn the Predecessors column into links.
+/// One reference out of a dependency cell.
 ///
-/// The numbers in that column count rows in the sheet, and the sheet's rows
-/// are not the plan's: blank rows and banners were dropped on the way in. When
-/// an ID column is mapped the numbers are looked up in it, which is exact.
-/// Without one they are read as positions, which is what the exporter writes
-/// and what the numbers usually are.
+/// `key` is the code or row number it names and `tail` is the link type and
+/// lag in the shape `parse_predecessor_text` already reads, so whichever way
+/// round the sheet wrote them, they leave here written one way.
+struct Reference {
+    key: String,
+    tail: String,
+}
+
+/// Whether what follows a row number is a link type and a lag rather than more
+/// of the reference.
+///
+/// This is the difference between `475SS`, which is row 475 start to start,
+/// and `4.2.31.1`, which is a WBS code that happens to start with a digit.
+/// Reading the second as row 4 is not a near miss: it lands every one of those
+/// references on whatever task is fourth, which in a plan means one summary
+/// task collecting hundreds of dependencies and a dependency loop by lunchtime.
+fn is_a_tail(rest: &str) -> bool {
+    if rest.is_empty() {
+        return true;
+    }
+    let upper = rest.to_ascii_uppercase();
+    let after = match upper.get(..2) {
+        Some(head) if crate::model::LinkType::parse(head).is_some() => &upper[2..],
+        _ => upper.as_str(),
+    };
+    after.is_empty() || after.starts_with('+') || after.starts_with('-')
+}
+
+/// Split a dependency cell into the references it names.
+///
+/// Sheets write these every way there is, and one sheet writes them several
+/// ways: `12`, `12SS+2d`, `4.2.31.1 Complete Draft IDD [FS]`, and any number
+/// of those to a cell separated by a comma, a semicolon or a line break. What
+/// is constant is that the reference is the first word and the type is either
+/// stuck to it or spelled out in brackets at the end.
+fn references(text: &str) -> Vec<Reference> {
+    let mut out = Vec::new();
+    for token in text.split([',', ';', '\n', '\r']) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        // A type in brackets at the end, which is how a sheet that also writes
+        // the task's name into the cell keeps the two apart.
+        let (body, bracketed) = match (token.rfind('['), token.rfind(']')) {
+            (Some(open), Some(close)) if close > open => {
+                let inside = token[open + 1..close].trim().to_ascii_uppercase();
+                match crate::model::LinkType::parse(&inside) {
+                    Some(kind) => (token[..open].trim(), Some(kind)),
+                    None => (token, None),
+                }
+            }
+            _ => (token, None),
+        };
+        let Some(word) = body.split_whitespace().next() else {
+            continue;
+        };
+        if let Some(kind) = bracketed {
+            out.push(Reference {
+                key: word.trim_end_matches('.').to_string(),
+                tail: kind.code().to_string(),
+            });
+            continue;
+        }
+        let digits: String = word.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let rest = &word[digits.len()..];
+        if !digits.is_empty() && is_a_tail(rest) {
+            out.push(Reference {
+                key: digits,
+                tail: rest.to_string(),
+            });
+        } else {
+            out.push(Reference {
+                key: word.trim_end_matches('.').to_string(),
+                tail: String::new(),
+            });
+        }
+    }
+    out
+}
+
+/// What the rows of a sheet answer to, so a reference can find one.
+struct Identities {
+    /// Code, upper cased, to the 1-based position of the row that carries it.
+    by_code: std::collections::HashMap<String, usize>,
+    /// The row number the spreadsheet shows down its left edge, to the same.
+    by_row: std::collections::HashMap<usize, usize>,
+    /// Whether the sheet has any identity of its own at all.
+    named: bool,
+    rows: usize,
+}
+
+impl Identities {
+    fn of(drafts: &[Draft], mapping: &Mapping) -> Identities {
+        let mut by_code: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut named = false;
+        // The id column first, so it wins where a sheet has both and they
+        // disagree: it is the column somebody put there to be cited.
+        if mapping.column_of(Field::Id).is_some() {
+            for (index, draft) in drafts.iter().enumerate() {
+                if draft.id.is_empty() {
+                    continue;
+                }
+                named = true;
+                by_code
+                    .entry(draft.id.to_ascii_uppercase())
+                    .or_insert(index + 1);
+            }
+        }
+        for (index, draft) in drafts.iter().enumerate() {
+            if draft.code.is_empty() {
+                continue;
+            }
+            named = true;
+            by_code
+                .entry(draft.code.to_ascii_uppercase())
+                .or_insert(index + 1);
+        }
+        let by_row = drafts
+            .iter()
+            .enumerate()
+            .map(|(index, draft)| (draft.row, index + 1))
+            .collect();
+        Identities {
+            by_code,
+            by_row,
+            named,
+            rows: drafts.len(),
+        }
+    }
+
+    /// The 1-based position a reference names, if any row answers to it.
+    ///
+    /// The sheet's own names first, then two readings of a bare number, and
+    /// which of the two applies depends on whether the sheet names its rows at
+    /// all.
+    ///
+    /// A sheet that names them and then writes a bare number is not naming a
+    /// row, because its names are not numbers. It is pointing at the number
+    /// down the left edge of the spreadsheet, which is what somebody reading
+    /// the file sees. A sheet that names nothing is counting its own task rows
+    /// from one, which is what this application's own export writes.
+    ///
+    /// A number that answers to neither reading is left out and counted.
+    /// Counting it off as a position anyway would pick a task very nearly at
+    /// random and call it a dependency, and enough of those in one plan is a
+    /// dependency loop, which is a plan that cannot be scheduled at all.
+    fn find(&self, key: &str) -> Option<usize> {
+        if let Some(position) = self.by_code.get(&key.to_ascii_uppercase()) {
+            return Some(*position);
+        }
+        if !key.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let number: usize = key.parse().ok()?;
+        if self.named {
+            return self.by_row.get(&number).copied();
+        }
+        (number >= 1 && number <= self.rows).then_some(number)
+    }
+}
+
+/// The links being built, and whether one more would close a loop.
+///
+/// A plan whose links form a loop cannot be scheduled at all: every date in it
+/// stays at zero and the window opens on a complaint instead of a plan. A
+/// sheet is quite capable of describing one, especially a sheet whose two
+/// dependency columns were kept by different people. So a loop is refused
+/// here, where the rows that caused it can still be named, rather than carried
+/// into a plan that will not run.
+///
+/// The awkward part is that the loop has to be looked for the way the
+/// scheduler will look for it. A link naming a summary is not one link there:
+/// it is expanded onto every leaf under that summary. So a link from a task to
+/// its own parent is a loop even though the two are different rows, and
+/// checking the links as written would miss it entirely.
+struct Building {
+    /// Links as written, from row position to row position.
+    out: Vec<Vec<usize>>,
+    /// The predecessor text each 0-based position has collected.
+    incoming: Vec<Vec<String>>,
+    /// Pairs already linked, in the direction they were linked.
+    joined: std::collections::HashSet<(usize, usize)>,
+    /// The leaf rows under each row, which is what a link really joins.
+    leaves_of: Vec<Vec<usize>>,
+    /// For each leaf row, itself and every summary above it: the rows whose
+    /// links that leaf therefore carries.
+    owners: Vec<Vec<usize>>,
+}
+
+impl Building {
+    fn new(levels: &[u16]) -> Building {
+        let rows = levels.len();
+        let is_leaf = |row: usize| {
+            levels
+                .get(row + 1)
+                .is_none_or(|next| *next <= levels[row])
+        };
+        let mut leaves_of: Vec<Vec<usize>> = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let mut under = Vec::new();
+            for below in row + 1..rows {
+                if levels[below] <= levels[row] {
+                    break;
+                }
+                if is_leaf(below) {
+                    under.push(below);
+                }
+            }
+            // A row with nothing under it stands for itself.
+            if under.is_empty() {
+                under.push(row);
+            }
+            leaves_of.push(under);
+        }
+        let mut owners: Vec<Vec<usize>> = vec![Vec::new(); rows];
+        for (row, under) in leaves_of.iter().enumerate() {
+            for leaf in under {
+                owners[*leaf].push(row);
+            }
+        }
+        Building {
+            out: vec![Vec::new(); rows],
+            incoming: vec![Vec::new(); rows],
+            joined: std::collections::HashSet::new(),
+            leaves_of,
+            owners,
+        }
+    }
+
+    fn already(&self, from: usize, to: usize) -> bool {
+        self.joined.contains(&(from, to))
+    }
+
+    /// Whether a leaf under `from` can already be reached by following links
+    /// out of `to`, which is what would make a link from `from` to `to` a loop.
+    ///
+    /// The walk is over leaves, because that is the graph the scheduler builds.
+    /// A leaf carries the links of every summary it sits under, and a link
+    /// arriving at a summary arrives at all of its leaves.
+    fn reaches(&self, to: usize, from: usize) -> bool {
+        let target: std::collections::HashSet<usize> =
+            self.leaves_of[from].iter().copied().collect();
+        let mut seen = vec![false; self.out.len()];
+        let mut stack: Vec<usize> = self.leaves_of[to].clone();
+        while let Some(leaf) = stack.pop() {
+            if target.contains(&leaf) {
+                return true;
+            }
+            if std::mem::replace(&mut seen[leaf], true) {
+                continue;
+            }
+            for owner in &self.owners[leaf] {
+                for next in &self.out[*owner] {
+                    stack.extend(self.leaves_of[*next].iter().copied());
+                }
+            }
+        }
+        false
+    }
+
+    fn add(&mut self, from: usize, to: usize, tail: &str) {
+        self.out[from].push(to);
+        self.joined.insert((from, to));
+        self.incoming[to].push(format!("{}{tail}", from + 1));
+    }
+}
+
+/// Turn the dependency columns into links.
+///
+/// The references in those columns are the sheet's own, not the plan's: they
+/// name rows by whatever the sheet calls them, which is a WBS code in one sheet
+/// and a row number in the next, and blank rows and banners mean the sheet's
+/// numbering is not this plan's either way. So every reference is resolved to a
+/// position here, and only then handed to the plan, which reads positions.
+///
+/// Successors are the same relationship written from the other end, so one is
+/// imported by creating the link on the other task. Where a sheet has both
+/// columns and they disagree about a pair, the predecessors column wins: it is
+/// read first, and the successors column then finds the pair already joined.
+/// Two columns that disagree are one relationship written twice, not two
+/// relationships, and taking both would make a loop out of a typo.
 fn link(
     project: &mut Project,
     drafts: &[Draft],
@@ -1569,62 +2162,88 @@ fn link(
     sheet: &Sheet,
     report: &mut Report,
 ) {
-    let heading = mapping
-        .column_of(Field::Predecessors)
-        .map(|column| sheet.heading(mapping.heading_row, column))
-        .unwrap_or_else(|| Field::Predecessors.label().to_string());
+    let heading_for = |field: Field| {
+        mapping
+            .column_of(field)
+            .map(|column| sheet.heading(mapping.heading_row, column))
+            .unwrap_or_else(|| field.label().to_string())
+    };
+    let known = Identities::of(drafts, mapping);
+    let levels: Vec<u16> = project.tasks.iter().map(|task| task.outline_level).collect();
+    let mut building = Building::new(&levels);
 
-    let by_id: std::collections::HashMap<String, usize> = drafts
-        .iter()
-        .enumerate()
-        .filter(|(_, draft)| !draft.id.is_empty())
-        .map(|(index, draft)| (draft.id.clone(), index + 1))
-        .collect();
-    let use_ids = mapping.column_of(Field::Id).is_some() && !by_id.is_empty();
-
-    for (index, draft) in drafts.iter().enumerate() {
-        if draft.predecessors.is_empty() {
-            continue;
-        }
-        let mut parts: Vec<String> = Vec::new();
-        for token in draft.predecessors.split([',', ';']) {
-            let token = token.trim();
-            if token.is_empty() {
+    // Predecessors first, then successors, so that the order in which a
+    // disagreement is settled is the same every time this runs.
+    for reading in [Field::Predecessors, Field::Successors] {
+        let heading = heading_for(reading);
+        for (index, draft) in drafts.iter().enumerate() {
+            let cell = match reading {
+                Field::Predecessors => &draft.predecessors,
+                _ => &draft.successors,
+            };
+            if cell.is_empty() {
                 continue;
             }
-            let digits: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() {
-                report.dropped_links += 1;
-                report.note(
-                    draft.row,
-                    &heading,
-                    token,
-                    "Not a row number, so this dependency was left out.",
-                );
-                continue;
+            for reference in references(cell) {
+                let Some(position) = known.find(&reference.key) else {
+                    report.dropped_links += 1;
+                    report.note(
+                        draft.row,
+                        &heading,
+                        &reference.key,
+                        "No row in this import answers to that, so the dependency was left out.",
+                    );
+                    continue;
+                };
+                let other = position - 1;
+                // Which end of the link this row is depends on which column
+                // the reference came out of.
+                let (from, to) = match reading {
+                    Field::Predecessors => (other, index),
+                    _ => (index, other),
+                };
+                if from == to {
+                    report.dropped_links += 1;
+                    report.note(
+                        draft.row,
+                        &heading,
+                        &reference.key,
+                        "A task cannot depend on itself, so this was left out.",
+                    );
+                    continue;
+                }
+                if building.already(from, to) {
+                    // The two columns agreeing about a pair. Nothing to do and
+                    // nothing worth saying.
+                    continue;
+                }
+                if building.already(to, from) {
+                    report.dropped_links += 1;
+                    report.note(
+                        draft.row,
+                        &heading,
+                        &reference.key,
+                        "The other dependency column already has these two the other way round, so this one was left out.",
+                    );
+                    continue;
+                }
+                if building.reaches(to, from) {
+                    report.looped_links += 1;
+                    report.note(
+                        draft.row,
+                        &heading,
+                        &reference.key,
+                        "Following this dependency comes back to this row, and a plan whose \
+                         dependencies form a loop cannot be scheduled at all, so it was left out.",
+                    );
+                    continue;
+                }
+                building.add(from, to, &reference.tail);
             }
-            let position = if use_ids {
-                by_id.get(&digits).copied()
-            } else {
-                digits
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|row| *row >= 1 && *row <= drafts.len())
-            };
-            let Some(position) = position else {
-                report.dropped_links += 1;
-                report.note(
-                    draft.row,
-                    &heading,
-                    token,
-                    "No row in this import answers to that number, so the dependency was left out.",
-                );
-                continue;
-            };
-            // The tail carries the link type and any lag, which the plan
-            // already knows how to read.
-            parts.push(format!("{position}{}", &token[digits.len()..]));
         }
+    }
+
+    for (index, parts) in building.incoming.iter().enumerate() {
         if parts.is_empty() {
             continue;
         }
@@ -1646,18 +2265,12 @@ fn outline_levels(drafts: &[Draft], mapping: &Mapping, report: &mut Report) -> V
         .filter(|indent| *indent > 0)
         .collect();
 
-    let mut raw: Vec<i64> = if has_column {
+    // `None` means the row said nothing, which is a different thing from
+    // saying zero and has to stay different all the way down: it is what makes
+    // a row inherit rather than invent.
+    let raw: Vec<Option<i64>> = if has_column {
         report.structure = Structure::FromColumn;
-        let mut last = 0i64;
-        drafts
-            .iter()
-            .map(|draft| {
-                // A row the column says nothing about sits where the row above
-                // it sits. Inventing a level for it would invent structure.
-                last = draft.level.unwrap_or(last);
-                last
-            })
-            .collect()
+        drafts.iter().map(|draft| draft.level).collect()
     } else if !indents.is_empty() {
         report.structure = Structure::FromIndent;
         // One level is the smallest step the sheet actually uses, so four
@@ -1665,25 +2278,37 @@ fn outline_levels(drafts: &[Draft], mapping: &Mapping, report: &mut Report) -> V
         let step = indents.iter().copied().fold(0usize, gcd).max(1);
         drafts
             .iter()
-            .map(|draft| (draft.indent / step) as i64)
+            .map(|draft| Some((draft.indent / step) as i64))
             .collect()
     } else {
         report.structure = Structure::Flat;
-        vec![0; drafts.len()]
+        vec![Some(0); drafts.len()]
     };
 
-    // The shallowest row in the sheet is the top of this plan, whether the
-    // sheet counted from zero, from one, or from an indent nothing outdents.
-    let floor = raw.iter().copied().min().unwrap_or(0);
+    // The shallowest row that said anything is the top of this plan, whether
+    // the sheet counted from zero, from one, or from an indent nothing
+    // outdents. Rows that said nothing are not in the reckoning: they have no
+    // level of their own to be the shallowest.
+    let floor = raw.iter().flatten().copied().min().unwrap_or(0);
     let mut previous = 0i64;
-    for level in raw.iter_mut() {
-        // A jump of more than one level has no parent to hang from, so it is
-        // pulled in to the deepest level that does.
-        let value = (*level - floor).max(0).min(previous + 1);
-        previous = value;
-        *level = value;
+    let mut levels = Vec::with_capacity(raw.len());
+    for value in raw {
+        let level = match value {
+            // A jump of more than one level has no parent to hang from, so it
+            // is pulled in to the deepest level that does.
+            Some(level) => (level - floor).max(0).min(previous + 1),
+            // A row the column says nothing about sits where the row above it
+            // sits. Note that it inherits the level as settled, not the raw
+            // value: inheriting the raw one is what let a single absurd value
+            // set every following row climbing a level at a time, for the rest
+            // of the sheet.
+            None => previous,
+        };
+        let level = level.clamp(0, MAX_OUTLINE_DEPTH as i64);
+        previous = level;
+        levels.push(level as u16);
     }
-    raw.into_iter().map(|level| level.clamp(0, u16::MAX as i64) as u16).collect()
+    levels
 }
 
 #[cfg(test)]
@@ -1771,6 +2396,107 @@ mod tests {
     }
 
     #[test]
+    fn a_heading_can_carry_its_useful_word_on_either_side_of_a_bracket() {
+        // The two shapes, in one sheet: "Duration (hours)" says what it is
+        // outside the bracket and qualifies it inside, and "In Dependencies
+        // (Predecessors)" does the opposite. Reading either one from the wrong
+        // side is silent: the first would come in as Work and the second as
+        // nothing at all.
+        assert_eq!(Field::for_heading("Duration (hours)"), Some(Field::Duration));
+        assert_eq!(
+            Field::for_heading("In Dependencies (Predecessors)"),
+            Some(Field::Predecessors)
+        );
+        assert_eq!(
+            Field::for_heading("Out Dependencies (Successors)"),
+            Some(Field::Successors)
+        );
+        // Two words for one column, which is a heading naming it twice.
+        assert_eq!(Field::for_heading("Notes / Comments"), Some(Field::Notes));
+        // And none of that loosens the matcher. These are the headings that
+        // must stay unplaced, whatever is bracketed onto them.
+        assert_eq!(Field::for_heading("Cost Centre"), None);
+        assert_eq!(Field::for_heading("Cost Centre (Total)"), None);
+        assert_eq!(Field::for_heading("Realistic End Date"), None);
+        assert_eq!(Field::for_heading("Start Location"), None);
+    }
+
+    #[test]
+    fn work_days_is_how_long_a_task_takes_and_not_how_much_effort_it_carries() {
+        // "Work" and "Days" separately name two different fields, and the
+        // trimming pass would drop the second and answer Work. The whole
+        // heading is a duration in days, which is what people write it for.
+        assert_eq!(Field::for_heading("Work Days"), Some(Field::Duration));
+        assert_eq!(Field::for_heading("Work"), Some(Field::Work));
+    }
+
+    // ---- what a column holds, when its heading will not say -----------
+
+    /// A sheet of names beside one column of values, which is what the
+    /// questions about a column's shape are all about.
+    fn column(heading: &str, values: &[&str]) -> Sheet {
+        let mut rows: Vec<Vec<Cell>> = vec![vec![text("Task Name"), text(heading)]];
+        rows.extend(
+            values
+                .iter()
+                .map(|value| vec![text("A task"), text(value)]),
+        );
+        let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+        Sheet {
+            name: "Sheet1".into(),
+            rows,
+            width,
+        }
+    }
+
+    #[test]
+    fn a_wbs_column_is_the_outline_however_it_is_headed() {
+        // The defect this exists for. Column A of a real plan is headed "No."
+        // and holds the whole outline, the heading matches the ID aliases, and
+        // the plan imports flat: fifteen hundred rows at level zero.
+        let book = column("No.", &["1", "1.1", "1.1.1", "1.2", "1.2.1", "1.2.2", "2"]);
+        let mapping = Mapping::guess(&book);
+        assert_eq!(mapping.column_of(Field::OutlineLevel), Some(1));
+        assert_eq!(mapping.column_of(Field::Id), None, "it is not an identifier");
+        let outcome = read(&book, &mapping, "Test plan").expect("read");
+        let levels: Vec<u16> = outcome
+            .project
+            .tasks
+            .iter()
+            .map(|task| task.outline_level)
+            .collect();
+        assert_eq!(levels, vec![0, 1, 2, 1, 2, 2, 0]);
+    }
+
+    #[test]
+    fn a_column_of_counting_numbers_is_an_identifier_however_it_is_headed() {
+        // The other half of the same question. Nothing here varies its depth,
+        // so there is no outline in it to find.
+        let book = column("No.", &["1", "2", "3", "4", "5", "6", "7"]);
+        let mapping = Mapping::guess(&book);
+        assert_eq!(mapping.column_of(Field::Id), Some(1));
+        assert_eq!(mapping.column_of(Field::OutlineLevel), None);
+    }
+
+    #[test]
+    fn a_column_of_codes_all_the_same_depth_is_left_to_its_heading() {
+        // Version numbers, part numbers, clause numbers. Dotted, but the depth
+        // never varies, so nothing in them describes a hierarchy and this
+        // declines to invent one. The heading keeps the last word.
+        let book = column("No.", &["1.1", "1.2", "1.3", "2.1", "2.2", "2.3"]);
+        let mapping = Mapping::guess(&book);
+        assert_eq!(mapping.column_of(Field::Id), Some(1));
+        assert_eq!(mapping.column_of(Field::OutlineLevel), None);
+    }
+
+    #[test]
+    fn a_wbs_column_is_found_even_where_no_heading_names_it() {
+        let book = column("Ref", &["1", "1.1", "1.1.1", "1.2", "2", "2.1", "2.1.1"]);
+        let mapping = Mapping::guess(&book);
+        assert_eq!(mapping.column_of(Field::OutlineLevel), Some(1));
+    }
+
+    #[test]
     fn a_column_of_words_is_taken_for_the_name_when_no_heading_says_so() {
         let book = sheet(&[
             &["Ref", "What", "Days"],
@@ -1846,6 +2572,49 @@ mod tests {
             read_date(&Cell::Empty, DateOrder::DayFirst),
             DateRead::Blank
         ));
+    }
+
+    #[test]
+    fn a_zeroed_date_cell_is_absent_rather_than_a_century_out() {
+        // A spreadsheet writes an empty or zeroed date cell as a serial at or
+        // near zero, which reads back as the last days of 1899. Believing one
+        // costs more than one wrong task: the plan's own start is the earliest
+        // start in the sheet, so a single zero drags the whole timescale back
+        // a hundred and twenty years.
+        assert_eq!(read_date(&Cell::Number(0.0), DateOrder::DayFirst), DateRead::Blank);
+        assert_eq!(read_date(&Cell::Number(1.0), DateOrder::DayFirst), DateRead::Blank);
+        assert_eq!(read_date(&Cell::Number(2.0), DateOrder::DayFirst), DateRead::Blank);
+        // And a real date is still a real date.
+        assert!(matches!(
+            read_date(&text("2026-03-02"), DateOrder::DayFirst),
+            DateRead::Certain { .. }
+        ));
+    }
+
+    #[test]
+    fn a_date_serial_that_landed_in_the_duration_column_is_not_a_duration() {
+        // 33000 working days is a hundred and twenty years. Nothing lasts that
+        // long, and believing it stretches every summary above the task and
+        // the plan's own finish with them.
+        let book = sheet(&[
+            &["Task Name", "Work Days"],
+            &["Survey", "5"],
+            &["Pasted", "33000"],
+        ]);
+        let outcome = import(&book);
+        assert_eq!(outcome.project.tasks[0].duration_minutes, 5 * 480);
+        assert_eq!(
+            outcome.project.tasks[1].duration_minutes,
+            480,
+            "one day, and said so, rather than a century"
+        );
+        assert!(
+            outcome
+                .report
+                .notices
+                .iter()
+                .any(|notice| notice.value == "33000")
+        );
     }
 
     #[test]
@@ -1980,6 +2749,55 @@ mod tests {
         ]);
         let outcome = import(&book);
         assert_eq!(outcome.project.tasks[1].outline_level, 1);
+    }
+
+    #[test]
+    fn an_unreadable_outline_value_inherits_rather_than_burrowing() {
+        // The runaway. One issue number in the outline column used to be
+        // believed, every row after it inherited that number, and the level
+        // then climbed by one a row for the rest of the sheet: levels eight to
+        // eighty four with a single task in each.
+        let book = sheet(&[
+            &["Task Name", "No."],
+            &["Phase one", "1"],
+            &["Survey", "1.1"],
+            &["Detail", "1.1.1"],
+            &["Ticket", "1230258"],
+            &["Also ticket", "1229221"],
+            &["Still ticket", "1215785"],
+            &["Phase two", "2"],
+            &["Dig", "2.1"],
+        ]);
+        let outcome = import(&book);
+        let levels: Vec<u16> = outcome
+            .project
+            .tasks
+            .iter()
+            .map(|task| task.outline_level)
+            .collect();
+        assert_eq!(
+            levels,
+            vec![0, 1, 2, 2, 2, 2, 0, 1],
+            "the three rows that say nothing keep the level of the row above them"
+        );
+        assert_eq!(outcome.report.deepest, 2);
+    }
+
+    #[test]
+    fn the_outline_is_capped_at_a_depth_a_plan_can_really_have() {
+        let deep: String = std::iter::repeat_n("1", 40).collect::<Vec<_>>().join(".");
+        let book = sheet(&[
+            &["Task Name", "WBS"],
+            &["Top", "1"],
+            &["Under", "1.1"],
+            &["Buried", &deep],
+        ]);
+        let outcome = import(&book);
+        assert!(
+            outcome.report.deepest <= MAX_OUTLINE_DEPTH,
+            "got {}",
+            outcome.report.deepest
+        );
     }
 
     #[test]
@@ -2184,6 +3002,130 @@ mod tests {
         let link = outcome.project.links[0];
         assert_eq!(link.kind, crate::model::LinkType::SS);
         assert_eq!(link.lag_minutes, 960);
+    }
+
+    #[test]
+    fn a_dependency_naming_a_wbs_code_finds_the_row_that_carries_it() {
+        // And, just as importantly, does not find row four. Reading the
+        // leading digit of "4.2.31.1" as a row number is not a near miss: it
+        // lands every reference in the sheet on one summary task, and a plan
+        // of those is a plan that will not schedule.
+        let book = sheet(&[
+            &["No.", "Task Name", "In Dependencies (Predecessors)"],
+            &["4", "Design", ""],
+            &["4.1", "Draft", ""],
+            &["4.2", "Build", ""],
+            &["4.2.31", "Wire it up", ""],
+            &["4.2.31.1", "Test it", ""],
+            &["5", "Hand over", "4.2.31.1 Test it [FS]"],
+        ]);
+        let outcome = import(&book);
+        assert_eq!(outcome.report.links, 1);
+        let link = outcome.project.links[0];
+        assert_eq!(link.predecessor, outcome.project.tasks[4].id, "Test it");
+        assert_eq!(link.successor, outcome.project.tasks[5].id, "Hand over");
+    }
+
+    #[test]
+    fn a_reference_that_names_nothing_is_left_out_and_counted() {
+        let book = sheet(&[
+            &["No.", "Task Name", "Predecessors"],
+            &["1", "Survey", ""],
+            &["1.1", "Dig", ""],
+            &["1.2", "Pour", "9.9.9, \u{25c6}"],
+        ]);
+        let outcome = import(&book);
+        assert_eq!(outcome.report.links, 0);
+        assert_eq!(outcome.report.dropped_links, 2);
+    }
+
+    #[test]
+    fn a_successor_column_creates_the_link_on_the_other_task() {
+        // The reverse of a predecessor, so importing one means giving the link
+        // to the row it names rather than to the row it is written on.
+        let book = sheet(&[
+            &["Task Name", "Out Dependencies (Successors)"],
+            &["Survey", "3"],
+            &["Dig", ""],
+            &["Pour", ""],
+        ]);
+        let outcome = import(&book);
+        assert_eq!(outcome.report.links, 1);
+        let link = outcome.project.links[0];
+        assert_eq!(link.predecessor, outcome.project.tasks[0].id, "Survey");
+        assert_eq!(link.successor, outcome.project.tasks[2].id, "Pour");
+    }
+
+    #[test]
+    fn the_two_dependency_columns_agreeing_is_one_link_and_not_two() {
+        let book = sheet(&[
+            &["Task Name", "Predecessors", "Successors"],
+            &["Survey", "", "2"],
+            &["Dig", "1", ""],
+        ]);
+        let outcome = import(&book);
+        assert_eq!(outcome.report.links, 1);
+        assert_eq!(outcome.report.dropped_links, 0, "agreement is not a problem");
+    }
+
+    #[test]
+    fn the_two_dependency_columns_disagreeing_keeps_the_predecessor() {
+        // One relationship written twice, the second time backwards. Taking
+        // both would be a loop of two, which is a plan that cannot be
+        // scheduled, so the predecessors column wins and the other is said.
+        // The same two rows, joined both ways round by the same row's own two
+        // cells: Survey waits for Dig, and Survey is followed by Dig.
+        let book = sheet(&[
+            &["Task Name", "Predecessors", "Successors"],
+            &["Survey", "2", "2"],
+            &["Dig", "", ""],
+        ]);
+        let outcome = import(&book);
+        assert_eq!(outcome.report.links, 1);
+        let link = outcome.project.links[0];
+        assert_eq!(link.predecessor, outcome.project.tasks[1].id, "Dig");
+        assert_eq!(link.successor, outcome.project.tasks[0].id, "Survey");
+        assert_eq!(outcome.report.dropped_links, 1);
+        assert!(
+            outcome
+                .report
+                .notices
+                .iter()
+                .any(|notice| notice.why.contains("other way round"))
+        );
+    }
+
+    #[test]
+    fn a_dependency_that_would_close_a_loop_is_refused_and_named() {
+        let book = sheet(&[
+            &["Task Name", "Predecessors"],
+            &["Survey", "3"],
+            &["Dig", "1"],
+            &["Pour", "2"],
+        ]);
+        let outcome = import(&book);
+        assert_eq!(outcome.report.links, 2, "the loop is broken, not the plan");
+        assert_eq!(outcome.report.looped_links, 1);
+        assert!(
+            crate::schedule::schedule(&mut outcome.project.clone()).is_ok(),
+            "a plan that came out of this has to be schedulable"
+        );
+    }
+
+    #[test]
+    fn a_dependency_on_a_row_that_contains_it_is_a_loop_and_is_refused() {
+        // The scheduler expands a link naming a summary onto every leaf under
+        // it, so a task waiting for its own parent is waiting for itself. The
+        // two are different rows, so nothing but the outline says otherwise.
+        let book = sheet(&[
+            &["Task Name", "Level", "Predecessors"],
+            &["Phase one", "1", ""],
+            &["Survey", "2", "1"],
+            &["Dig", "2", ""],
+        ]);
+        let outcome = import(&book);
+        assert_eq!(outcome.report.links, 0);
+        assert_eq!(outcome.report.looped_links, 1);
     }
 
     // ---- the account of it -------------------------------------------

@@ -1008,6 +1008,7 @@ fn column_for(field: Field) -> Result<Column, MacroError> {
         Field::Start => Ok(Column::Start),
         Field::Finish => Ok(Column::Finish),
         Field::Predecessors => Ok(Column::Predecessors),
+        Field::Successors => Ok(Column::Successors),
         Field::ResourceNames => Ok(Column::Resources),
         other => Err(MacroError::FieldNotWritable { field: other }),
     }

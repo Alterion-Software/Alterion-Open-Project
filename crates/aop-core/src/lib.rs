@@ -21,6 +21,7 @@ pub mod leveling;
 pub mod model;
 pub mod mpp;
 pub mod mspdi;
+pub mod mspdi_write;
 pub mod pdf;
 pub mod persist;
 pub mod schedule;
@@ -44,6 +45,7 @@ pub use model::{
     Resource, ResourceId, ResourceKind, ScheduleFrom, Scheduled, Task, TaskId, TaskMode,
 };
 pub use mspdi::ImportError;
+pub use mspdi_write::ExportError as ProjectXmlError;
 pub use persist::{FileError, FILE_EXTENSION, FILE_TYPE_NAME};
 pub use schedule::{
     apply_remedy, critical_path, critical_path_duration_minutes, critical_path_span_minutes,

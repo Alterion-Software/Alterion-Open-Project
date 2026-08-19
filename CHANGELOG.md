@@ -2,6 +2,86 @@
 
 Notable changes, newest first. Dates are the day a version was tagged.
 
+## 1.0.4-beta
+
+Live editing that carries what you do, and a way out to Microsoft Project.
+
+### Live collaborate, which was wrong in both directions at once
+
+The server renumbers every entry as it lands it, so a change sent as 6 comes
+back to everybody, its author included, as 43. Comparing an id the server
+chose against one this copy chose is comparing two numbering schemes that
+share a type, and it failed opposite ways on the same line.
+
+- **Fields duplicated on every sync.** Your own work came back over the
+  socket wearing a number you did not recognise and was applied twice. The
+  client also never sent the field the server reads to avoid echoing to the
+  sender, and could not: nothing told it its own connection id.
+- **Somebody else's change never appeared.** Local ids and server sequence
+  numbers share a numbering space, so a copy holding unsent work holds an
+  entry whose id will also be issued as a sequence number. The next change
+  anybody made collided with it and was dropped as a duplicate, and the
+  cursor advanced regardless, so it was never asked for again. The table was
+  not failing to redraw; the change never arrived.
+- **Your copy offered other people's work back to the server**, on every
+  incoming change, writing a duplicate into the shared log for everybody.
+
+The cursor decides now, because the cursor is the record of how far down the
+shared log this copy has read.
+
+- Saving a shared plan reaches the server, and can never fail the save for it.
+- A batch nobody answers times out after twenty seconds instead of leaving a
+  session silently mute, which is what a mismatched server did.
+- `/api/health` publishes what protocol it speaks, so a mismatched pair says
+  so instead of half working.
+
+### Microsoft Project
+
+- **Export as Microsoft Project XML.** Project opens it with File and Open and
+  can save it as `.mpp` itself. Tasks, outline, links with type and lag,
+  constraints, deadlines, baselines, actuals, resources, assignments and
+  calendars, including per resource calendars and leave, which are written as
+  a derived calendar per person. The 1504 task plan we test with round trips
+  with no field mismatches and identical dates on both sides.
+- **Importing a Project file was silently truncating text.** A name, note or
+  author containing `&` or `<` arrived cut short: "Survey & report" imported
+  as "report", because the parser kept only the last fragment of a run split
+  at each entity reference. Every such name in every file ever imported was
+  affected.
+- Also now read, having been dropped before: baselines, task calendars,
+  estimated durations, the actuals block, resource notes, email and code, and
+  cost resources, which were arriving as work resources.
+
+### Spreadsheets
+
+- **A plan that would not schedule.** Dependency references written as WBS
+  codes were parsed as row numbers, so `5.2.1` resolved to whichever task is
+  fifth, and the resulting cycle meant nothing scheduled and every date read
+  as zero. A WBS column is now read as both the outline and the identity its
+  own dependency column cites.
+- Cycles are refused at import with a notice naming the rows, rather than
+  producing a plan that cannot be scheduled and does not say why.
+- An outline value that cannot be a level, such as an issue number, is
+  inherited from the row above rather than starting a ratchet that deepened
+  every following row.
+- A duration of a hundred years and a date at Excel's epoch zero are refused.
+- The mapping page shows the columns it could place, with the rest a button
+  away, rather than drawing a card for all ninety nine.
+
+### Successors
+
+A Successors tab in Task Information and a Successors column in the grid,
+both the same picker as Predecessors pointed the other way. A successor is
+not stored: it is the same link read from the other end, so editing either
+end changes one thing.
+
+### Also
+
+- Opening a plan file no longer starts a second copy of the application. Two
+  copies of one shared plan, each with its own log and cursor, is the state
+  the sync protocol exists to detect.
+- The About page names the engine rather than the toolkit it is built with.
+
 ## 1.0.3-beta
 
 Live editing that is actually live, and Windows keeping what it is told.

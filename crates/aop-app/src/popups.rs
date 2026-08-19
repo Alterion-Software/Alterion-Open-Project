@@ -1,5 +1,9 @@
-//! Popup cell editors: a predecessor picker and a resource picker, opened from
+//! Popup cell editors: a dependency picker and a resource picker, opened from
 //! the grid instead of making the user type raw cell syntax.
+//!
+//! The dependency picker serves both ends of a link. Predecessors and
+//! successors are the same rows of `Project.links` read from opposite sides,
+//! so they are picked by one component pointed either way.
 
 use dioxus::prelude::*;
 
@@ -62,13 +66,83 @@ fn Anchored(width: f64, children: Element) -> Element {
     }
 }
 
-// ------------------------------------------------------------ predecessors
+// ------------------------------------------------------------- dependencies
+
+/// Which end of a link a picker is being pointed at.
+///
+/// The picker is one component rather than two because a successor is not a
+/// second kind of relationship: it is the same `Link` read from the other end.
+/// Two components would be two chances to disagree about what a link is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEnd {
+    /// The listed tasks come before the task being edited.
+    Predecessors,
+    /// The listed tasks wait on the task being edited.
+    Successors,
+}
+
+impl LinkEnd {
+    /// The grid column this end writes to, which is also the cell the typed
+    /// form commits through.
+    fn column(self) -> Column {
+        match self {
+            LinkEnd::Predecessors => Column::Predecessors,
+            LinkEnd::Successors => Column::Successors,
+        }
+    }
+
+    fn heading(self, task: &str) -> String {
+        match self {
+            LinkEnd::Predecessors => format!("Predecessors of {task}"),
+            LinkEnd::Successors => format!("Successors of {task}"),
+        }
+    }
+
+    fn empty_hint(self) -> &'static str {
+        match self {
+            LinkEnd::Predecessors => "There is no other task to depend on yet.",
+            LinkEnd::Successors => "There is no other task to wait on this one yet.",
+        }
+    }
+
+    fn explanation(self) -> &'static str {
+        match self {
+            LinkEnd::Predecessors => {
+                "Tick a task to depend on it. The type sets which ends are tied together, and lag                  delays the successor: 2 days waits, -1 day overlaps."
+            }
+            LinkEnd::Successors => {
+                "Tick a task to make it wait on this one. The type sets which ends are tied                  together, and lag delays the successor: 2 days waits, -1 day overlaps."
+            }
+        }
+    }
+
+    fn tally(self, chosen: usize) -> String {
+        match (self, chosen) {
+            (LinkEnd::Predecessors, 1) => "1 predecessor".to_string(),
+            (LinkEnd::Predecessors, n) => format!("{n} predecessors"),
+            (LinkEnd::Successors, 1) => "1 successor".to_string(),
+            (LinkEnd::Successors, n) => format!("{n} successors"),
+        }
+    }
+}
 
 #[component]
 pub fn PredecessorPopup(row: usize) -> Element {
     rsx! {
         Anchored { width: 560.0,
-            PredecessorPicker { row }
+            LinkPicker { row, end: LinkEnd::Predecessors }
+            div { style: "display: flex; justify-content: flex-end; margin-top: 10px;",
+                DonePopup {}
+            }
+        }
+    }
+}
+
+#[component]
+pub fn SuccessorPopup(row: usize) -> Element {
+    rsx! {
+        Anchored { width: 560.0,
+            LinkPicker { row, end: LinkEnd::Successors }
             div { style: "display: flex; justify-content: flex-end; margin-top: 10px;",
                 DonePopup {}
             }
@@ -85,18 +159,20 @@ fn DonePopup() -> Element {
     }
 }
 
-/// The predecessor picker itself: every task that could be depended on, shown
-/// at its outline level with a tick box, plus the typed form for planners who
-/// know the row numbers.
+/// The dependency picker itself: every task that could be on the other end of a
+/// link, shown at its outline level with a tick box, plus the typed form for
+/// planners who know the row numbers.
 ///
-/// Used both by the popup the grid opens and by the Predecessors tab of Task
-/// Information, so the two cannot drift apart.
+/// Used by the popup the grid opens and by the Predecessors and Successors tabs
+/// of Task Information, so none of them can drift apart.
 #[component]
-pub fn PredecessorPicker(row: usize) -> Element {
+pub fn LinkPicker(row: usize, end: LinkEnd) -> Element {
     let mut state = use_context::<Signal<AppState>>();
 
-    // Everything that could be a predecessor: the whole outline except this
-    // task and the rows nested underneath it, which cannot depend on it.
+    // Everything that could be on the other end: the whole outline except this
+    // task and the rows nested underneath it, which cannot be tied to it in
+    // either direction. A summary already spans its children, so a link
+    // between the two would be a task waiting on itself.
     struct Row {
         id: TaskId,
         number: usize,
@@ -113,11 +189,20 @@ pub fn PredecessorPicker(row: usize) -> Element {
             return rsx! {};
         };
         let own = project.descendants(row);
-        let existing: Vec<(TaskId, LinkType, i64)> = project
-            .predecessors_of(task.id)
-            .into_iter()
-            .map(|l| (l.predecessor, l.kind, l.lag_minutes))
-            .collect();
+        // The very same links either way round, only read from the end this
+        // picker is pointed at.
+        let existing: Vec<(TaskId, LinkType, i64)> = match end {
+            LinkEnd::Predecessors => project
+                .predecessors_of(task.id)
+                .into_iter()
+                .map(|l| (l.predecessor, l.kind, l.lag_minutes))
+                .collect(),
+            LinkEnd::Successors => project
+                .successors_of(task.id)
+                .into_iter()
+                .map(|l| (l.successor, l.kind, l.lag_minutes))
+                .collect(),
+        };
 
         let rows: Vec<Row> = (0..project.tasks.len())
             .filter(|&index| index != row && !own.contains(&index))
@@ -144,6 +229,26 @@ pub fn PredecessorPicker(row: usize) -> Element {
     };
 
     let chosen = rows.iter().filter(|r| r.linked.is_some()).count();
+    let heading = end.heading(&task_name);
+
+    // Ticking a box writes the plan directly, and which way round it is written
+    // is the only thing that differs between the two ends.
+    let mut set = move |other: TaskId, kind: LinkType, lag: i64| {
+        let mut w = state.write();
+        match end {
+            LinkEnd::Predecessors => w.set_link(row, other, kind, lag),
+            LinkEnd::Successors => w.set_successor_link(row, other, kind, lag),
+        }
+        w.refresh_cell_draft();
+    };
+    let mut clear = move |other: TaskId| {
+        let mut w = state.write();
+        match end {
+            LinkEnd::Predecessors => w.remove_link(row, other),
+            LinkEnd::Successors => w.remove_successor_link(row, other),
+        }
+        w.refresh_cell_draft();
+    };
 
     // Seeded with what the cell already says, so typing edits rather than
     // starts from nothing.
@@ -152,20 +257,23 @@ pub fn PredecessorPicker(row: usize) -> Element {
         s.project
             .tasks
             .get(row)
-            .map(|task| s.project.predecessor_text(task.id))
+            .map(|task| match end {
+                LinkEnd::Predecessors => s.project.predecessor_text(task.id),
+                LinkEnd::Successors => s.project.successor_text(task.id),
+            })
             .unwrap_or_default()
     });
     let mut commit = move || {
         let text = typed();
-        state.write().commit_cell(row, Column::Predecessors, &text);
+        state.write().commit_cell(row, end.column(), &text);
     };
 
     rsx! {
         div { class: "picker",
-            div { class: "ctxheader", "Predecessors of {task_name}" }
+            div { class: "ctxheader", "{heading}" }
 
             if rows.is_empty() {
-                div { class: "hint", "There is no other task to depend on yet." }
+                div { class: "hint", "{end.empty_hint()}" }
             } else {
                 div { class: "pred-list",
                     for entry in rows.iter() {
@@ -187,13 +295,9 @@ pub fn PredecessorPicker(row: usize) -> Element {
                                         style: "padding-left: {indent}px;",
                                         onclick: move |_| {
                                             if checked {
-                                                let mut w = state.write();
-                                                w.remove_link(row, id);
-                                                w.refresh_cell_draft();
+                                                clear(id);
                                             } else {
-                                                let mut w = state.write();
-                                                w.set_link(row, id, LinkType::FS, 0);
-                                                w.refresh_cell_draft();
+                                                set(id, LinkType::FS, 0);
                                             }
                                         },
                                         span { class: "{box_class}", if checked { "\u{2713}" } }
@@ -209,6 +313,10 @@ pub fn PredecessorPicker(row: usize) -> Element {
                                     // put it straight back, because the other three are how
                                     // overlapping work is expressed and hunting for the
                                     // syntax is not a substitute for a control.
+                                    //
+                                    // Both belong to the link rather than to either task, so
+                                    // changing one here changes exactly the same link the
+                                    // other end is showing.
                                     if checked {
                                         div { class: "pred-detail",
                                             Dropdown {
@@ -218,10 +326,8 @@ pub fn PredecessorPicker(row: usize) -> Element {
                                                     .collect(),
                                                 width: 62.0, large: false, disabled: false,
                                                 on_pick: move |picked: String| {
-                                                    let chosen = LinkType::parse(&picked).unwrap_or(LinkType::FS);
-                                                    let mut w = state.write();
-                                                    w.set_link(row, id, chosen, lag);
-                                                    w.refresh_cell_draft();
+                                                    let picked = LinkType::parse(&picked).unwrap_or(LinkType::FS);
+                                                    set(id, picked, lag);
                                                 },
                                             }
                                             input {
@@ -229,14 +335,13 @@ pub fn PredecessorPicker(row: usize) -> Element {
                                                 title: "Lag; use a negative value to overlap",
                                                 value: "{signed_lag(lag)}",
                                                 onchange: move |event| {
-                                                    let minutes = parse_signed_lag(&event.value());
-                                                    state.write().set_link(row, id, kind, minutes);
+                                                    set(id, kind, parse_signed_lag(&event.value()));
                                                 },
                                             }
                                             button {
                                                 class: "iconbtn danger",
                                                 title: "Remove this link",
-                                                onclick: move |_| state.write().remove_link(row, id),
+                                                onclick: move |_| clear(id),
                                                 {icon("clear", 13)}
                                             }
                                         }
@@ -248,10 +353,7 @@ pub fn PredecessorPicker(row: usize) -> Element {
                 }
             }
 
-            div { class: "hint",
-                "Tick a task to depend on it. The type sets which ends are tied together, and lag "
-                "delays the successor: 2 days waits, -1 day overlaps."
-            }
+            div { class: "hint", "{end.explanation()}" }
 
             // Typing is faster than hunting for a row once you know the number,
             // so the same cell text Project accepts is accepted here.
@@ -268,15 +370,7 @@ pub fn PredecessorPicker(row: usize) -> Element {
             }
 
             div { class: "pred-foot",
-                span { class: "recent-path",
-                    {
-                        if chosen == 1 {
-                            "1 predecessor".to_string()
-                        } else {
-                            format!("{chosen} predecessors")
-                        }
-                    }
-                }
+                span { class: "recent-path", {end.tally(chosen)} }
             }
         }
     }
