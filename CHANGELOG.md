@@ -2,6 +2,35 @@
 
 Notable changes, newest first. Dates are the day a version was tagged.
 
+## 1.0.5-beta
+
+**Live collaborate actually carries what you do.** Everything in 1.0.4 was
+correct about what to send and when; the socket could not be written to
+between frames from the server.
+
+`set_read_timeout` matched on the transport and did nothing for anything it
+did not recognise. This crate asks tungstenite for rustls, `dioxus-devtools`
+asks the same tungstenite for native-tls, cargo unifies the features, and
+tungstenite prefers native-tls when both are on. So the socket was a variant
+with no arm, no read timeout was ever set, and the read blocked until the
+server happened to say something, which is every twenty five to thirty
+seconds. Everything waiting went out in a clump at that moment, which is why
+one pointer position was recorded and then nothing ever moved again.
+
+Measured against an independent client watching the room: nothing but the
+greeting in thirty seconds before, a hundred and twenty four pointer updates
+in twenty five seconds after. Typing into a cell now appears on the other
+screen letter by letter, and the committed change follows within the second.
+
+The connection is made directly now and the timeout set on a duplicate of the
+socket, which holds whichever TLS wrapper is chosen, so no dependency's
+feature selection can take it away again.
+
+Also: a log at `<config root>/log.log`, truncated at each start, recording
+start up, signing in, and every live decision **including the decisions not to
+send**. This failure worked once and then stopped silently, which a log of
+successes alone cannot show.
+
 ## 1.0.4-beta
 
 Live editing that carries what you do, and a way out to Microsoft Project.
