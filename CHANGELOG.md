@@ -2,6 +2,22 @@
 
 Notable changes, newest first. Dates are the day a version was tagged.
 
+## 1.0.2-beta
+
+Windows fixes, found by running it on Windows.
+
+- **The Open and Save As panes started nowhere.** The folder they begin in was
+  read from `HOME`, which is a Unix variable that Windows does not set, so
+  every Windows copy fell through to `.`, the directory the application
+  happened to be launched from. It asks for `USERPROFILE` first there, falls
+  back to `HOMEDRIVE` and `HOMEPATH` for the case where Windows splits it in
+  two, and checks the Documents folder exists before starting in it, since it
+  can be renamed, redirected to a network share, or simply absent.
+- **The Open pane had no way off the drive it started on.** Going up walks to
+  the parent, and the parent of `C:\` is nothing. It has drive buttons and a
+  Home button now, the same as the browser in the dialogs, which got them
+  first.
+
 ## 1.0.1-beta
 
 Everything here was found by running the thing against a real deployment

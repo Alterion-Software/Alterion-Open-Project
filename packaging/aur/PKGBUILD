@@ -1,6 +1,6 @@
 # Maintainer: Chace Berry <chaceberry686@gmail.com>
 pkgname=alterion-open-project
-pkgver=1.0.1
+pkgver=1.0.2
 pkgrel=1
 pkgdesc="Project scheduler with a critical path engine, Gantt chart and Microsoft Project import"
 arch=('x86_64' 'aarch64')

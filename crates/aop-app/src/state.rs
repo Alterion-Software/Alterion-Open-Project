@@ -6093,10 +6093,48 @@ fn save_qat(commands: &[QatCommand]) {
 }
 
 /// The default folder the Save As and Open panes start in.
+///
+/// `HOME` is a Unix variable. Windows does not set it and uses `USERPROFILE`,
+/// so asking for `HOME` alone fell through to `.`, the working directory,
+/// which is wherever the application happened to be started from and holds
+/// nobody's plans. Both are asked for, in the order that suits the platform.
+///
+/// The Documents folder is preferred but not insisted on: it can be renamed,
+/// redirected to a network share, or simply absent, and starting in a folder
+/// that does not exist shows an empty list with nothing to say why. Falling
+/// back to the home folder is worse than Documents and much better than
+/// nothing.
+pub fn home_dir() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["USERPROFILE", "HOME"]
+    } else {
+        &["HOME", "USERPROFILE"]
+    };
+    for name in names {
+        if let Some(value) = std::env::var_os(name) {
+            let path = PathBuf::from(value);
+            if !path.as_os_str().is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    // Windows splits it in two when it is not set as one.
+    match (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
+        (Some(drive), Some(rest)) => {
+            let mut path = drive;
+            path.push(rest);
+            Some(PathBuf::from(path))
+        }
+        _ => None,
+    }
+}
+
 pub fn documents_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("Documents"))
-        .unwrap_or_else(|| PathBuf::from("."))
+    let Some(home) = home_dir() else {
+        return PathBuf::from(".");
+    };
+    let documents = home.join("Documents");
+    if documents.is_dir() { documents } else { home }
 }
 
 /// Rebuild each band's count and totals from the rows still under it.
@@ -7461,5 +7499,27 @@ mod tests {
 
         assert!(!offered_in_browser(&std::path::PathBuf::from("notes.txt"), false));
         assert!(!offered_in_browser(&std::path::PathBuf::from("noextension"), false));
+    }
+
+    #[test]
+    fn a_start_folder_is_found_from_whichever_variable_this_platform_sets() {
+        // The bug this pins: `documents_dir` asked only for HOME, which is a
+        // Unix variable. Windows sets USERPROFILE, so every Windows copy fell
+        // through to ".", the working directory, and the Open page listed the
+        // folder the application happened to be started from.
+        let found = home_dir();
+        assert!(
+            found.is_some(),
+            "no home could be found from HOME, USERPROFILE or HOMEDRIVE/HOMEPATH"
+        );
+        let start = documents_dir();
+        assert_ne!(
+            start,
+            std::path::Path::new("."),
+            "the working directory is never somebody's plans"
+        );
+        // Documents when it is there, the home folder when it is not, but
+        // always somewhere that exists rather than a guess.
+        assert!(start.is_dir(), "the start folder must exist: {start:?}");
     }
 }

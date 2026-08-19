@@ -622,6 +622,22 @@ pub(crate) fn FileBrowser(
                 },
                 "Up"
             }
+            // Home, because the folder box can be typed into and walked out
+            // of, and there should always be one press back to somewhere with
+            // plans in it.
+            button { class: "btn",
+                onclick: move |_| dir.set(crate::state::documents_dir()),
+                "Home"
+            }
+            // Empty on any platform with a single root. On Windows the parent
+            // of `C:\` is nothing, so without these a plan on another drive
+            // cannot be navigated to at all.
+            for (label, root) in crate::state::browser_roots() {
+                button { class: "btn",
+                    onclick: move |_| dir.set(root.clone()),
+                    "{label}"
+                }
+            }
         }
 
         if saving {
