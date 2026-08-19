@@ -178,6 +178,33 @@ packaging/macos/build-dmg.sh             # macOS universal .app and .dmg
 On Arch, `install.sh` offers to build the package instead of dropping loose
 files, because a package manager that owns the files can also remove them.
 
+### Updating
+
+The application checks for a new version itself and offers it, and **how it
+updates depends on how it was installed**, because getting that wrong breaks
+things quietly:
+
+| Installed by | How it updates |
+| --- | --- |
+| `install.sh` for your user | the application replaces its own binary, after checking it against the published checksum |
+| `install.sh --system` | run `install.sh` again; the files are not your account's to rewrite |
+| pacman, from the AUR package | `pacman -Syu`. The application refuses to touch files pacman owns |
+| the Windows installer | run the new installer; it finds the existing location and updates in place |
+| the macOS disk image | drag the new one over, as with any `.app` |
+
+A self-updating copy that overwrote files a package manager owned would be
+undone by the next system upgrade, or would make that upgrade fail on a
+conflict, so those cases report the new version and name the command instead.
+
+Because `install.sh` has its version written into it, fetch the current one
+rather than re-running an old copy:
+
+```
+curl -fsSL https://github.com/Alterion-Software/Alterion-Open-Project/releases/latest/download/install.sh | bash
+```
+
+Update checks can be turned off entirely in Options > General.
+
 Both share `packaging/linux/`: the desktop entry, the scalable icon (which the
 Windows `.ico` is generated from), and the MIME definition that registers
 `.aprj` against its `APRJ` magic bytes rather than just the extension.

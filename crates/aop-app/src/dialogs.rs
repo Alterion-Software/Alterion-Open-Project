@@ -100,13 +100,23 @@ fn UpdateAvailable() -> Element {
         Head { title: "Update".to_string() }
         div { class: "dlg-body", style: "min-width: 460px;",
             match (&found, &ready) {
-                (_, Some(crate::updates::Installed::Downloaded { installer })) => rsx! {
+                (_, Some(crate::updates::Installed::Downloaded { installer, .. })) => rsx! {
                     p { class: "hint", style: "margin-top: 0;",
-                        "The installer has been downloaded and checked against the checksum                          published with it. Running it closes this application."
+                        "The installer has been downloaded and checked against the checksum \
+                         published with it. Installing closes this application, which is what \
+                         frees its files to be replaced, and starts the new version when it is \
+                         done."
                     }
                     div { class: "sync-row",
                         span { class: "sync-key", "Installer" }
                         span { class: "sync-value mono", "{installer.display()}" }
+                    }
+                    // Closing is no longer something to walk through a wizard
+                    // first: this window goes the moment the button is
+                    // pressed, so anything unsaved has to be said before it
+                    // rather than after.
+                    if let Some(why) = &blocked {
+                        p { class: "sync-why", style: "margin-top: 12px;", "{why}" }
                     }
                 },
                 (Some(found), _) => rsx! {
@@ -159,15 +169,19 @@ fn UpdateAvailable() -> Element {
                 "Check again"
             }
             div { class: "grow" }
-            if let Some(crate::updates::Installed::Downloaded { installer }) = ready {
+            if let Some(crate::updates::Installed::Downloaded { installer, sha256 }) = ready {
                 button {
                     class: "btn primary",
+                    disabled: blocked.is_some() || working,
                     onclick: move |_| {
-                        if crate::updates::run_installer(&installer).is_ok() {
-                            state.write().quit_requested = true;
+                        match crate::updates::run_installer(&installer, &sha256) {
+                            Ok(()) => state.write().quit_requested = true,
+                            // Refusing to run it is the point of checking, so
+                            // say so rather than closing on a failure.
+                            Err(why) => state.write().update_message = Some(why),
                         }
                     },
-                    "Run the installer"
+                    "Install and restart"
                 }
             } else if found.as_ref().is_some_and(|found| found.installable()) {
                 button {
@@ -177,7 +191,32 @@ fn UpdateAvailable() -> Element {
                     "Install it"
                 }
             }
-            button { class: "btn", onclick: move |_| state.write().dialog = None, "Close" }
+            // Offered for any release that was found, including one this copy
+            // will not install itself: somebody told to run a package manager
+            // command is exactly the person who may want to be left alone
+            // about this version and told about the next.
+            if found.is_some() {
+                button {
+                    class: "btn",
+                    disabled: working,
+                    title: "This version is never offered again. Later versions still are.",
+                    onclick: move |_| {
+                        let mut writer = state.write();
+                        writer.skip_the_found_version();
+                        writer.dialog = None;
+                    },
+                    "Skip this version"
+                }
+            }
+            // What closing the dialog has always meant, said out loud. Leaving
+            // it as a dismissal makes "ask me again" the one answer of the
+            // three with no button, which reads as though it were not an
+            // answer at all.
+            button {
+                class: "btn",
+                onclick: move |_| state.write().dialog = None,
+                if found.is_some() { "Not now" } else { "Close" }
+            }
         }
     }
 }

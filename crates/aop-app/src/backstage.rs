@@ -1655,6 +1655,7 @@ const ATTRIBUTIONS: [(&str, &[Attribution]); 5] = [
 fn AboutPage() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let mut show_attributions = use_signal(|| false);
+    let skipped = state.read().skip_version.clone();
     let year = chrono::Local::now().year();
     let (logo_w, logo_h) = crate::brand::LOGO_VIEWBOX;
     let logo_height = 210.0 * logo_h / logo_w;
@@ -1691,6 +1692,17 @@ fn AboutPage() -> Element {
                     div { key: "{label}", class: "about-row",
                         span { class: "k", "{label}" }
                         span { class: "v", "{value}" }
+                    }
+                }
+                // Beside the version that is running, since the pair is the
+                // whole story: this is what you have, and that is the one you
+                // asked not to be offered. Only while there is one, and where
+                // Check for updates is, so the button and the reason it may
+                // say nothing are read together.
+                if !skipped.is_empty() {
+                    div { class: "about-row",
+                        span { class: "k", "Skipped" }
+                        span { class: "v", "v{skipped}, cleared in Options under General" }
                     }
                 }
             }
@@ -2502,9 +2514,14 @@ fn OptGeneral() -> Element {
         let s = state.read();
         (s.user_name.clone(), s.user_initials.clone(), s.default_view)
     };
-    let (update_check, patch_notes, support_page) = {
+    let (update_check, patch_notes, support_page, skipped) = {
         let s = state.read();
-        (s.update_check, s.patch_notes, s.support_page)
+        (
+            s.update_check,
+            s.patch_notes,
+            s.support_page,
+            s.skip_version.clone(),
+        )
     };
     // The name on the account, while there is one. It is the name written
     // against every change in a shared plan, so it is the name to show here:
@@ -2614,6 +2631,24 @@ fn OptGeneral() -> Element {
             on: move |_| { let on = state.read().patch_notes; state.write().patch_notes = !on; } }
         OptCheck { label: "Offer the support page after an update".to_string(), on_state: support_page,
             on: move |_| { let on = state.read().support_page; state.write().support_page = !on; } }
+        // Only while there is one. A row saying nothing is skipped would be a
+        // permanent fixture explaining a feature nobody had used, and the
+        // reason this is here at all is the opposite case: a skip that cannot
+        // be found again is somebody quietly not being offered a fix.
+        if !skipped.is_empty() {
+            Setting {
+                label: "Skipped version".to_string(),
+                hint: "Not offered again. Anything newer still is.".to_string(),
+                div { style: "display: flex; align-items: center; gap: 10px;",
+                    span { class: "opt-hint", "v{skipped}" }
+                    button {
+                        class: "btn",
+                        onclick: move |_| state.write().offer_the_skipped_version_again(),
+                        "Offer it again"
+                    }
+                }
+            }
+        }
     }
 }
 

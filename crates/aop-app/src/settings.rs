@@ -94,6 +94,15 @@ pub struct Settings {
     /// Whether to look for a newer release at all. Honoured everywhere,
     /// including the check made at start up.
     pub update_check: bool,
+    /// The one version somebody asked never to be offered again. Empty until
+    /// they do, and that emptiness is the whole record.
+    ///
+    /// The version rather than a flag, and that is the point of the key. A
+    /// flag would either silence every release after it or need clearing at
+    /// some moment nobody could name, whereas a version answers exactly one
+    /// question: is the release that was just found this one. Anything newer
+    /// is a different release and is still offered.
+    pub skip_version: String,
     /// Only the bindings the user has changed. Defaults are left out so a later
     /// release can improve one and have it reach anyone who never touched it.
     pub keys: crate::keymap::Keymap,
@@ -132,6 +141,8 @@ impl Default for Settings {
             patch_notes: true,
             support_page: true,
             update_check: true,
+            // Nothing skipped until somebody skips something.
+            skip_version: String::new(),
             // Marking the critical path everywhere by default turns the whole
             // plan red, which says nothing about which parts matter.
             show_critical: false,
@@ -216,6 +227,10 @@ impl Settings {
              support_page = {}\n\
              # Whether to look for a newer release at all.\n\
              update_check = {}\n\
+             # One version you chose to skip, and only that one. A release\n\
+             # newer than it is still offered. Delete this line to be offered\n\
+             # it again.\n\
+             skip_version = {}\n\
              {}",
             self.user_name,
             self.user_initials,
@@ -243,6 +258,7 @@ impl Settings {
             self.patch_notes,
             self.support_page,
             self.update_check,
+            self.skip_version,
             self.keyboard_section(),
         )
     }
@@ -358,6 +374,12 @@ impl Settings {
         settings.patch_notes = flag("patch_notes", settings.patch_notes);
         settings.support_page = flag("support_page", settings.support_page);
         settings.update_check = flag("update_check", settings.update_check);
+        // Read whole rather than filtered for emptiness, for the same reason
+        // the acknowledgement above is: an empty value is a real answer, and
+        // writing one back empty is how a skip is withdrawn by hand.
+        if let Some(value) = text_of("skip_version") {
+            settings.skip_version = value;
+        }
 
         settings
     }
@@ -394,6 +416,44 @@ impl Settings {
             }
         let _ = std::fs::write(path, self.to_text());
     }
+
+    /// Forget a skip the running copy has already gone past.
+    ///
+    /// A skip only ever means "not this one, I am staying where I am". Once
+    /// the running version is that one or later, whatever it took to get here
+    /// (the installer run by hand, a package manager, a rebuild), the record
+    /// describes a release nobody can be offered any more. Left alone it would
+    /// sit in the file for good, be shown in Options as though it still meant
+    /// something, and have to be reasoned about every time this is read.
+    ///
+    /// It also happens to be where a value that is not a version at all gets
+    /// dropped. Comparison treats anything unparseable as equal to everything,
+    /// so `skip_version = yes` typed into the file by hand would otherwise
+    /// silence every release. Equal is not newer, so it is cleared here on the
+    /// next start rather than quietly suppressing updates for ever.
+    pub fn forget_a_spent_skip(&mut self, running: &str) {
+        if !self.skip_version.is_empty()
+            && !crate::updates::is_newer(&self.skip_version, running)
+        {
+            self.skip_version.clear();
+        }
+    }
+}
+
+/// Whether a release that has been found is the one that was skipped.
+///
+/// Equality, and deliberately nothing wider. "Skip this version" is an answer
+/// about one release, not a ceiling: a person who skips `1.0.2` because it
+/// broke something they rely on still wants to hear about `1.0.3`, which may
+/// well be the release that fixes it. Suppressing anything at or below the
+/// skipped version would turn one refusal into a permanent silence.
+///
+/// Compared as versions rather than as text, since `1.0.10` and `1.0.9` are
+/// not ordered the way their strings are, and `1.0.0-beta` is not `1.0.0`.
+pub fn is_skipped(skipped: &str, version: &str) -> bool {
+    !skipped.is_empty()
+        && !crate::updates::is_newer(version, skipped)
+        && !crate::updates::is_newer(skipped, version)
 }
 
 #[cfg(test)]
@@ -431,6 +491,7 @@ mod tests {
             patch_notes: false,
             support_page: false,
             update_check: false,
+            skip_version: "1.0.2".into(),
             keys: {
                 let mut keys = crate::keymap::Keymap::default();
                 keys.bind(crate::keymap::Action::SetBaseline, "Ctrl+B");
@@ -523,6 +584,100 @@ mod tests {
     fn update_checks_are_on_until_they_are_turned_off() {
         assert!(Settings::default().update_check);
         assert!(!Settings::from_text("update_check = false").update_check);
+    }
+
+    #[test]
+    fn nothing_is_skipped_until_somebody_skips_something() {
+        assert!(Settings::default().skip_version.is_empty());
+        assert!(!is_skipped("", "1.0.2"));
+    }
+
+    #[test]
+    fn the_skipped_version_travels_through_the_file_with_everything_else() {
+        // Its own assertion as well as the round trip above, because this is
+        // the key whose loss would silently start offering a version somebody
+        // has already refused.
+        let settings = Settings {
+            skip_version: "1.0.2".into(),
+            ..Settings::default()
+        };
+        assert_eq!(Settings::from_text(&settings.to_text()).skip_version, "1.0.2");
+        assert_eq!(
+            Settings::from_text("skip_version = 1.0.2-beta.2").skip_version,
+            "1.0.2-beta.2"
+        );
+    }
+
+    #[test]
+    fn deleting_the_line_by_hand_offers_the_version_again() {
+        // The record is the only thing suppressing the offer, so a file
+        // without one has to read as nothing skipped.
+        assert!(Settings::from_text("update_check = true").skip_version.is_empty());
+        assert!(!is_skipped(&Settings::from_text("").skip_version, "1.0.2"));
+    }
+
+    #[test]
+    fn only_the_skipped_version_itself_is_suppressed() {
+        assert!(is_skipped("1.0.2", "1.0.2"));
+        // The whole feature: newer releases keep coming.
+        assert!(!is_skipped("1.0.2", "1.0.3"));
+        assert!(!is_skipped("1.0.9", "1.0.10"));
+        // And an older one is not resurrected by the skip either. It would
+        // never be offered anyway, since only something newer than the running
+        // copy is ever found, but the rule must not read as a ceiling.
+        assert!(!is_skipped("1.0.2", "1.0.1"));
+    }
+
+    #[test]
+    fn a_skip_is_matched_as_a_version_rather_than_as_text() {
+        // Written 1.0.02 by hand, or padded by a release script, is the same
+        // release and must stay skipped.
+        assert!(is_skipped("1.0.2", "1.0.2+build.7"));
+        // A pre-release is a different release from the version it leads to,
+        // which comparing text would get wrong in both directions.
+        assert!(!is_skipped("1.0.2-beta", "1.0.2"));
+        assert!(!is_skipped("1.0.2", "1.0.2-beta"));
+    }
+
+    #[test]
+    fn a_skip_the_running_copy_has_passed_is_forgotten() {
+        // Somebody who ran the installer by hand is now on the version they
+        // skipped, or past it, and the record describes a release nobody can
+        // be offered any more.
+        let mut caught_up = Settings {
+            skip_version: "1.0.2".into(),
+            ..Settings::default()
+        };
+        caught_up.forget_a_spent_skip("1.0.2");
+        assert!(caught_up.skip_version.is_empty());
+
+        let mut overtaken = Settings {
+            skip_version: "1.0.2".into(),
+            ..Settings::default()
+        };
+        overtaken.forget_a_spent_skip("1.0.3");
+        assert!(overtaken.skip_version.is_empty());
+
+        // Still ahead, so still worth honouring.
+        let mut still_ahead = Settings {
+            skip_version: "1.0.2".into(),
+            ..Settings::default()
+        };
+        still_ahead.forget_a_spent_skip("1.0.1");
+        assert_eq!(still_ahead.skip_version, "1.0.2");
+    }
+
+    #[test]
+    fn a_skip_that_is_not_a_version_is_dropped_rather_than_silencing_everything() {
+        // Comparison treats anything unparseable as equal to everything, so a
+        // hand typed `skip_version = yes` would suppress every release. It is
+        // not newer than the running version, so it goes on the next start.
+        let mut nonsense = Settings {
+            skip_version: "yes".into(),
+            ..Settings::default()
+        };
+        nonsense.forget_a_spent_skip("1.0.1");
+        assert!(nonsense.skip_version.is_empty());
     }
 
     #[test]

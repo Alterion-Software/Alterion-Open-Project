@@ -16,6 +16,7 @@
 //!     /usr, /opt, a package manager's file  ->  say how, never touch it
 //!     inside a .app bundle                  ->  say how, the .dmg is the unit
 //!     could not be worked out               ->  say how, nothing on a guess
+//!     Program Files or ProgramData          ->  say how, the installer's job
 //!     anywhere else                         ->  ours to replace
 //! ```
 //!
@@ -65,6 +66,34 @@
 //! comment in this file should claim otherwise. What can be said truthfully is
 //! that the artefact is checked against the published checksum, and that a
 //! download which does not match it is never run.
+//!
+//! # Windows, which will not overwrite what it is running
+//!
+//! A running executable is locked on Windows: it cannot be deleted and it
+//! cannot be written over. That is why the Windows release is an installer
+//! rather than a bare binary, and why installing one is the only update here
+//! that closes the application. The order is the whole of it:
+//!
+//! ```text
+//!   check against SHA256SUMS   nothing unchecked is ever started
+//!   start setup.exe /S         quietly, on its own, nothing waited on
+//!   close this window          going away is what unlocks the executable
+//!   the installer replaces it and starts the new version
+//! ```
+//!
+//! Nothing is waited for, and that is not laziness. The installer's first job
+//! is to replace this program's own executable, so this process has to be gone
+//! before it gets that far; waiting for it would be waiting for something that
+//! is waiting for this.
+//!
+//! The other half of making that work is where the application lives. An
+//! update needing administrator rights is not an update that can happen by
+//! itself, because there is nobody there to answer the prompt, so the
+//! installer puts the application under the account's own `%LOCALAPPDATA%` by
+//! default, the way Chrome, VS Code and Discord do and for the same reason. A
+//! machine wide install is still offered to anybody who wants one, and such a
+//! copy is still told to run the installer rather than rewriting Program Files
+//! from in here.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -182,6 +211,19 @@ pub fn detect() -> Install {
     if path.contains(".app/Contents/MacOS/") {
         return Install::Bundle;
     }
+    // Windows first, because none of the prefixes below can match a path
+    // there and a machine wide install would otherwise be judged self
+    // managed. Updating one means running an installer that writes under
+    // Program Files, which needs administrator rights this account may not
+    // have and which an update happening by itself cannot ask for.
+    //
+    // This is no longer the ordinary case. The installer puts the application
+    // under the account's own %LOCALAPPDATA% by default, which is under none
+    // of these roots, and a copy there is genuinely this account's to replace.
+    #[cfg(windows)]
+    if in_windows_system_location(&path, &windows_system_roots()) {
+        return Install::SystemWide;
+    }
     if !SYSTEM_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
         return Install::SelfManaged;
     }
@@ -191,6 +233,40 @@ pub fn detect() -> Install {
         return packaged;
     }
     Install::SystemWide
+}
+
+/// The places Windows keeps for the machine rather than for one account.
+///
+/// Read from the environment rather than written down: Program Files is
+/// localised on some installs and relocated on others, and there are three of
+/// them once a 64 bit system with 32 bit software is counted.
+#[cfg(windows)]
+fn windows_system_roots() -> Vec<String> {
+    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .collect()
+}
+
+/// Whether this path is somewhere Windows considers the machine's rather than
+/// one account's.
+///
+/// The roots are passed in rather than read here, which is what lets this be
+/// tested on a machine that has no such directories.
+///
+/// Comparison is case insensitive because the filesystem is, and a separator
+/// has to follow the root: `C:/ProgramData` is not a prefix of
+/// `C:/ProgramDataOfSomebodyElse` in any sense that matters, though it is one
+/// as text. A per user install sits under `%LOCALAPPDATA%`, which is under
+/// none of these, and that is exactly the point of installing there.
+#[cfg(any(windows, test))]
+fn in_windows_system_location(path: &str, roots: &[String]) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    roots.iter().any(|root| {
+        let root = root.replace('\\', "/").to_ascii_lowercase();
+        let root = root.trim_end_matches('/');
+        !root.is_empty() && path.starts_with(&format!("{root}/"))
+    })
 }
 
 /// Ask whether a package manager claims this file.
@@ -239,10 +315,25 @@ impl Install {
                  system upgrade, or would make that upgrade fail on a conflict."
             ),
             Install::SystemWide => {
-                "This copy is installed for everyone on this machine, so its files are not this \
-                 account's to rewrite. Update it by running install.sh again, or through whatever \
-                 package installed it."
-                    .into()
+                // Different advice, because the two cases are genuinely
+                // different: on Windows the setup program is how it got here
+                // and how it updates, and a running executable cannot replace
+                // itself there whatever the permissions say.
+                #[cfg(windows)]
+                {
+                    "This copy is installed for everyone on this machine, so replacing its files \
+                     needs administrator rights, which an update running by itself has no way to \
+                     ask for. Download the new installer and run it: it finds this installation \
+                     and updates it in place."
+                        .into()
+                }
+                #[cfg(not(windows))]
+                {
+                    "This copy is installed for everyone on this machine, so its files are not \
+                     this account's to rewrite. Update it by running install.sh again, or through \
+                     whatever package installed it."
+                        .into()
+                }
             }
             Install::Bundle => {
                 "This copy is a macOS application bundle. Download the new disk image and drag it \
@@ -629,8 +720,12 @@ pub enum Installed {
     /// case the new one turns out not to start.
     Replaced { kept: PathBuf },
     /// The installer has been downloaded and checked. Running it is a separate
-    /// and deliberate step, since it closes this application.
-    Downloaded { installer: PathBuf },
+    /// and deliberate step, because it closes this application: on Windows
+    /// that is not manners but the mechanism, since an installer cannot
+    /// replace an executable something is still running.
+    /// The digest travels with the path so it can be checked again just
+    /// before the installer is run, rather than only when it arrived.
+    Downloaded { installer: PathBuf, sha256: String },
 }
 
 /// Fetch a release's artefact, check it, and put it in place.
@@ -665,6 +760,7 @@ pub fn install(found: &Found) -> Result<Installed, String> {
         Kind::Installer => {
             keep_installer(&artefact.name, &bytes).map(|installer| Installed::Downloaded {
                 installer,
+                sha256: artefact.digest.clone(),
             })
         }
         Kind::Image => Err(
@@ -777,17 +873,129 @@ fn octal_field(header: &[u8], at: usize, len: usize) -> Option<usize> {
     usize::from_str_radix(text, 8).ok()
 }
 
-/// Put the new binary where the running one is, in one step that cannot leave
-/// a half written file behind the name.
+/// The name an update leaves the previous version under, beside the new one.
+///
+/// One rule in one place, because three things have to agree about it: the
+/// swap that creates the file, the sweep that clears it at the next start, and
+/// the Windows installer, which renames the running executable aside under
+/// exactly this name for exactly the same reason.
+fn previous_beside(exe: &Path) -> Option<PathBuf> {
+    let directory = exe.parent()?;
+    let mut name = exe.file_name()?.to_os_string();
+    name.push(".old");
+    Some(directory.join(name))
+}
+
+/// Clear the previous version an update left beside this one.
+///
+/// Silent and best effort in both directions. Usually there is nothing there,
+/// and when there is, it may still be locked because a copy of the old binary
+/// is somehow still running, which is not a fault and not news anybody wants:
+/// the start after this one clears it instead.
+pub fn sweep_previous() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    sweep_beside(&exe);
+}
+
+/// The half of the sweep that can be pointed at a directory of its own.
+fn sweep_beside(exe: &Path) {
+    if let Some(previous) = previous_beside(exe) {
+        let _ = std::fs::remove_file(previous);
+    }
+}
+
+/// Put the new binary where the running one is.
+///
+/// Which way round this goes depends entirely on whether a running executable
+/// can be written over, so the branch is on the platform and on nothing else:
+///
+/// ```text
+///   unix     write .name.new beside it, then rename over the name
+///            one step, and the name never holds a half written file
+///
+///   windows  rename the running file out of the way, then write the new
+///            one into the name that frees up
+/// ```
+///
+/// Windows locks a running executable against being deleted or written over,
+/// but not against being renamed: the process keeps its handle to the file
+/// under the new name and the old name is free. That is the only order that
+/// works there, and it is the wrong order everywhere else, where the rename is
+/// genuinely atomic and there is no reason to give that up.
+///
+/// The Windows release is an installer rather than a bare binary, so in
+/// practice this takes the unix branch and the Windows branch is what makes
+/// the function true rather than what runs today. `Kind` decides which
+/// artefact a platform is offered; this decides what to do with a binary once
+/// something has handed one over.
+fn swap_in(binary: &[u8]) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|_| "Where this program is installed could not be read.".to_string())?;
+    if cfg!(windows) {
+        rename_aside_then_write(&exe, binary, |path, bytes| std::fs::write(path, bytes))
+    } else {
+        stage_then_rename(&exe, binary)
+    }
+}
+
+/// Free the running name by renaming the file holding it, then write the new
+/// binary into the name that is now free.
+///
+/// Between those two steps there is no executable under this name at all, and
+/// that window is the whole risk of doing it this way. If the write does not
+/// land, the previous version goes back under its own name and the update is
+/// reported as not having happened, which is the only acceptable end to it.
+///
+/// `write` is a parameter so that failure can be provoked in a test. There is
+/// no other way to reach it: the real write fails on a full disk or a
+/// disappearing directory, neither of which a test may arrange.
+fn rename_aside_then_write(
+    exe: &Path,
+    binary: &[u8],
+    write: impl Fn(&Path, &[u8]) -> std::io::Result<()>,
+) -> Result<PathBuf, String> {
+    let kept = previous_beside(exe)
+        .ok_or_else(|| "This program is not in a directory it can be replaced in.".to_string())?;
+
+    // A leftover from an earlier update is in the way of this rename, and it
+    // is only still here because it was locked when that update ended.
+    let _ = std::fs::remove_file(&kept);
+
+    std::fs::rename(exe, &kept).map_err(|error| {
+        format!("This version could not be moved aside, so it has been left as it was: {error}")
+    })?;
+
+    let placed = write(exe, binary)
+        .map_err(|error| format!("The new version could not be written: {error}"))
+        .and_then(|()| make_runnable(exe));
+    if let Err(error) = placed {
+        // A part written binary under this name is worse than no file at all:
+        // if putting the old one back also fails, whatever is left here is
+        // what gets started next time.
+        let _ = std::fs::remove_file(exe);
+        return Err(match std::fs::rename(&kept, exe) {
+            Ok(()) => format!("{error}. The previous version has been put back."),
+            Err(second) => format!(
+                "{error}, and the previous version could not be put back either ({second}). It \
+                 is at {}, and renaming it to {} restores this installation.",
+                kept.display(),
+                exe.display()
+            ),
+        });
+    }
+    Ok(kept)
+}
+
+/// Write the new binary beside the running one and rename it over the top.
 ///
 /// The old binary is copied aside *before* anything is moved, so there is
 /// something to go back to whether the swap fails or the new binary turns out
 /// not to start. The staging file is written next to the target rather than in
 /// a temporary directory, because a rename is only atomic within one
 /// filesystem and `/tmp` very often is not the same one.
-fn swap_in(binary: &[u8]) -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|_| "Where this program is installed could not be read.".to_string())?;
+fn stage_then_rename(exe: &Path, binary: &[u8]) -> Result<PathBuf, String> {
     let directory = exe
         .parent()
         .ok_or_else(|| "This program is not in a directory it can be replaced in.".to_string())?;
@@ -795,6 +1003,8 @@ fn swap_in(binary: &[u8]) -> Result<PathBuf, String> {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| BINARY_NAME.to_string());
+    let kept = previous_beside(exe)
+        .ok_or_else(|| "This program is not in a directory it can be replaced in.".to_string())?;
 
     let staged = directory.join(format!(".{name}.new"));
     std::fs::write(&staged, binary).map_err(|error| {
@@ -808,9 +1018,8 @@ fn swap_in(binary: &[u8]) -> Result<PathBuf, String> {
         return Err(error);
     }
 
-    let kept = directory.join(format!("{name}.old"));
     let _ = std::fs::remove_file(&kept);
-    if let Err(error) = std::fs::copy(&exe, &kept) {
+    if let Err(error) = std::fs::copy(exe, &kept) {
         let _ = std::fs::remove_file(&staged);
         return Err(format!(
             "The current version could not be set aside, so it has been left alone: {error}"
@@ -819,7 +1028,7 @@ fn swap_in(binary: &[u8]) -> Result<PathBuf, String> {
 
     // The one step that changes anything. Until it lands the name still points
     // at the working binary, and if it fails nothing has moved.
-    if let Err(error) = std::fs::rename(&staged, &exe) {
+    if let Err(error) = std::fs::rename(&staged, exe) {
         let _ = std::fs::remove_file(&staged);
         let _ = std::fs::remove_file(&kept);
         return Err(format!(
@@ -850,11 +1059,55 @@ fn keep_installer(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Hand the installer to the system and let it take over.
-pub fn run_installer(path: &Path) -> Result<(), String> {
+/// Start the checked installer and let it take over.
+///
+/// Quietly, on its own, and without waiting for it. Each of those is load
+/// bearing:
+///
+/// `/S` is NSIS's own switch for an install that asks nothing, which is what
+/// makes this an update somebody presses a button for rather than a wizard
+/// they walk through a second time. The installer put the application under
+/// this account's own directory, so a silent run raises no prompt for
+/// administrator rights, and there would be nobody to answer one.
+///
+/// Detached, so it outlives this process by design rather than by luck.
+///
+/// And not waited on, because the first thing it does is replace this
+/// program's own executable, which Windows will not allow while this process
+/// is running it. The caller closes the window the moment this returns: going
+/// away is what unlocks the file.
+pub fn run_installer(path: &Path, want: &str) -> Result<(), String> {
+    // Checked again here, against the bytes on disk, immediately before it is
+    // run. It was already checked when it was downloaded, but it has been
+    // sitting in the temporary directory since, and the rule is that nothing
+    // unchecked gets run rather than that nothing unchecked gets downloaded.
+    // The window is small and the directory is this account's, so this is not
+    // a likely attack so much as the difference between a property that holds
+    // and one that usually holds.
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("The downloaded installer could not be read back: {error}"))?;
+    verify(&bytes, want)?;
+    drop(bytes);
+
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+
+        /// Not attached to this process's console, so nothing about it ends
+        /// when this process does.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+
         std::process::Command::new(path)
+            .arg("/S")
+            // Anywhere but the directory being installed into: a process's
+            // working directory cannot be renamed or removed while it is
+            // current, and renaming files in there is how the installer gets
+            // past a copy of this application that has not quite gone yet.
+            .current_dir(std::env::temp_dir())
+            .creation_flags(DETACHED_PROCESS)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map(|_| ())
             .map_err(|error| format!("The installer would not start: {error}"))
@@ -1256,6 +1509,245 @@ e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4 *AlterionOpenPr
         for url in artefact_urls("1.0.1", &name) {
             assert!(url.ends_with(&name), "{url}");
         }
+    }
+
+    // ---- where Windows keeps things -------------------------------------
+
+    /// The roots a Windows machine would report, written out here because this
+    /// machine has no such variables to read.
+    fn windows_roots() -> Vec<String> {
+        [
+            "C:\\Program Files",
+            "C:\\Program Files (x86)",
+            "C:\\ProgramData",
+        ]
+        .iter()
+        .map(|root| root.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn a_per_user_windows_install_is_this_accounts_to_replace() {
+        // The whole point of installing under %LOCALAPPDATA%: it is under none
+        // of the machine's roots, so replacing it asks nobody's permission,
+        // and that is what makes an update that nobody has to approve
+        // possible at all.
+        assert!(!in_windows_system_location(
+            "C:/Users/somebody/AppData/Local/Programs/Alterion Open \
+             Project/alterion-open-project.exe",
+            &windows_roots()
+        ));
+    }
+
+    #[test]
+    fn a_machine_wide_windows_install_still_is_not() {
+        for path in [
+            "C:/Program Files/Alterion/Alterion Open Project/alterion-open-project.exe",
+            "C:\\Program Files (x86)\\Alterion\\alterion-open-project.exe",
+            // Case, because the filesystem does not care and nor may this.
+            "c:/program files/alterion/alterion-open-project.exe",
+            "C:/ProgramData/Alterion/alterion-open-project.exe",
+        ] {
+            assert!(in_windows_system_location(path, &windows_roots()), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_root_only_matches_where_a_directory_ends() {
+        // Text prefixes are not paths. This one shares the opening characters
+        // with ProgramData and shares nothing else.
+        assert!(!in_windows_system_location(
+            "C:/ProgramDataOfSomebodyElse/alterion-open-project.exe",
+            &windows_roots()
+        ));
+        // A variable that was not set must not become a root matching
+        // everything.
+        assert!(!in_windows_system_location(
+            "C:/anywhere/alterion-open-project.exe",
+            &[String::new()]
+        ));
+    }
+
+    #[test]
+    fn a_machine_wide_copy_refuses_and_the_reason_it_gives_is_its_real_one() {
+        assert!(
+            !Install::SystemWide.self_updates(),
+            "files everybody shares are not one account's to rewrite"
+        );
+        let advice = Install::SystemWide.advice();
+        assert!(!advice.is_empty(), "it still has to say how to update");
+        // The Windows wording is the half that changed: it used to say a
+        // running program cannot replace itself, which is no longer the
+        // reason, since the installer renames the running file aside and the
+        // rights are the only thing left in the way.
+        #[cfg(windows)]
+        {
+            assert!(advice.contains("administrator rights"), "got {advice}");
+            assert!(advice.contains("installer"), "got {advice}");
+        }
+    }
+
+    // ---- replacing the running binary -----------------------------------
+
+    /// A directory of this test's own, emptied first so that what a previous
+    /// run left cannot be read as what this one did.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aop-update-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory to work in");
+        dir
+    }
+
+    /// The write that lands, for the tests that are not about it failing.
+    fn writing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        std::fs::write(path, bytes)
+    }
+
+    #[test]
+    fn the_running_name_is_freed_by_a_rename_and_the_new_binary_written_into_it() {
+        // The Windows order, run here on a filesystem that would have allowed
+        // the other one. What is being tested is the sequence, and the
+        // sequence is the same wherever it runs.
+        let dir = scratch("rename");
+        let exe = dir.join("alterion-open-project.exe");
+        std::fs::write(&exe, b"the old binary").expect("an old binary to replace");
+
+        let kept = rename_aside_then_write(&exe, b"the new binary", writing).expect("the swap");
+
+        assert_eq!(std::fs::read(&exe).expect("the new one"), b"the new binary");
+        assert_eq!(std::fs::read(&kept).expect("the old one"), b"the old binary");
+        assert_eq!(
+            kept,
+            dir.join("alterion-open-project.exe.old"),
+            "the name the sweep and the installer both expect"
+        );
+    }
+
+    #[test]
+    fn a_leftover_from_the_last_update_does_not_block_the_next_one() {
+        // One is left behind whenever a copy was still running at the time,
+        // and it sits in exactly the name this update needs.
+        let dir = scratch("leftover");
+        let exe = dir.join("alterion-open-project.exe");
+        std::fs::write(&exe, b"the old binary").expect("an old binary");
+        std::fs::write(dir.join("alterion-open-project.exe.old"), b"older still")
+            .expect("a leftover");
+
+        let kept = rename_aside_then_write(&exe, b"the new binary", writing).expect("the swap");
+        assert_eq!(std::fs::read(&kept).expect("the old one"), b"the old binary");
+        assert_eq!(std::fs::read(&exe).expect("the new one"), b"the new binary");
+    }
+
+    #[test]
+    fn a_write_that_fails_after_the_rename_puts_the_previous_version_back() {
+        // The window this approach opens, and the whole of its risk: between
+        // the rename and the write there is no executable under this name at
+        // all. Nothing may end there.
+        let dir = scratch("recovery");
+        let exe = dir.join("alterion-open-project.exe");
+        std::fs::write(&exe, b"the old binary").expect("an old binary");
+
+        let refused = rename_aside_then_write(&exe, b"the new binary", |_, _| {
+            Err(std::io::Error::other("the disk is full"))
+        })
+        .expect_err("a write that did not happen must not be reported as a swap");
+
+        assert_eq!(
+            std::fs::read(&exe).expect("the old binary, back under its own name"),
+            b"the old binary"
+        );
+        assert!(
+            !dir.join("alterion-open-project.exe.old").exists(),
+            "and not left aside as a second copy as well"
+        );
+        assert!(refused.contains("put back"), "got {refused}");
+    }
+
+    #[test]
+    fn a_part_written_binary_is_never_what_is_left_under_the_running_name() {
+        // A write can fail having written something, and something is worse
+        // than nothing here, because something is what would be started next
+        // time.
+        let dir = scratch("partial");
+        let exe = dir.join("alterion-open-project.exe");
+        std::fs::write(&exe, b"the old binary").expect("an old binary");
+
+        let refused = rename_aside_then_write(&exe, b"the new binary", |path, _| {
+            std::fs::write(path, b"half a bin")?;
+            Err(std::io::Error::other("and then the disk filled up"))
+        })
+        .expect_err("a half written binary is not an installed one");
+
+        assert_eq!(
+            std::fs::read(&exe).expect("the old binary, back"),
+            b"the old binary",
+            "the half written one must not survive"
+        );
+        assert!(refused.contains("put back"), "got {refused}");
+    }
+
+    #[test]
+    fn the_other_platforms_still_write_beside_and_rename_over() {
+        // Unchanged on purpose: a rename over the name is genuinely atomic
+        // here, and there is no reason to give that up for an order Windows
+        // needs and nothing else does.
+        let dir = scratch("stage");
+        let exe = dir.join("alterion-open-project");
+        std::fs::write(&exe, b"the old binary").expect("an old binary");
+
+        let kept = stage_then_rename(&exe, b"the new binary").expect("the swap");
+
+        assert_eq!(std::fs::read(&exe).expect("the new one"), b"the new binary");
+        assert_eq!(std::fs::read(&kept).expect("the old one"), b"the old binary");
+        assert!(
+            !dir.join(".alterion-open-project.new").exists(),
+            "the staging file is a step, not a leftover"
+        );
+    }
+
+    // ---- what an update leaves behind -----------------------------------
+
+    #[test]
+    fn the_previous_version_is_swept_at_the_next_start() {
+        let dir = scratch("sweep");
+        let exe = dir.join("alterion-open-project.exe");
+        std::fs::write(&exe, b"the running binary").expect("a running binary");
+        let previous = dir.join("alterion-open-project.exe.old");
+        std::fs::write(&previous, b"the one it replaced").expect("a previous version");
+
+        sweep_beside(&exe);
+
+        assert!(!previous.exists(), "the previous version should be gone");
+        assert!(exe.exists(), "and nothing else touched");
+    }
+
+    #[test]
+    fn a_previous_version_that_will_not_go_is_left_where_it_is_and_nothing_is_said() {
+        // On Windows it stays locked while any copy of it is still running,
+        // which is ordinary rather than a fault, and the start after this one
+        // clears it. A directory standing in its place is how a file that
+        // cannot be removed is arranged on a machine with no such locking.
+        let dir = scratch("locked");
+        let exe = dir.join("alterion-open-project.exe");
+        std::fs::write(&exe, b"the running binary").expect("a running binary");
+        let previous = dir.join("alterion-open-project.exe.old");
+        std::fs::create_dir(&previous).expect("something remove_file will not remove");
+
+        sweep_beside(&exe);
+
+        assert!(previous.exists(), "it stays, and the sweep says nothing about it");
+        assert!(exe.exists());
+    }
+
+    #[test]
+    fn a_sweep_with_nothing_to_sweep_is_a_sweep_that_does_nothing() {
+        let dir = scratch("nothing");
+        let exe = dir.join("alterion-open-project.exe");
+        std::fs::write(&exe, b"the running binary").expect("a running binary");
+
+        sweep_beside(&exe);
+
+        assert!(exe.exists(), "the running binary is not what gets swept");
     }
 
     /// Actually reaches the release hosts, so it only runs when asked for:

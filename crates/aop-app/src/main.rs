@@ -315,6 +315,12 @@ fn App() -> Element {
     // that found something sets a chip in the status bar, and a check that
     // could not reach anybody says nothing at all.
     use_future(move || async move {
+        // The previous version, if an update left one beside this one. Windows
+        // cannot delete a running executable, so an update renames the old one
+        // aside and whoever starts next is the first moment it can go. Silent
+        // and best effort: there is usually nothing there, and a copy that is
+        // still locked is not news.
+        updates::sweep_previous();
         // After the splash, so a slow name resolution cannot be the first
         // thing a start up does.
         tokio::time::sleep(std::time::Duration::from_secs(updates::STARTUP_DELAY_SECONDS)).await;

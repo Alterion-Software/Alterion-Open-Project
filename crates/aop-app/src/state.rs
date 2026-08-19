@@ -1055,6 +1055,10 @@ pub struct AppState {
     pub patch_notes: bool,
     pub support_page: bool,
     pub update_check: bool,
+    /// The one version that has been skipped, if any. Held here as well as in
+    /// the file so the pages that must show it can, and so the offer can be
+    /// suppressed without reading the disk on every check.
+    pub skip_version: String,
     /// A newer release, once one has been found.
     pub update_found: Option<crate::updates::Found>,
     /// The last thing the updater had to say, for the page that asked. Never
@@ -1274,6 +1278,7 @@ impl AppState {
             patch_notes: true,
             support_page: true,
             update_check: true,
+            skip_version: String::new(),
             update_found: None,
             update_message: None,
             updating: false,
@@ -1916,7 +1921,13 @@ impl AppState {
     }
 
     /// Take the remembered preferences on, at start up.
-    fn apply_settings(&mut self, settings: crate::settings::Settings) {
+    fn apply_settings(&mut self, mut settings: crate::settings::Settings) {
+        // Done here rather than anywhere later, because this is the one moment
+        // the running version is news: a skip that this copy has already gone
+        // past means somebody updated by another route, and the record is
+        // spent. Clearing it here also gets it written back, since the copy
+        // start up compares against was read from the file before this ran.
+        settings.forget_a_spent_skip(crate::welcome::RUNNING);
         self.user_name = settings.user_name.clone();
         self.user_initials = settings.user_initials.clone();
         if !settings.company.is_empty() {
@@ -1949,6 +1960,7 @@ impl AppState {
         self.patch_notes = settings.patch_notes;
         self.support_page = settings.support_page;
         self.update_check = settings.update_check;
+        self.skip_version = settings.skip_version.clone();
         self.keys = settings.keys;
     }
 
@@ -1981,6 +1993,7 @@ impl AppState {
             patch_notes: self.patch_notes,
             support_page: self.support_page,
             update_check: self.update_check,
+            skip_version: self.skip_version.clone(),
             keys: self.keys.clone(),
         }
     }
@@ -2039,6 +2052,19 @@ impl AppState {
     pub fn update_landed(&mut self, outcome: Result<Option<crate::updates::Found>, String>) {
         self.updating = false;
         match outcome {
+            // The skipped release, found again. Nothing is offered and nothing
+            // is said in the status bar, since being told about it is the
+            // thing that was refused. The page that asked is told plainly,
+            // though, and told where the refusal can be withdrawn: a skip
+            // nobody can find again is a trap rather than a preference.
+            Ok(Some(found)) if crate::settings::is_skipped(&self.skip_version, &found.version) => {
+                self.update_found = None;
+                self.update_message = Some(format!(
+                    "Version {} is available. You chose to skip it, so it is not offered. \
+                     Options, under General, offers it again.",
+                    found.version
+                ));
+            }
             Ok(Some(found)) => {
                 self.note(format!("Version {} is available", found.version));
                 self.update_message = None;
@@ -2075,6 +2101,42 @@ impl AppState {
         self.update_found.as_ref().and_then(|found| found.why_not())
     }
 
+    /// Never offer this particular release again.
+    ///
+    /// The version is written down rather than a flag being set, so the answer
+    /// stays about this release alone. The next one is a different version and
+    /// is offered as though nothing had been skipped.
+    pub fn skip_the_found_version(&mut self) {
+        let Some(found) = self.update_found.take() else {
+            return;
+        };
+        self.note(format!(
+            "Version {} will not be offered again. Later versions still will.",
+            found.version
+        ));
+        self.skip_version = found.version;
+        // The offer is gone, so anything the updater had to say about it is
+        // stale. Left behind it would sit under the next check's answer.
+        self.update_message = None;
+    }
+
+    /// Withdraw a skip, so the version it named is offered again.
+    ///
+    /// The record is the only thing suppressing the offer, so clearing it is
+    /// the whole undo. The version comes back at the next check rather than
+    /// this instant, since finding it means asking a server and nothing here
+    /// waits on one.
+    pub fn offer_the_skipped_version_again(&mut self) {
+        if self.skip_version.is_empty() {
+            return;
+        }
+        self.note(format!(
+            "Version {} will be offered again at the next check.",
+            self.skip_version
+        ));
+        self.skip_version.clear();
+    }
+
     /// What an install came back with.
     pub fn install_landed(&mut self, outcome: Result<crate::updates::Installed, String>) {
         self.updating = false;
@@ -2086,7 +2148,9 @@ impl AppState {
                         kept.display()
                     ),
                     crate::updates::Installed::Downloaded { .. } => {
-                        "The installer has been downloaded and checked against its published                          checksum. Running it closes this application."
+                        "The installer has been downloaded and checked against its published \
+                         checksum. Installing closes this application, which is what frees its \
+                         files to be replaced, and starts the new version when it is done."
                             .into()
                     }
                 });
@@ -6720,6 +6784,105 @@ mod tests {
 
         state.dirty = false;
         assert!(state.update_blocked().is_none());
+    }
+
+    /// A release found by a check, at whatever version.
+    fn found(version: &str) -> crate::updates::Found {
+        crate::updates::Found {
+            version: version.into(),
+            install: crate::updates::Install::SelfManaged,
+            artefact: Some(crate::updates::Artefact {
+                name: format!("alterion-open-project-{version}-x86_64-linux.tar.gz"),
+                digest: "0".repeat(64),
+            }),
+            page: format!("https://example.test/releases/v{version}"),
+        }
+    }
+
+    #[test]
+    fn skipping_a_version_takes_the_offer_away_without_stopping_the_next_one() {
+        let mut state = AppState::new();
+        state.update_landed(Ok(Some(found("9.9.9"))));
+        assert!(state.update_found.is_some(), "the offer stands before it is refused");
+
+        state.skip_the_found_version();
+        assert_eq!(state.skip_version, "9.9.9");
+        assert!(state.update_found.is_none(), "and the offer goes with it");
+
+        // Found again, and this time not offered at all.
+        state.update_landed(Ok(Some(found("9.9.9"))));
+        assert!(state.update_found.is_none());
+        let message = state.update_message.clone().expect("the page that asked is told");
+        assert!(message.contains("9.9.9") && message.contains("Options"), "got {message}");
+
+        // The next release is a different version, and nothing was said about
+        // it. This is the whole point of storing the version rather than a flag.
+        state.update_landed(Ok(Some(found("9.9.10"))));
+        assert_eq!(
+            state.update_found.as_ref().map(|f| f.version.as_str()),
+            Some("9.9.10")
+        );
+    }
+
+    #[test]
+    fn skipping_one_version_does_not_bring_an_older_one_back() {
+        // A skip is not a floor either: it says nothing at all about versions
+        // other than the one it names.
+        let mut state = AppState::new();
+        state.skip_version = "9.9.9".into();
+        state.update_landed(Ok(Some(found("9.9.8"))));
+        assert_eq!(
+            state.update_found.as_ref().map(|f| f.version.as_str()),
+            Some("9.9.8"),
+            "an older release is judged on its own, not by the skip"
+        );
+    }
+
+    #[test]
+    fn withdrawing_a_skip_puts_the_offer_back() {
+        let mut state = AppState::new();
+        state.skip_version = "9.9.9".into();
+        state.update_landed(Ok(Some(found("9.9.9"))));
+        assert!(state.update_found.is_none(), "suppressed while the record stands");
+
+        state.offer_the_skipped_version_again();
+        assert!(state.skip_version.is_empty());
+
+        state.update_landed(Ok(Some(found("9.9.9"))));
+        assert!(state.update_found.is_some(), "and offered once it is gone");
+    }
+
+    #[test]
+    fn a_skip_this_copy_has_already_passed_is_dropped_at_start_up() {
+        // Updated by some other route, so the skipped release is behind us and
+        // the record is dead weight. Cleared where the preferences are taken
+        // on, which is also where it gets written back to the file.
+        let mut state = AppState::new();
+        state.apply_settings(crate::settings::Settings {
+            skip_version: "0.0.1-nonesuch".into(),
+            ..Default::default()
+        });
+        assert!(state.skip_version.is_empty());
+
+        // One that is still ahead of this copy survives, since it is still a
+        // release somebody could be offered.
+        let mut ahead = AppState::new();
+        ahead.apply_settings(crate::settings::Settings {
+            skip_version: "9999.0.0".into(),
+            ..Default::default()
+        });
+        assert_eq!(ahead.skip_version, "9999.0.0");
+    }
+
+    #[test]
+    fn a_skipped_version_says_nothing_in_the_status_bar() {
+        // Being told about it is the thing that was refused.
+        let mut state = AppState::new();
+        state.skip_version = "9.9.9".into();
+        let before = state.status.clone();
+        state.update_landed(Ok(Some(found("9.9.9"))));
+        assert_eq!(state.status, before);
+        assert!(state.dialog.is_none());
     }
 
     #[test]
