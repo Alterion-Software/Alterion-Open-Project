@@ -10,6 +10,12 @@ use crate::state::AppState;
 ///
 /// It does touch the database, because a process that is running and cannot
 /// reach Postgres is not healthy in any sense a load balancer cares about.
+///
+/// It also says which messages this build understands. A version string
+/// cannot answer that: a client holding one has to know which versions of
+/// somebody else's self-hosted server gained which message, and getting that
+/// wrong is how a pair looks healthy and silently does nothing. A name a
+/// client can look for costs one field and answers it outright.
 #[get("/api/health")]
 pub async fn health(state: web::Data<AppState>) -> HttpResponse {
     let database = state.db.ping().await.is_ok();
@@ -19,6 +25,7 @@ pub async fn health(state: web::Data<AppState>) -> HttpResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "database": database,
         "issuer": state.idp.issuer(),
+        "capabilities": crate::live::CAPABILITIES,
     });
     if database {
         HttpResponse::Ok().json(body)

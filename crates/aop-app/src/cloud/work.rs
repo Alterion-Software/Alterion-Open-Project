@@ -31,6 +31,14 @@ pub struct Offer {
     /// The plan as it stands, for the case where the server asks for a fresh
     /// whole copy of it.
     pub plan: Project,
+    /// This copy's live socket, when one is open.
+    ///
+    /// Gathered here with the rest because the server needs it to know which
+    /// connection not to send the appended work to. Without it a sync during a
+    /// live session is echoed back to the copy that made it, and the entries
+    /// have been renumbered by then, so they arrive looking like somebody
+    /// else's and are applied twice.
+    pub connection: Option<u64>,
 }
 
 /// A session, and whatever the work came back with.
@@ -72,6 +80,7 @@ pub fn sync(mut session: Session, offer: Offer) -> (Session, Result<Pushed, coll
         &offer.project,
         offer.after,
         &offer.changes,
+        offer.connection,
     );
 
     // The server asking for a fresh whole plan is housekeeping: it stores
@@ -294,13 +303,27 @@ pub fn standing(mut session: Session, server: String, project: String) -> Handed
     (session, outcome)
 }
 
-/// A token to open the live socket with.
+/// A token to open the live socket with, and what the server says it speaks.
 ///
 /// Its own job because opening the socket happens on yet another thread, and
 /// the session must not travel there: it would be two places at once, each
 /// able to spend the other's refresh token.
-pub fn live_token(mut session: Session) -> Handed<String> {
-    let outcome = token_for(&mut session);
+///
+/// The two questions are asked together because they are one intention and
+/// one wait. Asking what the server speaks is what stops a session against an
+/// older server from looking as though it works: such a server takes the
+/// socket, relays everybody else's edits, and does nothing with this copy's
+/// own. It is asked here, before the socket exists, so nothing has to be
+/// undone when the answer is no, and the health endpoint carries no token, so
+/// it costs one unauthenticated request on a wait that was happening anyway.
+pub fn live_token(
+    mut session: Session,
+    server: String,
+) -> Handed<(String, crate::cloud::health::Speaks)> {
+    // The token first, so a session that cannot be renewed fails on the thing
+    // that actually stopped it rather than on a health check.
+    let outcome =
+        token_for(&mut session).map(|token| (token, crate::cloud::health::speaks_streaming(&server)));
     (session, outcome)
 }
 

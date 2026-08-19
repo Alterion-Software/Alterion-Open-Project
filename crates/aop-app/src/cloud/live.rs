@@ -142,7 +142,16 @@ pub struct Peer {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Incoming {
     /// The connection is up. Says who else is here.
-    Welcome { head: i64, peers: Vec<Peer> },
+    ///
+    /// `connection` is this socket's own handle on the server, which is sent
+    /// back on a REST push so that the append does not broadcast this client's
+    /// own work to this very socket. `None` is an older server that does not
+    /// say, and the push then omits the field exactly as it always did.
+    Welcome {
+        head: i64,
+        peers: Vec<Peer>,
+        connection: Option<u64>,
+    },
     /// Everything missed while away, sent before any live change so the order
     /// things are applied in is the log's order.
     Catchup { head: i64, changes: Vec<Change> },
@@ -556,6 +565,11 @@ enum ServerMessage {
         head: i64,
         #[serde(default)]
         peers: Vec<Peer>,
+        /// Absent on any server built before it started saying so. Absent is
+        /// handled rather than assumed away: the push simply leaves the field
+        /// out, which is the body such a server already expects.
+        #[serde(default)]
+        connection: Option<u64>,
     },
     Catchup {
         head: i64,
@@ -635,9 +649,10 @@ fn vetted(mut peer: Peer) -> Peer {
 /// down a working socket over it would be.
 fn read_message(text: &Utf8Bytes) -> Option<Incoming> {
     match serde_json::from_str::<ServerMessage>(text.as_str()).ok()? {
-        ServerMessage::Welcome { head, peers } => Some(Incoming::Welcome {
+        ServerMessage::Welcome { head, peers, connection } => Some(Incoming::Welcome {
             head,
             peers: peers.into_iter().map(vetted).collect(),
+            connection,
         }),
         ServerMessage::Catchup { head, changes } => Some(Incoming::Catchup { head, changes }),
         ServerMessage::Gap { head } => Some(Incoming::Gap { head }),
@@ -682,17 +697,34 @@ mod tests {
     }
 
     #[test]
-    fn a_welcome_says_who_else_is_here() {
+    fn a_welcome_says_who_else_is_here_and_which_connection_this_is() {
         let message = parse(
-            r#"{"type":"welcome","head":45,
+            r#"{"type":"welcome","head":45,"connection":7,
                 "peers":[{"subject":"0198","name":"Grace","row":12}]}"#,
         );
-        let Some(Incoming::Welcome { head, peers }) = message else {
+        let Some(Incoming::Welcome { head, peers, connection }) = message else {
             panic!("a welcome is the answer to hello");
         };
         assert_eq!(head, 45);
         assert_eq!(peers[0].name, "Grace");
         assert_eq!(peers[0].row, Some(12));
+        assert_eq!(
+            connection,
+            Some(7),
+            "the handle a REST push sends back so it is not echoed to this socket",
+        );
+    }
+
+    #[test]
+    fn a_server_that_does_not_say_which_connection_this_is_still_welcomes() {
+        // An older server sends no such field. The push then omits it, which
+        // is the body that server already expects, and the copy falls back to
+        // recognising its own work by where the cursor has reached.
+        let message = parse(r#"{"type":"welcome","head":45}"#);
+        let Some(Incoming::Welcome { connection, .. }) = message else {
+            panic!("a welcome without the field is still a welcome");
+        };
+        assert_eq!(connection, None);
     }
 
     #[test]

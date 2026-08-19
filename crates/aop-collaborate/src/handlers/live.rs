@@ -279,7 +279,14 @@ async fn catch_up(
         return vec![ServerMessage::Error { message: "could not read the log".into() }];
     };
 
-    let mut messages = vec![ServerMessage::Welcome { head: range.head, peers }];
+    // The connection's own handle goes out with the greeting, because it is
+    // the only thing this client cannot find out for itself and it needs it to
+    // push over REST without being sent its own work back over this socket.
+    let mut messages = vec![ServerMessage::Welcome {
+        head: range.head,
+        peers,
+        connection: conn,
+    }];
     let Some(after) = after else {
         // No cursor means a client that has no plan yet, and the whole plan
         // is a REST call, not a websocket message.

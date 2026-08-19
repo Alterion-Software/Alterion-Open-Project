@@ -797,6 +797,28 @@ pub const EPHEMERAL_POLL_MILLIS: u64 = 120;
 /// only how long it sits there before being offered.
 pub const STREAM_AFTER_MILLIS: u64 = 250;
 
+/// The seq an entry that came from the server carries.
+///
+/// Every entry the server hands out is identified by its seq, because that is
+/// the name the shared log gave it and the only name every copy agrees on.
+/// Named here rather than written out at each comparison so that the one
+/// assumption this rests on is stated once: an id on an incoming change is a
+/// seq, and an id on a change this copy made is not.
+fn seq_of(change: &aop_core::history::Change) -> i64 {
+    // Saturating rather than wrapping. A seq that will not fit in an i64 is
+    // not a thing this protocol can produce, and treating it as the furthest
+    // possible point means an unreadable one is skipped rather than replayed.
+    i64::try_from(change.id).unwrap_or(i64::MAX)
+}
+
+/// How often to look for work a save asked to be sent.
+///
+/// A read of one flag, so it costs nothing, and no write handle is taken
+/// unless there is something to do. Quick enough that pressing Save and
+/// watching the status is not a wait, slow enough that a plan nobody has
+/// saved is not being asked about several times a second.
+pub const SAVE_SYNC_POLL_MILLIS: u64 = 300;
+
 /// How long the local copy of a server plan waits before being rewritten.
 ///
 /// A local file, so this is cheap, but it is still a whole plan serialised
@@ -817,6 +839,22 @@ pub const STREAM_BATCH: usize = 200;
 /// that is already open makes a tight retry loop very easy to write by
 /// accident. The work is not lost by waiting: it is in the log.
 pub const STREAM_RETRY_MILLIS: u64 = 5_000;
+
+/// How long a streamed batch may go unanswered before it is given up on.
+///
+/// A refusal is an answer and is already handled. Silence is not an answer,
+/// and silence is what an older or mismatched server gives: it takes the
+/// message, understands none of it, and says nothing. Without a deadline the
+/// in-flight marker stays set and this copy never offers anything again, for
+/// the rest of the session, without a word.
+///
+/// Long enough that it is never reached by a server that is merely slow: the
+/// REST calls beside it wait far longer than this before giving up, and a
+/// batch is one round trip to a database and back. Short enough that somebody
+/// finds out inside the same minute they started, rather than at the end of
+/// an afternoon. Nothing is lost when it fires: the log still says the work is
+/// unsent, because nothing was ever marked as sent.
+pub const STREAM_ANSWER_SECONDS: u64 = 20;
 
 /// What the network is doing, so a button can say so rather than looking
 /// broken.
@@ -1163,6 +1201,29 @@ pub struct AppState {
     /// Whether live editing has been asked for. Separate from the socket,
     /// because a socket that drops should not look like a choice being undone.
     pub live_wanted: bool,
+    /// Entries in the log that were taken from the server rather than done
+    /// here.
+    ///
+    /// `History::unsent` is everything past a watermark, and the watermark
+    /// counts in this copy's own ids while a merged entry wears the seq the
+    /// server gave it. Those are two numbering schemes sharing a type, so an
+    /// entry of somebody else's can land on the unsent side of the line and be
+    /// offered straight back, which appends their edit to the shared log a
+    /// second time and sends the duplicate to everybody.
+    ///
+    /// A single watermark cannot express "these two interleaved entries, one
+    /// sent and one not", so the ones that must never be offered are named.
+    /// Kept for the session rather than in the plan file: the durable half is
+    /// the watermark move below, which covers the case where nothing of this
+    /// copy's own was waiting, and that is the case this happens in.
+    taken_from_server: std::collections::HashSet<u64>,
+    /// What the server calls this copy's socket, once it has said.
+    ///
+    /// Sent back on a REST push so the append does not broadcast the work to
+    /// the connection that just offered it. `None` is either no socket or a
+    /// server old enough not to say, and both mean the field is left out of
+    /// the push, which is the body such a server already expects.
+    live_connection: Option<u64>,
     /// Who else has this plan open.
     pub peers: Vec<crate::cloud::live::Peer>,
     /// Somebody else's work that arrived while a cell was open for editing.
@@ -1181,12 +1242,39 @@ pub struct AppState {
     /// A moment rather than a flag, because it is a debounce: typing a task
     /// name pushes it forward and the batch goes once the typing stops.
     stream_due: Option<std::time::Instant>,
-    /// Whether a batch is already with the server and unanswered.
+    /// When the batch now with the server was offered, if one is.
     ///
     /// One at a time, because the cursor a batch was made against is only
     /// right until the answer moves it. Two in flight would have the second
     /// one built on a head the server has already left behind.
-    streaming: bool,
+    ///
+    /// A moment rather than a flag, because a marker that can only be cleared
+    /// by an answer is a marker a server can leave set forever by saying
+    /// nothing, and one that has been set too long is the only evidence there
+    /// is that that has happened. See [`STREAM_ANSWER_SECONDS`].
+    in_flight: Option<std::time::Instant>,
+    /// Whether work may be offered over the socket at all.
+    ///
+    /// False against a server that does not understand the streaming message.
+    /// Such a server still takes the connection and still relays everybody
+    /// else's edits, so the session is worth having; what it will not do is
+    /// take this copy's own work, and pretending otherwise is what makes a
+    /// mismatched pair look like it is working.
+    stream_out: bool,
+    /// Whether this session has already said that nothing is being answered.
+    ///
+    /// Said once. The condition persists, the timer runs several times a
+    /// second, and a message repeated at that rate is one somebody turns off
+    /// rather than reads.
+    stream_silence_told: bool,
+    /// Whether a save has asked for this plan's unsent work to go over the
+    /// ordinary sync, and it has not gone yet.
+    ///
+    /// A flag rather than a call, because a save may not wait on a network:
+    /// the file is already written and the save point already marked by the
+    /// time this is set, and the worker that acts on it is started from a
+    /// timer where a slow server costs nobody a frozen window.
+    sync_after_save: bool,
     /// The server asking for a fresh whole plan, once its log has run far
     /// enough past the newest stored one. Housekeeping, with no decision in
     /// it for a planner, so it is answered rather than shown.
@@ -1390,9 +1478,16 @@ impl AppState {
             cloud_message: None,
             link: None,
             live: None,
+            taken_from_server: std::collections::HashSet::new(),
+            live_connection: None,
             held_live: Vec::new(),
             stream_due: None,
-            streaming: false,
+            in_flight: None,
+            // Assumed until a server says otherwise, so nothing that never
+            // opens a live session pays for a question about one.
+            stream_out: true,
+            stream_silence_told: false,
+            sync_after_save: false,
             snapshot_wanted: false,
             local_copy: None,
             local_due: None,
@@ -1843,6 +1938,10 @@ impl AppState {
         self.local_copy = None;
         self.local_due = None;
         self.held_live.clear();
+        // Names of entries in a log that is no longer the log on screen. Left
+        // behind, they would exclude whatever entries of this plan's own
+        // happened to be called the same thing.
+        self.taken_from_server.clear();
         self.snapshot_wanted = false;
         self.restore_link();
         self.versions = crate::versions::read(self.file_path.as_deref());
@@ -2576,20 +2675,44 @@ impl AppState {
         None
     }
 
+    /// Everything a push carries, gathered in one place.
+    ///
+    /// One builder for the sync and the pull, because they differ only in what
+    /// is offered and every other field has to be the same. `connection` in
+    /// particular: it is the field nothing noticed was missing, and a second
+    /// copy of this list is how it stays missing from one of them.
+    pub(crate) fn offer_of(
+        &self,
+        changes: Vec<aop_core::history::Change>,
+    ) -> Option<crate::cloud::work::Offer> {
+        let link = self.link.clone()?;
+        Some(crate::cloud::work::Offer {
+            server: self.collaborate_server.trim().to_string(),
+            project: link.project,
+            after: link.cursor,
+            changes,
+            plan: self.project.clone(),
+            // The socket the server must not send this work back down. Sent
+            // even on a pull, which offers nothing and so can be echoed
+            // nothing, because which connection this is does not depend on
+            // what is in the body.
+            connection: self.live_connection,
+        })
+    }
+
     /// Gather everything a sync needs, and hand the session over.
     pub fn start_sync(&mut self) -> Option<(crate::cloud::Session, crate::cloud::work::Offer)> {
         if self.sync_blocked().is_some() {
             return None;
         }
-        let link = self.link.clone()?;
-        let offer = crate::cloud::work::Offer {
-            server: self.collaborate_server.trim().to_string(),
-            project: link.project,
-            after: link.cursor,
-            changes: self.project.history.unsent().to_vec(),
-            plan: self.project.clone(),
-        };
+        let offer = self.offer_of(self.our_unsent())?;
         let session = self.hand_over(Working::Syncing)?;
+        // Whatever a save asked for is being carried out now. Cleared once the
+        // work is actually under way, and cleared then rather than when it
+        // succeeds: a sync that fails is one attempt rather than a retry on
+        // every tick at a server already having a bad time, and the work is
+        // still in the log for the next save to ask about.
+        self.sync_after_save = false;
         Some((session, offer))
     }
 
@@ -2601,7 +2724,7 @@ impl AppState {
     pub fn start_snapshot(
         &mut self,
     ) -> Option<(crate::cloud::Session, String, String, i64, Project)> {
-        if !self.snapshot_wanted || self.sync_blocked().is_some() {
+        if !self.snapshot_wanted() || self.sync_blocked().is_some() {
             return None;
         }
         let link = self.link.clone()?;
@@ -2612,9 +2735,27 @@ impl AppState {
         Some((session, server, link.project, link.cursor, plan))
     }
 
-    /// Whether the server is waiting on a fresh whole plan.
+    /// Whether the server is waiting on a fresh whole plan, and this copy is
+    /// in a position to give it one.
+    ///
+    /// The unsent check is the load bearing part, and it is what streaming
+    /// made necessary. A snapshot is stored under a seq and read back as "the
+    /// plan as of that seq". The plan on screen is only that while there is
+    /// nothing waiting to go: with work still unsent it is the plan as of that
+    /// seq *plus* edits the server has never seen, and storing it under the
+    /// cursor would have the next person to open the plan receive those edits
+    /// in the snapshot and then receive them again, as log entries, when they
+    /// are finally pushed.
+    ///
+    /// Under the REST sync this could not happen, because the snapshot went in
+    /// the same breath as a push that had just emptied the log. Streaming
+    /// separated the two, so the condition has to be stated. Waiting costs
+    /// nothing: the ask stays set and the next tick after the batch is
+    /// acknowledged answers it.
     pub fn snapshot_wanted(&self) -> bool {
-        self.snapshot_wanted && self.working.is_none()
+        self.snapshot_wanted
+            && self.working.is_none()
+            && !self.have_unsent()
     }
 
     /// Gather a pull: what the server has, without offering anything.
@@ -2628,17 +2769,10 @@ impl AppState {
         if self.sync_blocked().is_some() {
             return None;
         }
-        let link = self.link.clone()?;
-        let offer = crate::cloud::work::Offer {
-            server: self.collaborate_server.trim().to_string(),
-            project: link.project,
-            after: link.cursor,
-            // Deliberately nothing. Asking to see what is there is not asking
-            // to hand over what is here, and a pull that quietly pushed would
-            // be a sync under another name.
-            changes: Vec::new(),
-            plan: self.project.clone(),
-        };
+        // Deliberately nothing offered. Asking to see what is there is not
+        // asking to hand over what is here, and a pull that quietly pushed
+        // would be a sync under another name.
+        let offer = self.offer_of(Vec::new())?;
         let session = self.hand_over(Working::Syncing)?;
         Some((session, offer))
     }
@@ -2943,6 +3077,10 @@ impl AppState {
         plan.history.merge(fetched.changes.iter().cloned());
         let head = fetched.head.max(fetched.seq);
         self.project = plan;
+        let drifted = self.catch_up_to(&fetched.changes);
+        // Every entry in this log came from the server, and the watermark
+        // below says so exactly, so there is nothing left to name.
+        self.taken_from_server.clear();
         if let Some(newest) = self.project.history.changes().last().map(|c| c.id) {
             self.project.history.mark_pushed(newest);
         }
@@ -2955,11 +3093,55 @@ impl AppState {
         self.clamp_selection();
         self.reschedule();
         self.status = "Took a fresh copy from the server".into();
-        self.cloud_message = Some(
-            "This plan has been replaced with the server's copy. The version you had is in \
-             History and Sync if you want it back."
-                .into(),
-        );
+        self.cloud_message = Some(match drifted {
+            Some(why) => format!(
+                "This plan has been replaced with the server's copy. {why} The version you had \
+                 is in History and Sync if you want it back."
+            ),
+            None => "This plan has been replaced with the server's copy. The version you had is \
+                     in History and Sync if you want it back."
+                .to_string(),
+        });
+    }
+
+    /// Bring a fetched plan up to the end of the log that came with it.
+    ///
+    /// What the server sends is a snapshot as of some seq and every entry
+    /// appended since. The snapshot is a plan; the tail is commands, and until
+    /// they are run this copy is showing the plan as it was when the snapshot
+    /// was stored rather than as it is now. Merging them into the history
+    /// records that they happened without making them have happened here.
+    ///
+    /// How far behind the snapshot is depends entirely on the server's
+    /// setting: the log is allowed to run a set number of entries past the
+    /// newest stored snapshot before the server asks a client for a fresh one,
+    /// so this is a run of at most that many commands and usually far fewer.
+    ///
+    /// Gives back what to say when some of them would not run, which is the
+    /// two sides having drifted rather than a transient failure. Nothing is
+    /// undone in that case: the commands that did run are the ones the server
+    /// holds, and stopping at the first refusal keeps the plan a prefix of the
+    /// log rather than a plan with holes in it.
+    fn catch_up_to(&mut self, tail: &[aop_core::history::Change]) -> Option<String> {
+        if tail.is_empty() {
+            return None;
+        }
+        // Anything held from the plan that was on screen a moment ago belongs
+        // to that plan and not to this one. Dropped rather than written,
+        // because writing it would sign somebody's half finished edit of one
+        // plan into the log of another.
+        self.pending.clear();
+        let (replayed, asked) = self.replay(tail);
+        if replayed >= asked {
+            return None;
+        }
+        Some(format!(
+            "{} of the {asked} changes made since the server's stored copy could not be \
+             replayed here, so this plan is as it stood after the first {replayed} of them. \
+             That means this copy and the server understand those commands differently, which \
+             is worth telling whoever runs the server about.",
+            asked - replayed,
+        ))
     }
 
     /// Somebody has opened a link. Ask about it before anything is fetched.
@@ -3004,6 +3186,13 @@ impl AppState {
         plan.history.merge(fetched.changes.iter().cloned());
         let head = fetched.head.max(fetched.seq);
         self.project = plan;
+        // A first open is a snapshot plus whatever has been appended since,
+        // and the second half has to be run for this copy to be showing the
+        // plan as it is rather than as it was when the snapshot was stored.
+        let drifted = self.catch_up_to(&fetched.changes);
+        // As above: the whole log came from the server and the watermark says
+        // so, so no entry has to be named separately.
+        self.taken_from_server.clear();
         if let Some(newest) = self.project.history.changes().last().map(|c| c.id) {
             self.project.history.mark_pushed(newest);
         }
@@ -3034,12 +3223,14 @@ impl AppState {
         // and "it exists somewhere" is exactly the gap this closes.
         self.keep_a_local_copy(&project);
         self.remember_cursor(head);
-        self.cloud_message = Some(
-            "This plan came from the server. It is kept on this machine so that closing \
-             the window does not lose it, but that copy is not a backup and it is not \
-             yours to find: use Save As to put the plan where you want it, and it stays \
-             the same shared plan.".into(),
-        );
+        let kept = "This plan came from the server. It is kept on this machine so that \
+                    closing the window does not lose it, but that copy is not a backup and \
+                    it is not yours to find: use Save As to put the plan where you want it, \
+                    and it stays the same shared plan.";
+        self.cloud_message = Some(match drifted {
+            Some(why) => format!("{why} {kept}"),
+            None => kept.to_string(),
+        });
     }
 
     /// Open a plan from the local copy this machine already has.
@@ -3063,6 +3254,10 @@ impl AppState {
         // has nothing to do with this one.
         self.stop_live(None);
         self.snapshot_wanted = false;
+        // A different plan, so anything named against the last one's log means
+        // nothing here. What this copy has not sent is what its own watermark
+        // says, which came off the disk with it.
+        self.taken_from_server.clear();
         self.project = plan;
         self.file_path = None;
         self.local_copy = Some(path);
@@ -3133,8 +3328,9 @@ impl AppState {
         }
 
         // The entries are the record of what was done, so they go in with the
-        // work rather than being left to a later sync to discover.
-        self.project.history.merge(changes);
+        // work rather than being left to a later sync to discover, and on the
+        // sent side of the line, because the server is where they came from.
+        self.take_into_the_log(&changes);
         self.touch_local_copy();
         self.undo.push(before);
         if self.undo.len() > UNDO_LIMIT {
@@ -3320,12 +3516,31 @@ impl AppState {
 
     // ---- live editing ----------------------------------------------------
 
-    /// Open the socket with a token a worker has just fetched.
-    pub fn start_live(&mut self, token: String) {
+    /// Open the socket with a token a worker has just fetched, and what that
+    /// worker found out about the server on the other end.
+    ///
+    /// The two answers a mismatched pair can give, and what each does:
+    ///
+    /// ```text
+    ///   Speaks::Streaming     work goes over the socket, as it is done
+    ///   Speaks::NotStreaming  the socket watches only, and it is said out
+    ///                         loud; this copy's work goes on the REST sync
+    ///   Speaks::Unknown       assumed to work, because a health endpoint
+    ///                         that did not answer is not a refusal; a batch
+    ///                         nobody answers times out and says so
+    /// ```
+    ///
+    /// The old client against a new server needs nothing here: it asks no
+    /// question, the extra field in the answer means nothing to it, and the
+    /// server still speaks everything it spoke before.
+    pub fn start_live(&mut self, token: String, speaks: crate::cloud::health::Speaks) {
+        use crate::cloud::health::Speaks;
+
         self.working = None;
         let Some(link) = self.link.clone() else {
             return;
         };
+        self.stream_out = !matches!(speaks, Speaks::NotStreaming);
         let name = match self.display_name().as_str() {
             "" => "Someone".to_string(),
             name => name.to_string(),
@@ -3351,9 +3566,32 @@ impl AppState {
                 // is up. That is the other half of a reconnect: the catch-up
                 // brings in what was missed, and this offers what was made
                 // while there was nowhere to offer it.
-                self.streaming = false;
+                self.in_flight = None;
+                self.stream_silence_told = false;
+                // Not known until the welcome arrives. Anything pushed before
+                // then leaves the field out, which is what it did before this
+                // existed, and the cursor is what keeps that push's echo out.
+                self.live_connection = None;
                 self.stream_due = Some(std::time::Instant::now());
                 self.status = "Live editing is on".into();
+                if !self.stream_out {
+                    // Said plainly and once, at the moment somebody turned it
+                    // on, because everything they can see says it is working:
+                    // the others appear, their edits arrive, and only this
+                    // copy's own work quietly goes nowhere.
+                    self.status = "Live editing is on, for watching only".into();
+                    self.cloud_message = Some(
+                        "This server does not understand edits sent over the live connection, \
+                         so it is older than this copy. You will see other people's work as it \
+                         happens, and your own goes to the server when you save this plan or \
+                         press Sync rather than as you type. Updating the server turns the \
+                         rest of it on."
+                            .into(),
+                    );
+                    // The work still has somewhere to go, so it goes: the
+                    // ordinary sync carries it instead of the socket.
+                    self.sync_after_save = self.have_unsent();
+                }
             }
             Err(error) => {
                 self.live_wanted = false;
@@ -3366,12 +3604,19 @@ impl AppState {
     pub fn stop_live(&mut self, why: Option<String>) {
         self.live = None;
         self.live_wanted = false;
+        // The handle belonged to the connection that has just gone. Sending it
+        // on a later push would name a connection that is no longer there, and
+        // at worst somebody else's.
+        self.live_connection = None;
         self.peers.clear();
         // The next session has told nobody anything, and what this one said
         // went with it.
         // Nothing is in flight any more, and what was in flight was never
         // acknowledged, so it is still unsent work and stays in the log.
-        self.streaming = false;
+        self.in_flight = None;
+        self.stream_silence_told = false;
+        // What the last server understood says nothing about the next one.
+        self.stream_out = true;
         self.stream_due = None;
         // Held work was never applied and the cursor never moved past it, so
         // dropping it loses nothing: the next sync asks for it again.
@@ -3414,8 +3659,12 @@ impl AppState {
 
         for message in batch {
             match message {
-                Incoming::Welcome { head, peers } => {
+                Incoming::Welcome { head, peers, connection } => {
                     self.peers = peers;
+                    // Kept for the REST push to hand back. An older server
+                    // says nothing here, and then the push omits the field and
+                    // the cursor below is what keeps the echo out.
+                    self.live_connection = connection;
                     cursor = Some(head.max(cursor.unwrap_or(head)));
                 }
                 // A catch-up comes before any live change on purpose, so the
@@ -3432,7 +3681,7 @@ impl AppState {
                     // Marked by the local id the server acknowledged rather
                     // than by counting, because an answer that came back out
                     // of order must not mark work nobody has seen as sent.
-                    self.streaming = false;
+                    self.batch_answered();
                     if let Some(highest) = applied.iter().map(|(local, _)| *local).max() {
                         self.project.history.mark_pushed(highest);
                     }
@@ -3442,7 +3691,7 @@ impl AppState {
                     // in, so the log's end is this copy's own last change.
                     self.remember_cursor(head);
                     // Whatever did not fit in that batch goes in the next one.
-                    if !self.project.history.unsent().is_empty() {
+                    if self.have_unsent() {
                         self.stream_due = Some(std::time::Instant::now());
                     }
                     self.snapshot_wanted |= snapshot_wanted;
@@ -3453,7 +3702,7 @@ impl AppState {
                     // unsent and still in the log. What came back is what was
                     // missed, and it goes in the same way a live change does:
                     // replayed onto this copy, or refused outright.
-                    self.streaming = false;
+                    self.batch_answered();
                     cursor = Some(head.max(cursor.unwrap_or(head)));
                     incoming.extend(changes);
                     // Offered again once their work is in, which is what a
@@ -3462,7 +3711,7 @@ impl AppState {
                     self.stream_due = Some(std::time::Instant::now());
                 }
                 Incoming::Ahead { head, cursor: mine } => {
-                    self.streaming = false;
+                    self.batch_answered();
                     ahead = Some((head, mine));
                 }
                 Incoming::Refused(why) => {
@@ -3471,7 +3720,7 @@ impl AppState {
                     // at once, because whatever refused it will refuse it
                     // again a millisecond later and this is a socket, not a
                     // retry loop.
-                    self.streaming = false;
+                    self.batch_answered();
                     self.stream_due = Some(
                         std::time::Instant::now() + Duration::from_millis(STREAM_RETRY_MILLIS),
                     );
@@ -3539,7 +3788,18 @@ impl AppState {
         }
 
         if !incoming.is_empty() {
-            self.take_live_batch(&incoming, cursor);
+            if self.push_in_flight() {
+                // Parked rather than applied, and the cursor deliberately not
+                // remembered. A push of this copy's own work is out with the
+                // server, and until its answer lands and moves the cursor past
+                // what it carried, an entry arriving here cannot be told from
+                // somebody else's. Held work is applied the moment the answer
+                // is in, and by then the cursor says which of it was this
+                // copy's own all along.
+                self.held_live.extend(incoming);
+            } else {
+                self.take_live_batch(&incoming, cursor);
+            }
         }
         if let Some(why) = ended {
             self.stop_live(Some(why));
@@ -3610,8 +3870,8 @@ impl AppState {
     /// Asked before a write handle is taken, so that a live session with
     /// nothing happening does not redraw the window on every tick.
     pub fn stream_due(&self) -> bool {
-        self.live.is_some()
-            && !self.streaming
+        self.streams_out()
+            && self.in_flight.is_none()
             // Work of somebody else's is waiting to go in ahead of this. It
             // was made against a cursor this copy has not reached, so offering
             // anything now would only be told it is behind by that.
@@ -3619,7 +3879,75 @@ impl AppState {
             && self
                 .stream_due
                 .is_some_and(|due| due <= std::time::Instant::now())
-            && !self.project.history.unsent().is_empty()
+            && self.have_unsent()
+    }
+
+    /// The batch with the server has been answered, whatever the answer was.
+    ///
+    /// One place for it, because the four answers agree about exactly this:
+    /// the round trip is over and the socket is free to carry the next one.
+    /// Two of them mark work as sent and two do not, and that difference is
+    /// made where the answer is read.
+    fn batch_answered(&mut self) {
+        self.in_flight = None;
+        // A session that has started answering again is one worth complaining
+        // about afresh if it stops.
+        self.stream_silence_told = false;
+    }
+
+    /// Whether the batch with the server has gone unanswered too long.
+    ///
+    /// Asked from the same timer that offers work, and before a write handle
+    /// is taken, so a session that is behaving normally costs nothing to
+    /// check.
+    pub fn stream_unanswered(&self) -> bool {
+        self.in_flight.is_some_and(|sent| {
+            sent.elapsed() >= Duration::from_secs(STREAM_ANSWER_SECONDS)
+        })
+    }
+
+    /// Give up on a batch nobody answered, and carry on.
+    ///
+    /// This is the failure that cost an afternoon: a batch went to a server
+    /// that did not understand the message, the server said nothing at all,
+    /// and the in-flight marker stayed set. From that moment nothing else
+    /// streamed, for the rest of the session, without a word. Sync went on
+    /// working, because it is a different transport, which is exactly what
+    /// made it look like something else.
+    ///
+    /// Giving up is safe and needs no undoing. Nothing was ever marked as
+    /// sent, because only an answer marks anything, so the log still holds
+    /// every entry as unsent and the next offer carries them again. If the
+    /// server was merely slow and its answer arrives late, it acknowledges
+    /// work this copy is offering again; `mark_pushed` only ever moves
+    /// forward, and a change the server already holds is ignored by its own
+    /// push decision rather than applied twice.
+    pub fn gave_up_on_batch(&mut self) {
+        if !self.stream_unanswered() {
+            return;
+        }
+        self.in_flight = None;
+        // A pause rather than at once. A server that ignored one batch will
+        // ignore the next, and this is a socket rather than a retry loop.
+        self.stream_due =
+            Some(std::time::Instant::now() + Duration::from_millis(STREAM_RETRY_MILLIS));
+
+        // Once. The condition persists and this is asked several times a
+        // second; a message repeated at that rate is one somebody dismisses
+        // without reading. Cleared again by the next answer that arrives, so
+        // a session that recovers and then fails again says so again.
+        if self.stream_silence_told {
+            return;
+        }
+        self.stream_silence_told = true;
+        self.cloud_message = Some(format!(
+            "The server has not answered work sent over the live connection for \
+             {STREAM_ANSWER_SECONDS} seconds. That usually means it is older than this copy \
+             and does not understand it. Nothing has been lost: your work is still here and \
+             still waiting to go, and it goes when you save this plan or press Sync. Turning \
+             live editing off and on again re-checks the server."
+        ));
+        self.status = "The live connection is not answering".into();
     }
 
     /// Offer this copy's unsent work over the live socket.
@@ -3651,34 +3979,55 @@ impl AppState {
         // waiting. What is left goes in the next batch, once this one is
         // answered and the cursor has moved.
         let batch: Vec<aop_core::history::Change> = self
-            .project
-            .history
-            .unsent()
-            .iter()
+            .our_unsent()
+            .into_iter()
             .take(STREAM_BATCH)
-            .cloned()
             .collect();
         if let Some(live) = self.live.as_ref() {
             live.send_changes(after, &batch);
-            self.streaming = true;
+            // The moment it went, not merely that it did. A marker with no
+            // moment on it can only be cleared by an answer, and a server that
+            // never answers can then leave it set for the rest of the session.
+            self.in_flight = Some(std::time::Instant::now());
             self.stream_due = None;
         }
     }
 
-    /// Whether work held back for an editor can go in now.
+    /// Whether work held back can go in now.
+    ///
+    /// Two things hold work back, and both have to have cleared. An open cell
+    /// editor, because a change to the task somebody is typing into would move
+    /// the ground under them mid-word. And a push of this copy's own work that
+    /// is still with the server, because until its answer lands the cursor has
+    /// not moved past the work it carried, and anything the server echoed back
+    /// in the meantime cannot yet be told from somebody else's.
     pub fn held_work_due(&self) -> bool {
-        !self.held_live.is_empty() && self.editing.is_none()
+        !self.held_live.is_empty() && self.editing.is_none() && !self.push_in_flight()
     }
 
-    /// Bring in the work that was waiting for somebody to finish typing.
+    /// Whether a REST push of this copy's own work is out with the server.
+    ///
+    /// The window in which an echo of that push can arrive on the socket
+    /// before the answer that would move the cursor past it. An up to date
+    /// server never sends that echo, because the push names the connection to
+    /// skip; an older one does, and this is what keeps it from being applied
+    /// as though somebody else had made it.
+    fn push_in_flight(&self) -> bool {
+        matches!(self.working, Some(Working::Syncing))
+    }
+
+    /// Bring in the work that was waiting.
     pub fn apply_held_live(&mut self) {
         if !self.held_work_due() {
             return;
         }
         let held = std::mem::take(&mut self.held_live);
-        // No head to remember: the cursor moves with whatever answer carried
-        // these, and a batch applied late must not claim to have read further
-        // than it has.
+        // No head from an answer, because the answer that carried these went
+        // by long ago. How far they read is worked out from the entries
+        // themselves, which is the only honest source once they are applied
+        // late: claiming the answer's head would skip whatever arrived between
+        // then and now, and claiming nothing would have the server replay
+        // these after the next reconnect.
         self.take_live_batch(&held, None);
     }
 
@@ -3698,22 +4047,135 @@ impl AppState {
 
     /// Bring one batch of live changes in.
     /// Bring one batch of live changes in.
-    fn take_live_batch(&mut self, incoming: &[aop_core::history::Change], head: Option<i64>) {
-        // A change already in the log is one that arrived twice, which the
-        // protocol allows: it can be in a catch-up and in the live stream
-        // both. Applying it again would count the work twice.
-        let fresh: Vec<aop_core::history::Change> = incoming
+    /// Which of these have not already been taken in.
+    ///
+    /// **What makes an incoming change recognisably one's own.** Not its id.
+    /// The server renumbers every entry as it lands it: what a client sends as
+    /// change 6 is stored as seq 43 and comes back to everybody, its author
+    /// included, as change 43. So "have I seen this" cannot be answered by
+    /// comparing an id the server chose against one this copy chose. Those are
+    /// two different numbering schemes that happen to share a type, and asking
+    /// the question that way is wrong in both directions at once: this copy's
+    /// own work comes back wearing a number it has never used and is applied
+    /// as though it were somebody else's, while somebody else's work whose seq
+    /// happens to collide with an unsent local id is silently thrown away.
+    ///
+    /// The cursor is the answer, because the cursor is precisely the record of
+    /// how far down the shared log this copy has read. Everything at or before
+    /// it has been taken in, whoever wrote it and whatever this copy called it
+    /// at the time; everything past it has not. Every entry that arrives from
+    /// the server carries its seq as its id, so the comparison is exact and
+    /// needs nothing remembered on the side.
+    ///
+    /// That covers all the ways one change can arrive twice: in a catch-up and
+    /// again in the live stream, in a refusal and again as a broadcast, or
+    /// pushed over REST and echoed back over a socket the server did not know
+    /// to skip. The `connection` on the push stops that last one at the
+    /// server; this stops it here as well, which is what keeps an older server
+    /// merely older rather than corrupting.
+    fn not_yet_taken(
+        &self,
+        incoming: &[aop_core::history::Change],
+    ) -> Vec<aop_core::history::Change> {
+        let taken_through = self.link.as_ref().map(|link| link.cursor).unwrap_or(0);
+        let mut fresh: Vec<aop_core::history::Change> = Vec::new();
+        for change in incoming {
+            let seq = seq_of(change);
+            if seq <= taken_through {
+                continue;
+            }
+            // One batch can carry the same entry twice when a catch-up and the
+            // live stream overlap, so the batch is deduplicated against itself
+            // as well as against the cursor.
+            if fresh.iter().any(|held| seq_of(held) == seq) {
+                continue;
+            }
+            fresh.push(change.clone());
+        }
+        fresh
+    }
+
+    /// Put somebody else's entries in the log, on the sent side of the line.
+    ///
+    /// The log is the record, so their work belongs in it. What must not
+    /// follow is this copy offering it back: it is already in the shared log,
+    /// and appending it again puts a second copy of their edit in front of
+    /// everybody, permanently.
+    ///
+    /// Two things keep it out of the offer, and both are needed. When nothing
+    /// of this copy's own was waiting, the watermark can simply move past
+    /// them, which is exact, needs no bookkeeping and survives being saved and
+    /// reopened. When something of this copy's own was waiting, the watermark
+    /// cannot move without marking that work as sent when it has not been, so
+    /// the entries are named instead and left out of what is offered.
+    fn take_into_the_log(&mut self, theirs: &[aop_core::history::Change]) {
+        let nothing_of_ours_was_waiting = !self.have_unsent();
+        self.project.history.merge(theirs.iter().cloned());
+
+        let highest = theirs.iter().map(|change| change.id).max();
+        match (nothing_of_ours_was_waiting, highest) {
+            (true, Some(highest)) => self.project.history.mark_pushed(highest),
+            _ => self
+                .taken_from_server
+                .extend(theirs.iter().map(|change| change.id)),
+        }
+
+        // The log drops its oldest entries once it is long enough, and a name
+        // kept for an entry that no longer exists is a leak that grows for as
+        // long as a session lasts.
+        if !self.taken_from_server.is_empty() {
+            let held: std::collections::HashSet<u64> = self
+                .project
+                .history
+                .changes()
+                .iter()
+                .map(|change| change.id)
+                .collect();
+            self.taken_from_server.retain(|id| held.contains(id));
+        }
+    }
+
+    /// The work this copy has done and not sent.
+    ///
+    /// What `History::unsent` says, less anything that came from the server.
+    /// Everywhere that decides what to offer asks this rather than the log
+    /// directly, because the log holds both copies' entries and only one of
+    /// them is this copy's to offer.
+    /// Whether there is any of it, without building the list.
+    ///
+    /// The predicate the timers ask several times a second. Cloning a run of
+    /// entries to find out whether there are any would be a handful of string
+    /// allocations per tick for a question with a one word answer.
+    pub(crate) fn have_unsent(&self) -> bool {
+        self.project
+            .history
+            .unsent()
             .iter()
-            .filter(|change| {
-                !self
-                    .project
-                    .history
-                    .changes()
-                    .iter()
-                    .any(|held| held.id == change.id)
-            })
+            .any(|change| !self.taken_from_server.contains(&change.id))
+    }
+
+    pub(crate) fn our_unsent(&self) -> Vec<aop_core::history::Change> {
+        self.project
+            .history
+            .unsent()
+            .iter()
+            .filter(|change| !self.taken_from_server.contains(&change.id))
             .cloned()
-            .collect();
+            .collect()
+    }
+
+    fn take_live_batch(&mut self, incoming: &[aop_core::history::Change], head: Option<i64>) {
+        let fresh = self.not_yet_taken(incoming);
+        // How far the log has actually been read once these are in. Worked out
+        // from the entries themselves rather than taken on trust from the
+        // answer that carried them, because work held back for an open cell
+        // editor is applied later with no answer beside it, and a cursor that
+        // never moved past it would have the server replay it after the next
+        // reconnect.
+        let reached = head
+            .into_iter()
+            .chain(fresh.iter().map(seq_of).max())
+            .max();
         if fresh.is_empty() {
             if let Some(head) = head {
                 self.remember_cursor(head);
@@ -3763,7 +4225,7 @@ impl AppState {
             return;
         }
 
-        self.project.history.merge(fresh.clone());
+        self.take_into_the_log(&fresh);
         self.touch_local_copy();
         self.undo.push(before);
         if self.undo.len() > UNDO_LIMIT {
@@ -3771,8 +4233,8 @@ impl AppState {
         }
         self.redo.clear();
         self.dirty = true;
-        if let Some(head) = head {
-            self.remember_cursor(head);
+        if let Some(reached) = reached {
+            self.remember_cursor(reached);
         }
         self.clamp_selection();
         self.reschedule();
@@ -4154,6 +4616,10 @@ impl AppState {
                 // give back and would only turn up as a false alarm later.
                 crate::recovery::discard();
 
+                // After the link has settled, because `moved_to` is what
+                // decides which plan on the server this file now is.
+                self.offer_after_save();
+
                 // If this save was only asked for so that something else could
                 // go ahead, that something else happens now.
                 if let Some(action) = self.after_save.take() {
@@ -4170,6 +4636,64 @@ impl AppState {
                 });
             }
         }
+    }
+
+    /// Offer what this plan has not sent, because it has just been saved.
+    ///
+    /// Saving a shared plan and having nothing leave the machine is the
+    /// surprise this removes: somebody with live editing off could press Save
+    /// all afternoon and every one of those saves stayed on the disk in front
+    /// of them. A save is a decision about the work, so it is the right moment
+    /// to offer it.
+    ///
+    /// **Nothing here can make a save fail.** The file is written, the save
+    /// point is marked and the recent list is updated before this is reached,
+    /// and neither branch touches a network: one moves a debounce forward and
+    /// the other sets a flag a timer reads. A server that is down, an account
+    /// that is signed out, and a machine with no network at all all end the
+    /// same way, which is the way they end today: the work stays in the log,
+    /// unsent, waiting for the next opportunity. Saving is a local promise;
+    /// syncing is a best effort laid on top of it, and neither may become
+    /// conditional on the other.
+    ///
+    /// An unlinked plan has nowhere to send anything, so nothing happens.
+    fn offer_after_save(&mut self) {
+        if self.link.is_none() || !self.have_unsent() {
+            return;
+        }
+        if self.streams_out() {
+            // A socket is open and the server understands the message, so the
+            // only thing between the work and the wire is the debounce.
+            // Bringing it forward is what makes Save mean now rather than in a
+            // quarter of a second.
+            self.stream_due = Some(std::time::Instant::now());
+            return;
+        }
+        // No socket, or one that cannot carry work. The ordinary sync goes
+        // instead, started from a timer rather than from here.
+        self.sync_after_save = true;
+    }
+
+    /// Whether the live socket is one this copy's own work can go out on.
+    ///
+    /// Two separate facts: whether there is a connection, and whether the
+    /// server on the end of it understands work offered over it. An older
+    /// server is happy to hold the socket and relay everybody else's edits,
+    /// which is worth having and is why the session is not refused outright.
+    fn streams_out(&self) -> bool {
+        self.live.is_some() && self.stream_out
+    }
+
+    /// Whether a save has asked for a sync and the moment has come to start
+    /// one.
+    ///
+    /// Asked before a write handle is taken, like everything else read from a
+    /// timer: a plan nobody is editing must not redraw the window to be told
+    /// there is nothing to do.
+    pub fn sync_after_save_due(&self) -> bool {
+        self.sync_after_save
+            && self.sync_blocked().is_none()
+            && self.have_unsent()
     }
 
     /// Save over the current file, or fall through to Save As when there is none.
@@ -7845,6 +8369,404 @@ mod tests {
         }
     }
 
+    // ---- saving a shared plan sends it ------------------------------------
+
+    /// A linked plan with somebody signed in, which is what a sync needs
+    /// before it can be more than a wish.
+    fn signed_in() -> AppState {
+        let mut state = linked();
+        state.account = Some(crate::cloud::Account {
+            subject: "ada".into(),
+            name: "Ada".into(),
+            email: "ada@example.test".into(),
+            picture: None,
+        });
+        state
+    }
+
+    /// The offer a save makes, exercised on its own.
+    ///
+    /// `save_to` is not called here, and deliberately: a real save writes a
+    /// recent list, a version store and a recovery marker into whichever
+    /// configuration directory the machine running the tests happens to have,
+    /// which is why the save tests above only ever exercise the failing path.
+    /// What is checked here is the decision the save makes, which is the part
+    /// that can be wrong.
+    #[test]
+    fn saving_a_linked_plan_offers_what_it_has_not_sent() {
+        // The whole complaint: live editing off, a shared plan, and Save
+        // pressed all afternoon while nothing left the machine.
+        let mut state = signed_in();
+        state.append_task("Pour the foundations");
+        assert_eq!(state.project.history.unsent().len(), 1);
+
+        state.offer_after_save();
+
+        assert!(state.sync_after_save, "the save asked for it to go");
+        assert!(
+            state.sync_after_save_due(),
+            "and the timer that starts a worker can see that it should",
+        );
+    }
+
+    #[test]
+    fn saving_a_plan_that_is_on_no_server_asks_for_nothing() {
+        let mut state = signed_in();
+        state.link = None;
+        state.append_task("Pour the foundations");
+
+        state.offer_after_save();
+
+        assert!(!state.sync_after_save, "there is nowhere to send it");
+    }
+
+    #[test]
+    fn a_save_with_no_network_still_saves_and_leaves_the_work_unsent() {
+        // The rule that matters most. A save is a local promise: the file, the
+        // save point and the recent list do not depend on a server being
+        // there. Syncing is a best effort laid on top, and when it cannot
+        // happen the work stays in the log exactly as it does today.
+        let mut state = signed_in();
+        state.append_task("Pour the foundations");
+        let unsent_before = state.project.history.unsent().len();
+
+        // Nothing is reachable: no account, which is what a machine with no
+        // network looks like from here after a session has expired.
+        state.account = None;
+        state.offer_after_save();
+
+        assert!(
+            state.sync_after_save,
+            "the wish is remembered, so the next opportunity takes it",
+        );
+        assert!(
+            !state.sync_after_save_due(),
+            "but nothing is started, because there is nothing to start it against",
+        );
+        assert_eq!(
+            state.project.history.unsent().len(),
+            unsent_before,
+            "and the work is still unsent, which is what makes it recoverable",
+        );
+        assert!(state.dialog.is_none(), "and nothing was put in front of anybody");
+    }
+
+    #[test]
+    fn a_sync_a_save_asked_for_is_not_lost_when_it_cannot_be_started() {
+        // The wish is cleared when the work is taken, not when it is asked
+        // for. A sync that never got off the ground has sent nothing, so the
+        // note has to survive for the next opportunity to read it.
+        let mut state = signed_in();
+        state.append_task("Pour the foundations");
+        state.offer_after_save();
+
+        assert!(state.start_sync().is_none(), "there is no session to hand over");
+        assert!(state.sync_after_save, "so the save's wish is still standing");
+    }
+
+    #[test]
+    fn a_save_does_not_start_a_second_conversation_with_the_server() {
+        // One at a time. A sync running beside another would offer the same
+        // commands twice, and the second offer would be told it is behind by
+        // its own first one.
+        let mut state = signed_in();
+        state.append_task("Pour the foundations");
+        state.offer_after_save();
+        state.working = Some(Working::Syncing);
+
+        assert!(!state.sync_after_save_due(), "it waits for the one already going");
+        assert!(state.sync_after_save, "and is not forgotten while it waits");
+    }
+
+    #[test]
+    fn a_plan_fetched_from_the_server_is_brought_up_to_the_end_of_its_log() {
+        // What the server sends is a snapshot as of some seq plus every entry
+        // appended since, and the second half is commands. Recording that they
+        // happened is not the same as having them happen: without this the
+        // plan on screen is the plan as it stood when the snapshot was stored,
+        // by as many entries as the server lets the log run past one.
+        let mut state = linked();
+        let tail = vec![theirs(70, "append_task(\"Theirs\");", "Added Theirs")];
+
+        let drifted = state.catch_up_to(&tail);
+
+        assert!(drifted.is_none(), "it replayed: {drifted:?}");
+        assert!(
+            state.project.tasks.iter().any(|task| task.name == "Theirs"),
+            "the tail is part of the plan, not just part of its story",
+        );
+        assert!(
+            state.project.history.unsent().is_empty(),
+            "and replaying somebody else's work writes no entry of this copy's own",
+        );
+    }
+
+    #[test]
+    fn work_taken_from_the_server_is_never_offered_back_to_it() {
+        // The third way one edit becomes two, and the worst of them, because
+        // it writes the duplicate into the shared log where every copy gets
+        // it. An entry taken from the server is merged into this copy's log
+        // under the id the server gave it, and `unsent` is everything in the
+        // log past a watermark that counts in this copy's own ids. Those are
+        // two numbering schemes again, so somebody else's work lands on the
+        // unsent side of the line and is offered straight back.
+        use crate::cloud::live::Incoming;
+        let mut state = signed_in();
+        state.append_task("Mine");
+        let mine = state
+            .project
+            .history
+            .unsent()
+            .first()
+            .map(|change| change.id)
+            .expect("the edit was written down");
+        state.sync_landed(Ok(Pushed::Applied {
+            head: 5,
+            applied: vec![(mine, 5)],
+            snapshot_wanted: false,
+        }));
+        assert!(state.our_unsent().is_empty(), "everything of ours has gone");
+
+        state.take_live_arrivals(vec![Incoming::Change {
+            seq: 6,
+            change: theirs(6, "append_task(\"Theirs\");", "Added Theirs"),
+        }]);
+
+        assert!(
+            state.project.tasks.iter().any(|task| task.name == "Theirs"),
+            "their work is in",
+        );
+        assert!(
+            state.our_unsent().is_empty(),
+            "and none of it is waiting to be sent back to them",
+        );
+    }
+
+    #[test]
+    fn our_own_work_still_goes_when_theirs_arrives_beside_it() {
+        // The other side of the same line. Withholding somebody's own edit
+        // because an entry of theirs happened to be merged next to it would
+        // trade a duplicate for a loss, which is a worse bargain.
+        use crate::cloud::live::Incoming;
+        let mut state = signed_in();
+        state.append_task("Mine");
+        let waiting = state.our_unsent().len();
+        assert_eq!(waiting, 1);
+
+        state.take_live_arrivals(vec![Incoming::Change {
+            seq: 5,
+            change: theirs(5, "append_task(\"Theirs\");", "Added Theirs"),
+        }]);
+
+        let ours = state.our_unsent();
+        assert_eq!(ours.len(), 1, "still exactly one thing of ours to send");
+        assert_eq!(ours[0].id, {
+            state
+                .project
+                .history
+                .changes()
+                .iter()
+                .find(|change| change.summary.contains("Mine"))
+                .map(|change| change.id)
+                .unwrap_or_default()
+        });
+    }
+
+    // ---- not applying the same work twice --------------------------------
+
+    #[test]
+    fn a_push_names_the_socket_it_must_not_be_echoed_to() {
+        // The field the client simply never filled in. The server reads it,
+        // defaulted it to nothing, and so broadcast every synced change back
+        // to the very copy that made it.
+        use crate::cloud::live::Incoming;
+        let mut state = signed_in();
+        state.take_live_arrivals(vec![Incoming::Welcome {
+            head: 4,
+            peers: Vec::new(),
+            connection: Some(11),
+        }]);
+
+        let offer = state.offer_of(Vec::new()).expect("this plan is on a server");
+        assert_eq!(offer.connection, Some(11));
+    }
+
+    #[test]
+    fn a_push_with_no_socket_open_names_no_connection() {
+        // And an older server that has never heard of the field sees the body
+        // it already expects, because nothing is sent in place of it.
+        let state = signed_in();
+        let offer = state.offer_of(Vec::new()).expect("this plan is on a server");
+        assert_eq!(offer.connection, None);
+    }
+
+    #[test]
+    fn the_socket_handle_goes_when_the_socket_does() {
+        // It named a connection that has ended. Sending it on a later push
+        // would name one that is not there, and at worst somebody else's.
+        use crate::cloud::live::Incoming;
+        let mut state = signed_in();
+        state.take_live_arrivals(vec![Incoming::Welcome {
+            head: 4,
+            peers: Vec::new(),
+            connection: Some(11),
+        }]);
+        state.stop_live(None);
+
+        assert_eq!(state.offer_of(Vec::new()).and_then(|offer| offer.connection), None);
+    }
+
+    #[test]
+    fn a_sync_during_a_live_session_does_not_change_the_plan() {
+        // The corruption itself. Work is pushed over REST, the server echoes
+        // it to this copy's own socket, and it arrives renumbered so it no
+        // longer looks like this copy's own. Applying it again duplicates the
+        // task, because `append_task` is not a no-op the second time.
+        use crate::cloud::live::Incoming;
+        let mut state = signed_in();
+        state.append_task("Pour the foundations");
+        let mine = state
+            .project
+            .history
+            .unsent()
+            .first()
+            .map(|change| change.id)
+            .expect("the edit was written down");
+        let tasks_after_editing = state.project.tasks.len();
+
+        // The push lands: the entry this copy called `mine` is seq 5 now.
+        state.sync_landed(Ok(Pushed::Applied {
+            head: 5,
+            applied: vec![(mine, 5)],
+            snapshot_wanted: false,
+        }));
+
+        // And the server, not knowing to skip this connection, sends it back.
+        state.take_live_arrivals(vec![Incoming::Change {
+            seq: 5,
+            change: Change {
+                id: 5,
+                at: Local::now().naive_local(),
+                author: "Ada".into(),
+                script: "append_task(\"Pour the foundations\");".into(),
+                summary: "Added Pour the foundations".into(),
+            },
+        }]);
+
+        assert_eq!(
+            state.project.tasks.len(),
+            tasks_after_editing,
+            "the work went once, so it is in the plan once",
+        );
+    }
+
+    #[test]
+    fn work_already_read_is_not_applied_again_whatever_id_it_carries() {
+        // A catch-up and the live stream can carry the same entry, and a
+        // refusal and a broadcast can too. What settles it is the cursor:
+        // everything at or before it has been read, whoever wrote it.
+        use crate::cloud::live::Incoming;
+        let mut state = signed_in();
+        let arrival = || Incoming::Catchup {
+            head: 6,
+            changes: vec![theirs(6, "append_task(\"Theirs\");", "Added Theirs")],
+        };
+
+        state.take_live_arrivals(vec![arrival()]);
+        let after_first = state.project.tasks.len();
+        assert_eq!(state.link.as_ref().map(|link| link.cursor), Some(6));
+
+        state.take_live_arrivals(vec![arrival()]);
+
+        assert_eq!(
+            state.project.tasks.len(),
+            after_first,
+            "the second delivery is the same entry, not a second one",
+        );
+    }
+
+    #[test]
+    fn somebody_elses_work_is_not_thrown_away_for_sharing_a_number_with_ours() {
+        // The other half of the same mistake, and the one that showed up as a
+        // table that would not update. Ids from the server and ids this copy
+        // chose are two numbering schemes sharing a type: a copy with five
+        // unsent edits of its own has an entry called 5, and somebody else's
+        // work landing at seq 5 was dropped as a duplicate of it.
+        use crate::cloud::live::Incoming;
+        let mut state = signed_in();
+        // Local ids run from wherever this copy's own counter has reached, and
+        // the server's seqs run from the shared log. One of these copy's own
+        // entries is bound to wear a number the server will hand out too.
+        let mut mine = 0;
+        for _ in 0..5 {
+            mine = state.project.history.record(
+                "Ada", "indent();", "Indented", Local::now().naive_local(),
+            );
+        }
+        let collides = i64::try_from(mine).unwrap_or(0);
+        state.link = Some(Link { project: "a-project".into(), cursor: collides - 1 });
+
+        state.take_live_arrivals(vec![Incoming::Change {
+            seq: collides,
+            change: theirs(mine, "append_task(\"Theirs\");", "Added Theirs"),
+        }]);
+
+        assert!(
+            state.project.tasks.iter().any(|task| task.name == "Theirs"),
+            "their work is past the cursor, so it is theirs and it is new",
+        );
+    }
+
+    #[test]
+    fn an_arrival_during_a_push_waits_for_that_push_to_be_answered() {
+        // The window an older server can slip an echo through: it broadcasts
+        // when it commits, and the answer that moves the cursor past that work
+        // arrives afterwards. Until it does, an entry cannot be told from
+        // somebody else's, so it waits rather than being guessed at.
+        use crate::cloud::live::Incoming;
+        let mut state = signed_in();
+        state.append_task("Pour the foundations");
+        state.working = Some(Working::Syncing);
+
+        state.take_live_arrivals(vec![Incoming::Change {
+            seq: 5,
+            change: theirs(5, "append_task(\"Theirs\");", "Added Theirs"),
+        }]);
+
+        assert!(!state.held_live.is_empty(), "parked rather than applied");
+        assert!(!state.held_work_due(), "and it stays parked while the push is out");
+        assert_eq!(
+            state.link.as_ref().map(|link| link.cursor),
+            Some(4),
+            "and nothing claims to have been read that has not been",
+        );
+    }
+
+    #[test]
+    fn work_held_for_an_open_editor_moves_the_cursor_when_it_finally_lands() {
+        // Applied late, with no answer beside it to take a head from. A cursor
+        // left where it was would have the server replay this after the next
+        // reconnect, which is the duplicate arriving by another road.
+        use crate::cloud::live::Incoming;
+        let mut state = signed_in();
+        state.append_task("Pour the foundations");
+        state.editing = Some((0, Column::Name));
+        state.take_live_arrivals(vec![Incoming::Change {
+            seq: 6,
+            change: theirs(6, "set_field(1, Name, \"Pour the piles\");", "Renamed"),
+        }]);
+        assert!(!state.held_live.is_empty(), "held while the cell is open");
+
+        state.editing = None;
+        state.apply_held_live();
+
+        assert_eq!(
+            state.link.as_ref().map(|link| link.cursor),
+            Some(6),
+            "read this far, and says so, so it is never sent again",
+        );
+    }
+
     // ---- streaming, both ways -------------------------------------------
 
     #[test]
@@ -7874,7 +8796,7 @@ mod tests {
         let first = state.project.history.record(
             "Ada", "append_task(\"A\");", "Added A", Local::now().naive_local(),
         );
-        state.streaming = true;
+        state.in_flight = Some(std::time::Instant::now());
 
         state.take_live_arrivals(vec![Incoming::Applied {
             head: 8,
@@ -7884,7 +8806,7 @@ mod tests {
 
         assert!(state.project.history.unsent().is_empty(), "it went");
         assert_eq!(state.link.as_ref().map(|link| link.cursor), Some(8));
-        assert!(!state.streaming, "and the socket is free to carry the next batch");
+        assert!(state.in_flight.is_none(), "and the socket is free to carry the next batch");
     }
 
     #[test]
@@ -7897,7 +8819,7 @@ mod tests {
         let mine = state.project.history.record(
             "Ada", "append_task(\"Mine\");", "Added Mine", Local::now().naive_local(),
         );
-        state.streaming = true;
+        state.in_flight = Some(std::time::Instant::now());
 
         state.take_live_arrivals(vec![Incoming::Behind {
             head: 6,
@@ -7910,12 +8832,108 @@ mod tests {
             "a refusal writes nothing, so this is still waiting to go",
         );
         assert!(state.stream_due.is_some(), "and is offered again once theirs is in");
-        assert!(!state.streaming);
+        assert!(state.in_flight.is_none());
         assert!(
             state.project.tasks.iter().any(|task| task.name == "Theirs"),
             "their work applied quietly, because it applied cleanly",
         );
         assert!(state.dialog.is_none(), "and without a modal in front of somebody typing");
+    }
+
+    #[test]
+    fn a_server_that_does_not_speak_streaming_is_said_so_and_not_streamed_to() {
+        // The other half of the same problem, caught before anything is sent
+        // rather than after nothing comes back. Such a server is happy to hold
+        // the socket and relay everybody else's edits, so the session is worth
+        // having; what it will not do is take this copy's work, and that is
+        // the part that has to be said out loud.
+        //
+        // Loopback on a port nothing listens on, so the worker thread this
+        // starts fails at once and no name is ever looked up.
+        let mut state = signed_in();
+        state.collaborate_server = "http://127.0.0.1:1".into();
+        state.append_task("Pour the foundations");
+
+        state.start_live("a-token".into(), crate::cloud::health::Speaks::NotStreaming);
+
+        assert!(state.live.is_some(), "the socket is still worth having");
+        assert!(!state.streams_out(), "but nothing of this copy's own goes down it");
+        assert!(!state.stream_due(), "so no batch is ever offered, and none can hang");
+        assert!(
+            state.cloud_message.as_deref().is_some_and(|said| {
+                said.contains("does not understand") && said.contains("press Sync")
+            }),
+            "said plainly, and with what does work: got {:?}",
+            state.cloud_message,
+        );
+        assert!(
+            state.sync_after_save_due(),
+            "and the work is routed the way that does reach this server",
+        );
+
+        // Once. It is said when the session starts, which happens when
+        // somebody asks for one, rather than by anything on a timer.
+        state.cloud_message = None;
+        state.gave_up_on_batch();
+        assert!(state.cloud_message.is_none(), "nothing repeats it");
+    }
+
+    #[test]
+    fn a_batch_nobody_answers_is_given_up_on_and_the_next_one_is_offered() {
+        // This is the failure that cost an afternoon. A batch went to a server
+        // that did not understand the message, the server said nothing, and
+        // the in-flight marker stayed set. From that moment nothing else
+        // streamed, for the rest of the session, silently.
+        let mut state = signed_in();
+        let mine = state.project.history.record(
+            "Ada", "append_task(\"Mine\");", "Added Mine", Local::now().naive_local(),
+        );
+        state.in_flight = Some(
+            std::time::Instant::now() - Duration::from_secs(STREAM_ANSWER_SECONDS + 1),
+        );
+        assert!(state.stream_unanswered(), "long enough to be a fault rather than a wait");
+
+        state.gave_up_on_batch();
+
+        assert!(state.in_flight.is_none(), "the socket is free to carry the next batch");
+        assert!(
+            state.project.history.unsent().iter().any(|change| change.id == mine),
+            "nothing was ever marked as sent, so the work is still here",
+        );
+        assert!(state.stream_due.is_some(), "and is offered again after a pause");
+        assert!(
+            state.cloud_message.is_some_and(|said| said.contains("not answered")),
+            "and somebody is told, rather than left to discover it",
+        );
+    }
+
+    #[test]
+    fn a_connection_that_keeps_saying_nothing_is_complained_about_once() {
+        // The condition persists and the timer that notices it runs several
+        // times a second. A message repeated at that rate is one somebody
+        // turns off rather than reads.
+        let mut state = signed_in();
+        state.project.history.record(
+            "Ada", "append_task(\"Mine\");", "Added Mine", Local::now().naive_local(),
+        );
+        let long_ago =
+            || std::time::Instant::now() - Duration::from_secs(STREAM_ANSWER_SECONDS + 1);
+
+        state.in_flight = Some(long_ago());
+        state.gave_up_on_batch();
+        assert!(state.cloud_message.is_some(), "said the first time");
+
+        state.cloud_message = None;
+        state.in_flight = Some(long_ago());
+        state.gave_up_on_batch();
+        assert!(state.cloud_message.is_none(), "and not again");
+
+        // Until the server starts answering, which makes the next silence
+        // news again rather than more of the same.
+        state.batch_answered();
+        state.in_flight = Some(long_ago());
+        state.gave_up_on_batch();
+        assert!(state.cloud_message.is_some(), "a session that recovers and fails again says so");
     }
 
     #[test]
@@ -7974,12 +8992,12 @@ mod tests {
         // lost while there was nowhere to send it.
         let mut state = linked();
         state.append_task("Pour the foundations");
-        state.streaming = true;
+        state.in_flight = Some(std::time::Instant::now());
 
         state.stop_live(Some("Live editing stopped.".into()));
 
         assert_eq!(state.project.history.unsent().len(), 1, "still waiting");
-        assert!(!state.streaming, "and no longer thought to be in flight");
+        assert!(state.in_flight.is_none(), "and no longer thought to be in flight");
     }
 
     #[test]

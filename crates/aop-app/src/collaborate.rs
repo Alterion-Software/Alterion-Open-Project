@@ -210,6 +210,11 @@ pub fn fresh_copy(mut state: Signal<AppState>) {
 /// Turning it on needs a token, and asking for one can renew the session, so
 /// even this goes through a worker. The socket then runs on a thread of its
 /// own; the session never goes near it.
+///
+/// The same worker also asks the server what it speaks, because a socket is
+/// the one place where a mismatched pair looks like a working one: an older
+/// server accepts the connection, relays everybody else's edits, and does
+/// nothing at all with the work this copy offers it.
 pub fn live(mut state: Signal<AppState>, on: bool) {
     if !on {
         state.write().stop_live(Some("Live editing is off.".into()));
@@ -218,16 +223,17 @@ pub fn live(mut state: Signal<AppState>, on: bool) {
     if state.read().sync_blocked().is_some() {
         return;
     }
+    let server = state.read().collaborate_server.trim().to_string();
     let Some(session) = state.write().hand_over(Working::Checking) else {
         return;
     };
     cloud::off_thread(
-        move || cloud::work::live_token(session),
+        move || cloud::work::live_token(session, server),
         move |done| match done {
-            Some((session, Ok(token))) => {
+            Some((session, Ok((token, speaks)))) => {
                 let mut writer = state.write();
                 writer.hand_back(session);
-                writer.start_live(token);
+                writer.start_live(token, speaks);
             }
             Some((session, Err(why))) => {
                 let mut writer = state.write();

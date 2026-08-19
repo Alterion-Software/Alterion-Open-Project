@@ -25,6 +25,26 @@ use uuid::Uuid;
 /// laptop and a desktop is two of these.
 pub type ConnId = u64;
 
+/// The name the streaming half of this protocol goes by.
+///
+/// A client that opens a socket and offers work over it cannot learn from a
+/// version string whether the server on the other end understands the
+/// message: versions are ordered and capabilities are not, and a self-hoster
+/// pinned to an older build is the ordinary case rather than the odd one. So
+/// the name is published instead, and a server that does not publish it is
+/// one that does not speak it.
+pub const LIVE_CHANGES: &str = "live-changes";
+
+/// What this build understands, beyond the endpoints themselves.
+///
+/// Published by the health endpoint, which is unauthenticated on purpose and
+/// is therefore askable before anything else works. A name is added when a
+/// message is added and never removed while that message is still answered.
+/// A client reads this by looking for the one name it needs, so an extra name
+/// it has never heard of costs it nothing, and an older client that reads
+/// none of this is unaffected either way.
+pub const CAPABILITIES: [&str; 1] = [LIVE_CHANGES];
+
 /// What a client says.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -105,7 +125,23 @@ where
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// The answer to `hello`, once the catch-up has been decided.
-    Welcome { head: i64, peers: Vec<Presence> },
+    ///
+    /// `connection` is this socket's own handle, and it is here because the
+    /// client cannot work it out for itself and needs it. When that client
+    /// pushes over REST instead, it sends this back as `connection` on the
+    /// push, and the append skips it when it broadcasts: without that, a
+    /// client with a socket open is sent its own work back over that socket
+    /// and applies it a second time, and the log entries have been renumbered
+    /// by then so they no longer look like its own.
+    ///
+    /// An older client ignores the extra field, and an older server sends
+    /// none, so both ends fall back to what they did before rather than to
+    /// something worse.
+    Welcome {
+        head: i64,
+        peers: Vec<Presence>,
+        connection: ConnId,
+    },
     /// Everything the client missed while it was away. Sent before any live
     /// change, so the order a client applies things in is the log's order.
     Catchup { head: i64, changes: Vec<Change> },

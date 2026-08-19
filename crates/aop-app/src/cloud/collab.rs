@@ -359,6 +359,21 @@ pub fn read_push(status: u16, body: &str) -> Result<Pushed, CollabError> {
 struct PushBody<'a> {
     after: i64,
     changes: &'a [Change],
+    /// This client's live socket, when it has one open.
+    ///
+    /// The server broadcasts an appended change to every connection on the
+    /// project except this one. Leaving it out means a client that is holding
+    /// a socket is sent its own push straight back down it, and by then the
+    /// entries carry the seqs the server assigned rather than the ids this
+    /// copy chose, so they arrive looking like somebody else's work and are
+    /// applied a second time. `append_task` is not idempotent, so that is a
+    /// duplicated task and not a wasted round trip.
+    ///
+    /// Omitted entirely rather than sent as null when there is no socket, so
+    /// the body a server sees is byte for byte the one it saw before this
+    /// field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connection: Option<u64>,
 }
 
 /// Offer work to the server.
@@ -366,21 +381,37 @@ struct PushBody<'a> {
 /// An empty `changes` is how a client asks "am I still current?", and it gets
 /// the same four answers a real push does. That is what the sync view uses to
 /// check rather than assume.
+///
+/// `connection` is this copy's live socket if it has one, so the append does
+/// not send the work back to the copy that just offered it.
 pub fn push(
     server: &str,
     token: &str,
     project: &str,
     after: i64,
     changes: &[Change],
+    connection: Option<u64>,
 ) -> Result<Pushed, CollabError> {
     let base = base(server)?;
     let (status, body) = send(
         ureq::post(format!("{base}/api/projects/{project}/changes"))
             .header("Authorization", bearer(token)),
         &base,
-        &PushBody { after, changes },
+        &PushBody { after, changes, connection },
     )?;
     read_push(status, &body)
+}
+
+/// The body a push sends, as JSON, so its shape can be checked without a
+/// server.
+///
+/// Its own function because this is a field the client simply never filled in
+/// and nothing noticed: the server read it, defaulted it to `None`, and
+/// broadcast every synced change back to the client that made it. A shape
+/// nothing asserts on is a shape that drifts.
+#[cfg(test)]
+fn push_body(after: i64, changes: &[Change], connection: Option<u64>) -> String {
+    serde_json::to_string(&PushBody { after, changes, connection }).unwrap_or_default()
 }
 
 // ------------------------------------------------------------- whole plans
@@ -837,6 +868,25 @@ mod tests {
         assert_eq!((head, after, more), (45, 42, false));
         assert_eq!(changes.len(), 1, "the rebase needs no second round trip");
         assert_eq!(changes[0].author, "Grace");
+    }
+
+    #[test]
+    fn a_push_says_which_socket_it_must_not_be_echoed_to() {
+        // Asserted on the wire shape, because this is a field that existed on
+        // the server, was documented there, was read there, and was never once
+        // sent. Nothing noticed, and every sync made during a live session was
+        // broadcast straight back to the copy that made it.
+        let body = push_body(42, &[], Some(11));
+        assert!(body.contains("\"connection\":11"), "got {body}");
+    }
+
+    #[test]
+    fn a_push_with_no_socket_leaves_the_field_out_rather_than_sending_nothing() {
+        // Not `null`. A server built before the field existed should see the
+        // body it has always seen, byte for byte.
+        let body = push_body(42, &[], None);
+        assert!(!body.contains("connection"), "got {body}");
+        assert!(body.contains("\"after\":42"), "got {body}");
     }
 
     #[test]

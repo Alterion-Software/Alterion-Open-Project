@@ -77,6 +77,30 @@ impl Check {
     }
 }
 
+/// The name the server gives the message that carries work over the live
+/// socket.
+///
+/// The one thing a client has to be able to ask about before it starts
+/// streaming. It is a name and not a number on purpose: this is a question
+/// about which messages are understood, and messages are added and answered
+/// independently of each other, so an ordering would only be a guess about
+/// which build gained which one.
+pub const LIVE_CHANGES: &str = "live-changes";
+
+/// What a server said when asked whether it understands streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speaks {
+    /// It named the streaming message, so work may be offered over the socket.
+    Streaming,
+    /// It answered, and did not name it. Older than streaming, so the socket
+    /// is good for watching and this copy's own work has to go the other way.
+    NotStreaming,
+    /// It could not be asked at all. Not the same as a no, and must not be
+    /// treated as one: a health endpoint that is briefly unreachable is not a
+    /// reason to turn a working session into a degraded one.
+    Unknown,
+}
+
 /// What the server says about itself.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Health {
@@ -90,6 +114,19 @@ struct Health {
     database: bool,
     #[serde(default)]
     issuer: String,
+    /// The messages this server understands, by name.
+    ///
+    /// An option rather than a defaulted list, and the difference carries the
+    /// whole design. A server that lists nothing has answered the question and
+    /// the answer is no. A server that has no such field has not been asked a
+    /// question it knows about: it is older than the field itself, and it may
+    /// well speak everything this copy does. Collapsing the two would turn
+    /// every deployment that has not been updated yet into a watching-only
+    /// session, which is a regression dressed up as caution. Those are left to
+    /// find out by trying, and a batch nobody answers is given up on and
+    /// reported.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
 }
 
 /// Run the lot. Blocking, so it belongs on a worker like every other call
@@ -188,6 +225,43 @@ fn ask(base: &str) -> Result<Health, CollabError> {
     }
 }
 
+/// Ask a server whether it understands work offered over the live socket.
+///
+/// Blocking, like everything else here, so it belongs on a worker. Asked once
+/// when a live session starts rather than on every batch: the answer is a
+/// property of the build on the other end, and a server that changed under a
+/// running session has dropped the socket anyway.
+///
+/// Unauthenticated, which is what makes it cheap enough to ask at all: it
+/// costs one request that needs no token and no database of its own.
+pub fn speaks_streaming(server: &str) -> Speaks {
+    let Ok(base) = collab::base(server) else {
+        return Speaks::Unknown;
+    };
+    match ask(&base) {
+        Ok(health) => health.speaks_streaming(),
+        Err(_) => Speaks::Unknown,
+    }
+}
+
+impl Health {
+    /// Whether this server named the streaming message.
+    ///
+    /// A plain search for the name rather than a comparison of versions. A
+    /// newer server naming messages this build has never heard of is not a
+    /// mismatch, and neither is an older one naming fewer: the only question
+    /// is whether the one message about to be sent is understood.
+    ///
+    /// Saying nothing at all is not saying no. See [`Health::capabilities`].
+    fn speaks_streaming(&self) -> Speaks {
+        match &self.capabilities {
+            None => Speaks::Unknown,
+            Some(named) if named.iter().any(|name| name == LIVE_CHANGES) => Speaks::Streaming,
+            Some(_) => Speaks::NotStreaming,
+        }
+    }
+}
+
 /// Turn the health body into something worth reading.
 fn describe_health(health: &Health) -> Check {
     let mut detail = format!("{} version {}", health.service, health.version);
@@ -200,6 +274,28 @@ fn describe_health(health: &Health) -> Check {
     detail.push('.');
 
     if health.database && health.status == "ok" {
+        // Healthy and older than streaming is a real state and worth saying
+        // out loud, because everything else about such a server looks fine:
+        // it answers, it signs people in, and it takes a Sync. The only thing
+        // it does not do is understand edits sent over the live socket, and
+        // without this line the symptom is live editing that half works.
+        match health.speaks_streaming() {
+            Speaks::Streaming => {}
+            Speaks::NotStreaming => {
+                detail.push_str(
+                    " It does not understand edits sent over the live connection, so it is \
+                     older than this copy. Live editing still shows you other people's work \
+                     as it happens; your own goes to the server when you save this plan or \
+                     press Sync. Updating the server has it go as you type.",
+                );
+                return Check::new("What the server reports", Outcome::Warning, detail);
+            }
+            Speaks::Unknown => detail.push_str(
+                " It does not say which messages it understands, so it is older than this \
+                 copy in at least that respect. Live editing finds out by trying, and says \
+                 so if nothing comes back.",
+            ),
+        }
         return Check::new("What the server reports", Outcome::Good, detail);
     }
     detail.push_str(
@@ -310,14 +406,25 @@ mod tests {
         assert_eq!(checks[2].outcome, Outcome::NotChecked);
     }
 
+    /// A healthy server that names whatever it is given.
+    fn reporting(capabilities: Option<&[&str]>) -> Health {
+        Health {
+            status: "ok".into(),
+            service: "aop-collaborate".into(),
+            version: "1.0.0-beta".into(),
+            database: true,
+            issuer: "https://auth.example.org".into(),
+            capabilities: capabilities
+                .map(|named| named.iter().map(|name| name.to_string()).collect()),
+        }
+    }
+
     #[test]
     fn a_server_that_cannot_reach_its_database_is_a_failure_not_a_pass() {
         let health = Health {
             status: "degraded".into(),
-            service: "aop-collaborate".into(),
-            version: "1.0.0-beta".into(),
             database: false,
-            issuer: "https://auth.example.org".into(),
+            ..reporting(Some(&[LIVE_CHANGES]))
         };
         let check = describe_health(&health);
         assert_eq!(check.outcome, Outcome::Bad);
@@ -326,17 +433,49 @@ mod tests {
 
     #[test]
     fn the_version_and_the_issuer_are_shown_because_bug_reports_need_them() {
-        let health = Health {
-            status: "ok".into(),
-            service: "aop-collaborate".into(),
-            version: "1.0.0-beta".into(),
-            database: true,
-            issuer: "https://auth.example.org".into(),
-        };
-        let check = describe_health(&health);
+        let check = describe_health(&reporting(Some(&[LIVE_CHANGES])));
         assert_eq!(check.outcome, Outcome::Good);
         assert!(check.detail.contains("1.0.0-beta"));
         assert!(check.detail.contains("https://auth.example.org"));
+    }
+
+    #[test]
+    fn a_server_that_does_not_name_the_streaming_message_is_said_to_be_older() {
+        // This is the whole point of publishing a name. Such a server answers
+        // every other check perfectly: it is up, it has its database, and it
+        // signs people in. Without this it looks like nothing is wrong and
+        // live editing simply half works.
+        let check = describe_health(&reporting(Some(&[])));
+        assert_eq!(check.outcome, Outcome::Warning, "got {}", check.detail);
+        assert!(check.detail.contains("older than this copy"), "got {}", check.detail);
+    }
+
+    #[test]
+    fn a_server_that_says_nothing_about_what_it_speaks_has_not_said_no() {
+        // The distinction the whole design turns on. A server older than the
+        // field itself may well speak everything this copy does, and demoting
+        // every deployment that has not been updated yet to a watching-only
+        // session would be a regression dressed up as caution. It finds out by
+        // trying, and an unanswered batch is what catches it.
+        assert_eq!(reporting(None).speaks_streaming(), Speaks::Unknown);
+        assert_eq!(reporting(Some(&[])).speaks_streaming(), Speaks::NotStreaming);
+        assert_eq!(
+            reporting(Some(&[LIVE_CHANGES])).speaks_streaming(),
+            Speaks::Streaming,
+        );
+
+        let check = describe_health(&reporting(None));
+        assert_eq!(check.outcome, Outcome::Good, "got {}", check.detail);
+        assert!(check.detail.contains("does not say"), "got {}", check.detail);
+    }
+
+    #[test]
+    fn a_name_this_copy_has_never_heard_of_is_not_a_mismatch() {
+        // A newer server naming messages this build knows nothing about is
+        // the ordinary way a protocol grows. The only question asked is
+        // whether the one message about to be sent is understood.
+        let check = describe_health(&reporting(Some(&[LIVE_CHANGES, "something-later"])));
+        assert_eq!(check.outcome, Outcome::Good, "got {}", check.detail);
     }
 
     #[test]

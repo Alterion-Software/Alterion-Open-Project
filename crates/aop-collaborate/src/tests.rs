@@ -122,6 +122,16 @@ fn a_snapshot_is_wanted_once_the_log_runs_far_enough_past_the_last_one() {
     assert!(wants_snapshot(500, None, 500), "no snapshot at all counts from zero");
 }
 
+// ── What this build says it speaks ───────────────────────────────────────────
+
+#[test]
+fn the_streaming_message_is_named_in_what_this_server_publishes() {
+    // A client asks the health endpoint for this name before it offers work
+    // over a socket. Dropping it here, while the message is still answered,
+    // would have every up to date client quietly fall back to the REST sync.
+    assert!(crate::live::CAPABILITIES.contains(&crate::live::LIVE_CHANGES));
+}
+
 // ── The introspection cache ──────────────────────────────────────────────────
 
 fn active(sub: &str) -> Introspection {
@@ -826,6 +836,34 @@ fn the_socket_says_which_seq_each_change_was_given() {
     assert_eq!(value["head"], 45);
     assert_eq!(value["applied"][0]["local_id"], 7);
     assert_eq!(value["applied"][0]["seq"], 44);
+}
+
+#[test]
+fn a_welcome_tells_the_client_which_connection_it_is() {
+    // The client cannot work this out for itself, and it needs it: a REST
+    // push carries it back as `connection`, and the append then skips this
+    // socket when it broadcasts. Without it, a client holding a socket is sent
+    // its own push straight back down it, renumbered, and applies it twice.
+    let message = crate::live::ServerMessage::Welcome {
+        head: 45,
+        peers: Vec::new(),
+        connection: 11,
+    };
+    let text = message.encode().expect("encodes");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+    assert_eq!(value["type"], "welcome");
+    assert_eq!(value["connection"], 11);
+}
+
+#[test]
+fn a_push_that_names_no_connection_is_still_a_push() {
+    // An older client sends no such field, and must go on working exactly as
+    // it did: everything on the project hears about its work, itself included,
+    // which is what happened before this existed.
+    let body: crate::handlers::changes::Push =
+        serde_json::from_str(r#"{"after":42,"changes":[]}"#).expect("the older body still reads");
+    assert_eq!(body.after, Some(42));
+    assert_eq!(body.connection, None);
 }
 
 #[test]

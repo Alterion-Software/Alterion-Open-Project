@@ -314,14 +314,25 @@ fn App() -> Element {
             // Peeked rather than read: a future that subscribed to these
             // would be torn down and started again on every keystroke.
             let (at, draft) = (*pointing.peek(), drafting.peek().clone());
-            let (held, due) = {
+            let (held, due, unanswered) = {
                 let live = state.read();
                 if live.live.is_none() {
                     continue;
                 }
                 live.announce(at, draft);
-                (live.held_work_due(), live.stream_due())
+                (
+                    live.held_work_due(),
+                    live.stream_due(),
+                    live.stream_unanswered(),
+                )
             };
+            // A batch nobody answered, first of all, because until it is given
+            // up on nothing else can be offered at all. Silence is what an
+            // older or mismatched server gives, and without this the session
+            // stops streaming for good and says nothing about it.
+            if unanswered {
+                state.write().gave_up_on_batch();
+            }
             // Somebody else's work that waited for a cell editor to close
             // goes in first: it was made against a cursor this copy has not
             // reached, so anything offered before it would only be refused.
@@ -336,6 +347,27 @@ fn App() -> Element {
             // nobody presses Sync for hours and the ask would go unheard.
             if state.read().snapshot_wanted() {
                 crate::collaborate::send_snapshot(state);
+            }
+        }
+    });
+
+    // Work a save asked to be sent, when there is no live session to carry it.
+    //
+    // Started here rather than inside the save itself, which is the whole
+    // point: a save writes a file and marks a save point, and it may not wait
+    // on a network to do either. What it does instead is leave a note, and a
+    // server that is down means the note is read, nothing comes of it, and the
+    // work stays in the log unsent exactly as it does today.
+    //
+    // Its own timer rather than a line in the live one above, because that one
+    // gives up as soon as there is no socket, and no socket is precisely the
+    // case this exists for.
+    use_future(move || async move {
+        let interval = std::time::Duration::from_millis(crate::state::SAVE_SYNC_POLL_MILLIS);
+        loop {
+            tokio::time::sleep(interval).await;
+            if state.read().sync_after_save_due() {
+                crate::collaborate::sync(state);
             }
         }
     });
