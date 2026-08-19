@@ -2053,8 +2053,25 @@ button { font: inherit; color: inherit; }
 }
 
 /* The tip is the point. Everything else hangs off it, so the arrow's own
-   corner is what lands on the coordinate. */
-.cursor { position: absolute; }
+   corner is what lands on the coordinate.
+
+   The transition is what makes somebody else's pointer readable. Positions
+   arrive at a modest rate, because a mouse produces events far faster than
+   anything should put on a wire and every message costs the receiving copy a
+   redraw. Told about eight positions a second and drawn at eight positions a
+   second, a pointer is a slideshow; told about eight and glided between them,
+   it is a pointer. The browser does the interpolating, so this costs nothing
+   here.
+
+   The duration is a little longer than the gap between updates: shorter and
+   the pointer arrives early and waits, which stutters, and much longer and it
+   visibly trails where the person actually is. Linear, not eased: easing
+   between a stream of positions accelerates and decelerates between every
+   pair, which reads as a stutter of its own. */
+.cursor {
+  position: absolute;
+  transition: left 140ms linear, top 140ms linear;
+}
 
 .cursor-arrow { display: block; }
 
@@ -2093,6 +2110,35 @@ button { font: inherit; color: inherit; }
   font-size: 8px;
   font-weight: 700;
   letter-spacing: 0.2px;
+}
+
+/* A cell somebody else has open, in their colour, so two people do not both
+   start typing in one without knowing. */
+.peer-cell {
+  position: absolute;
+  height: 22px;
+  border: 1.5px solid;
+  border-radius: 3px;
+  pointer-events: none;
+  box-sizing: border-box;
+}
+
+/* What they have typed and not committed. Above the cell rather than in it:
+   inside, it would read as what the plan says, and the plan does not say it
+   until they commit. */
+.peer-draft {
+  position: absolute;
+  left: -1.5px;
+  bottom: 100%;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 5px;
+  border-radius: 3px 3px 3px 0;
+  color: #0d1717;
+  font-size: 10.5px;
+  line-height: 1.5;
 }
 
 /* ---------- critical path report ---------- */

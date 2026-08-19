@@ -215,7 +215,17 @@ if [ -n "$assets" ]; then
   place 644 "$assets/$name.desktop" "$sharedir/applications/$name.desktop"
   place 644 "$assets/$name.svg"     "$sharedir/icons/hicolor/scalable/apps/$name.svg"
   place 644 "$assets/$name.xml"     "$sharedir/mime/packages/$name.xml"
-  echo "  desktop entry, icon and .aprj association installed"
+  # The document icon, when there is one. Named after the MIME type rather
+  # than after the application, which is how the desktop finds it, and why a
+  # plan in a folder can look like a document rather than like a second copy
+  # of the application.
+  if [ -f "$assets/alterion-project-document.svg" ]; then
+    place 644 "$assets/alterion-project-document.svg" \
+      "$sharedir/icons/hicolor/scalable/mimetypes/application-x-alterion-project.svg"
+    echo "  desktop entry, application icon, document icon and .aprj association installed"
+  else
+    echo "  desktop entry, icon and .aprj association installed"
+  fi
 else
   warn "packaging/linux was not found beside this script, so only the binary was installed"
   warn "the application will still run; it just will not appear in your menu"

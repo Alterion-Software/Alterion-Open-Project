@@ -67,6 +67,9 @@ pub fn DialogHost(dialog: Dialog) -> Element {
                     Dialog::RestoreVersion(index) => rsx! { RestoreVersion { index } },
                     Dialog::HealthCheck => rsx! { HealthCheck {} },
                     Dialog::UpdateAvailable => rsx! { UpdateAvailable {} },
+                    Dialog::ConfirmOverwrite { path, beside } => rsx! {
+                        ConfirmOverwrite { path, beside }
+                    },
                     Dialog::Message { title, body } => rsx! { MessageBox { title, body } },
                 }
             }
@@ -3861,5 +3864,84 @@ fn health_class(outcome: crate::cloud::health::Outcome) -> &'static str {
         Outcome::Warning => "warn",
         Outcome::Bad => "bad",
         Outcome::NotChecked => "idle",
+    }
+}
+
+/// Saving would write over a file that is already there.
+///
+/// Three answers rather than two. Replacing is what somebody usually means
+/// when they type a name that already exists, but not always, and the way
+/// out has to be as easy as the way through or people stop reading the
+/// question. The suggested name is worked out before the question is asked,
+/// so the button can say exactly what it will do rather than promising to
+/// pick something.
+#[component]
+fn ConfirmOverwrite(path: std::path::PathBuf, beside: std::path::PathBuf) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let existing = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let suggested = beside
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| beside.display().to_string());
+    let folder = path
+        .parent()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default();
+    // Only offered when a free name was actually found. A folder holding
+    // every numbered name up to the bound is stranger than the question
+    // itself, and a button that might not work is worse than one fewer.
+    let can_keep_both = beside != path;
+
+    rsx! {
+        div { class: "dialog", style: "width: 460px;",
+            div { class: "dialog-head", "{existing} already exists" }
+            div { class: "dialog-body",
+                p { class: "opt-aside", "In {folder}." }
+                p {
+                    "Replacing it cannot be undone: the file on disk is gone, whatever \
+                     is in this plan."
+                }
+                if can_keep_both {
+                    p { class: "opt-aside", "Keeping both saves as {suggested}." }
+                }
+            }
+            div { class: "dialog-foot",
+                button {
+                    class: "btn",
+                    onclick: move |_| state.write().dialog = None,
+                    "Cancel"
+                }
+                div { class: "grow" }
+                if can_keep_both {
+                    button {
+                        class: "btn",
+                        onclick: {
+                            let beside = beside.clone();
+                            move |_| {
+                                let mut writer = state.write();
+                                writer.dialog = None;
+                                writer.save_to(beside.clone());
+                            }
+                        },
+                        "Save as {suggested}"
+                    }
+                }
+                button {
+                    class: "btn danger",
+                    onclick: {
+                        let path = path.clone();
+                        move |_| {
+                            let mut writer = state.write();
+                            writer.dialog = None;
+                            writer.save_to(path.clone());
+                        }
+                    },
+                    "Replace"
+                }
+            }
+        }
     }
 }

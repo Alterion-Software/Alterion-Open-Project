@@ -38,6 +38,7 @@ pub mod device;
 pub mod health;
 pub mod link;
 pub mod live;
+pub mod local;
 pub mod oauth;
 pub mod share;
 pub mod tokens;

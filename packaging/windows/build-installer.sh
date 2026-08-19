@@ -108,21 +108,48 @@ else
   echo "  could not fetch it; the installer will tell the user where to get it" >&2
 fi
 
-step "Building the icon"
-icon_svg="$root/packaging/linux/alterion-open-project.svg"
-if command -v magick >/dev/null; then
-  # Windows wants several sizes inside one .ico.
-  tmp="$(mktemp -d)"
-  for size in 16 24 32 48 64 128 256; do
-    magick -background none "$icon_svg" -resize "${size}x${size}" "$tmp/$size.png"
+step "Building the icons"
+# Two icons, not one. The application's icon belongs on the Start menu and
+# the window; a .aprj in a folder should look like a document, not like a
+# second copy of the application. Until the document artwork exists, the
+# application icon stands in, so this never breaks a build.
+# Either format. Every size here is rasterised from the source whatever it
+# is, so a 1024 pixel PNG loses nothing on this platform and is easier to
+# produce in a painting application. A PNG wins when both are present,
+# because somebody who added one meant it.
+artwork() {
+  local base="$root/packaging/linux/$1"
+  for candidate in "$base.png" "$base.svg"; do
+    [ -f "$candidate" ] && { printf '%s' "$candidate"; return; }
   done
-  magick "$tmp"/*.png "$staging/app.ico"
-  rm -rf "$tmp"
-elif command -v convert >/dev/null; then
-  convert -background none "$icon_svg" -define icon:auto-resize=256,128,64,48,32,16 "$staging/app.ico"
-else
-  echo "no imagemagick; the installer will use a blank icon" >&2
-  : > "$staging/app.ico"
+}
+icon_src="$(artwork alterion-open-project)"
+doc_src="$(artwork alterion-project-document)"
+[ -n "$doc_src" ] || doc_src="$icon_src"
+
+make_ico() {
+  local svg="$1" out="$2"
+  if command -v magick >/dev/null; then
+    # Windows wants several sizes inside one .ico.
+    local tmp
+    tmp="$(mktemp -d)"
+    for size in 16 24 32 48 64 128 256; do
+      magick -background none "$svg" -resize "${size}x${size}" "$tmp/$size.png"
+    done
+    magick "$tmp"/*.png "$out"
+    rm -rf "$tmp"
+  elif command -v convert >/dev/null; then
+    convert -background none "$svg" -define icon:auto-resize=256,128,64,48,32,16 "$out"
+  else
+    echo "no imagemagick; the installer will use a blank icon" >&2
+    : > "$out"
+  fi
+}
+
+make_ico "$icon_src" "$staging/app.ico"
+make_ico "$doc_src" "$staging/document.ico"
+if [ "$doc_src" = "$icon_src" ]; then
+  echo "  no document icon yet; .aprj files will show the application icon"
 fi
 
 step "Building the installer"

@@ -35,7 +35,7 @@ use dioxus::prelude::*;
 
 use aop_core::grouping::GroupRow;
 
-use crate::cloud::live::{Peer, Pointer};
+use crate::cloud::live::{Cell, Peer, Pointer};
 use crate::cloud::{Account, oauth};
 use crate::gantt::{HEADER_H, ROW_H};
 use crate::state::AppState;
@@ -98,6 +98,21 @@ fn in_table(state: &AppState, rows: &[GroupRow], at: Pointer) -> Option<(f64, f6
     Some((x + 7.0, HEADER_H + line as f64 * ROW_H + ROW_H / 2.0))
 }
 
+/// Where a peer's open cell lands in the table: its box, in the pane's own
+/// coordinates.
+///
+/// Their column number read against this copy's own widths, which is the whole
+/// reason a column travels as a number: the two copies need not be showing the
+/// same columns at the same sizes, and a rectangle worked out on their screen
+/// would land on the wrong cell here.
+fn cell_box(state: &AppState, rows: &[GroupRow], at: Cell) -> Option<(f64, f64, f64)> {
+    let line = line_of(rows, at.row)?;
+    let column = usize::from(at.column);
+    let width = state.columns.get(column)?.width;
+    let x: f64 = state.columns.iter().take(column).map(|c| c.width).sum();
+    Some((x, HEADER_H + line as f64 * ROW_H, width))
+}
+
 /// Where a peer's pointer lands on the chart, in the pane's own coordinates.
 fn in_chart(state: &AppState, rows: &[GroupRow], at: Pointer) -> Option<(f64, f64)> {
     let Pointer::Chart { row, minutes } = at else {
@@ -115,6 +130,29 @@ type Placed = (Peer, f64, f64);
 
 /// How one pane turns a plan position into its own coordinates.
 type Placing = fn(&AppState, &[GroupRow], Pointer) -> Option<(f64, f64)>;
+
+/// One peer's open cell, already placed: x, y and how wide.
+type Busy = (Peer, f64, f64, f64);
+
+/// The cells peers have open, in the table's own coordinates.
+///
+/// Drawn so that two people do not both start typing in one cell without
+/// knowing. It is the ephemeral channel doing its job: nothing here is stored,
+/// nothing is in the log, and it all goes when they do.
+fn editing(state: &AppState) -> Vec<Busy> {
+    if state.live.is_none() {
+        return Vec::new();
+    }
+    let rows = state.layout_rows();
+    state
+        .peers
+        .iter()
+        .filter_map(|peer| {
+            let (x, y, width) = cell_box(state, &rows, peer.editing?)?;
+            Some((peer.clone(), x, y, width))
+        })
+        .collect()
+}
 
 /// The peers worth drawing in one pane, already placed.
 fn placed(state: &AppState, which: Placing) -> Vec<Placed> {
@@ -137,8 +175,49 @@ fn placed(state: &AppState, which: Placing) -> Vec<Placed> {
 #[component]
 pub fn TableCursors() -> Element {
     let state = use_context::<Signal<AppState>>();
-    let people = placed(&state.read(), in_table);
-    rsx! { Overlay { people } }
+    let (people, busy) = {
+        let s = state.read();
+        (placed(&s, in_table), editing(&s))
+    };
+    rsx! {
+        OpenCells { busy }
+        Overlay { people }
+    }
+}
+
+/// The cells other people have open, and what they have typed into them.
+///
+/// Their colour around the cell, so it reads as the same person as the pointer
+/// and the label. The uncommitted text sits above the cell rather than in it:
+/// putting it in the cell would look like the plan says that, and the plan
+/// does not say that until they commit it.
+#[component]
+fn OpenCells(busy: Vec<Busy>) -> Element {
+    if busy.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        div { class: "cursors",
+            for (peer, x, y, width) in busy {
+                {
+                    let colour = colour_for(&peer.subject);
+                    rsx! {
+                        div {
+                            key: "{peer.subject}",
+                            class: "peer-cell",
+                            style: "left: {x}px; top: {y}px; width: {width}px; \
+                                    border-color: {colour};",
+                            if let Some(draft) = peer.draft.clone().filter(|d| !d.is_empty()) {
+                                span { class: "peer-draft", style: "background: {colour};",
+                                    "{draft}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Other people's pointers over the Gantt chart.
@@ -162,16 +241,14 @@ fn Overlay(people: Vec<Placed>) -> Element {
             for (peer, x, y) in people {
                 {
                     let colour = colour_for(&peer.subject);
-                    // No picture travels with a presence, so this is initials
-                    // today and every day. It goes through `Account` anyway
-                    // rather than around it: when a picture does arrive there
-                    // is one rule for what an initial and an image mean, and
-                    // one gate a URL has to pass.
+                    // Through `Account` rather than around it, so a face on a
+                    // label and a face on the account card mean the same
+                    // thing and pass the same gate.
                     let who = Account {
                         subject: peer.subject.clone(),
                         name: peer.name.clone(),
                         email: String::new(),
-                        picture: None,
+                        picture: peer.picture.clone(),
                     };
                     let (dx, dy) = LABEL_OFFSET;
                     rsx! {
@@ -212,14 +289,24 @@ fn name_of(who: &Account) -> String {
     }
 }
 
+/// The address of a face this copy is willing to load, if there is one.
+///
+/// One rule for whether a URL may be handed to the webview, and it is the same
+/// one the sign in uses. A peer's picture is a string another account chose and
+/// a server relayed, so it is checked on the way in from the socket as well;
+/// this is the same gate said again at the point of use, because the cost of
+/// saying it twice is nothing and the cost of a hole here is arbitrary content
+/// in somebody else's window.
+fn face(who: &Account) -> Option<&str> {
+    who.picture
+        .as_deref()
+        .filter(|url| oauth::transport_is_safe(url))
+}
+
 /// A peer's face, or the letters that stand in for one.
 #[component]
 fn Avatar(who: Account, colour: String) -> Element {
-    // One rule for whether a URL may be handed to the webview, and it is the
-    // same one the sign in uses. A picture address is a string the provider
-    // chose, and this is the check that stops it being a plain HTTP fetch or
-    // something that is not a fetch at all.
-    if let Some(picture) = who.picture.as_deref().filter(|url| oauth::transport_is_safe(url)) {
+    if let Some(picture) = face(&who) {
         return rsx! {
             img { class: "cursor-face", src: "{picture}", alt: "" }
         };
@@ -248,6 +335,38 @@ mod tests {
         let one = colour_for("0198f0c2-aaaa-4222-8333-444455556666");
         let two = colour_for("0198f0c2-bbbb-4222-8333-444455556666");
         assert_ne!(one, two);
+    }
+
+    fn peer(picture: Option<&str>) -> Account {
+        Account {
+            subject: "0198f0c2".into(),
+            name: "Ada Lovelace".into(),
+            email: String::new(),
+            picture: picture.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_picture_address_this_copy_will_not_load_renders_as_initials() {
+        // The label is the one place a peer could otherwise put content of
+        // their choosing into somebody else's window. A refused address is
+        // not an error and not a broken image: it is an account with no
+        // picture, which is what most accounts are.
+        assert_eq!(face(&peer(Some("https://idp.example.test/ada.png"))),
+                   Some("https://idp.example.test/ada.png"));
+        for refused in [
+            "http://idp.example.test/ada.png",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:image/svg+xml,<svg onload=alert(1)>",
+            "",
+        ] {
+            assert_eq!(face(&peer(Some(refused))), None, "{refused} must not be loaded");
+        }
+        assert_eq!(face(&peer(None)), None);
+        // And what stands in for it is the same thing an account with no
+        // picture gets, letters and all.
+        assert_eq!(peer(Some("javascript:alert(1)")).initials(), "AL");
     }
 
     #[test]

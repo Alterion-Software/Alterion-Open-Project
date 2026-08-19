@@ -53,10 +53,17 @@ fn token_for(session: &mut Session) -> Result<String, String> {
 }
 
 /// Offer this plan's unsent work to the server.
-pub fn sync(mut session: Session, offer: Offer) -> Handed<Pushed> {
+///
+/// The one call whose failure is not merely reported. A plan that is no
+/// longer on the server, because its owner deleted it or took this account
+/// out of it, has to be told apart from a server that is briefly unreachable:
+/// one of those is a reason to try again and the other is a reason to stop
+/// keeping a copy of a plan nobody can sync. So the error comes back as
+/// itself rather than as a sentence about itself.
+pub fn sync(mut session: Session, offer: Offer) -> (Session, Result<Pushed, collab::CollabError>) {
     let token = match token_for(&mut session) {
         Ok(token) => token,
-        Err(why) => return (session, Err(why)),
+        Err(why) => return (session, Err(collab::CollabError::Refused(why))),
     };
 
     let pushed = collab::push(
@@ -80,7 +87,28 @@ pub fn sync(mut session: Session, offer: Offer) -> Handed<Pushed> {
         let _ = collab::put_snapshot(&offer.server, &token, &offer.project, *head, &offer.plan);
     }
 
-    let outcome = pushed.map_err(|error| error.to_string());
+    (session, pushed)
+}
+
+/// Put a fresh whole plan on the server, because it asked for one.
+///
+/// Housekeeping with no decision in it: the server stores commands and has no
+/// engine to replay them with, so it cannot fold its own log into a plan and
+/// asks whoever it is talking to. Nothing waits on the answer.
+pub fn snapshot(
+    mut session: Session,
+    server: String,
+    project: String,
+    head: i64,
+    plan: Project,
+) -> Handed<()> {
+    let token = match token_for(&mut session) {
+        Ok(token) => token,
+        Err(why) => return (session, Err(why)),
+    };
+    let outcome = collab::put_snapshot(&server, &token, &project, head, &plan)
+        .map(|_| ())
+        .map_err(|error| error.to_string());
     (session, outcome)
 }
 

@@ -70,36 +70,65 @@ sed -e "s/__VERSION__/$version/" -e "s/__BUILD__/$build_number/" \
   "$here/Info.plist" > "$app/Contents/Info.plist"
 printf 'APPL????' > "$app/Contents/PkgInfo"
 
-step "Building the icon"
-# One .icns holds every size the Finder, the Dock and Spotlight ask for.
-iconset="$staging/AppIcon.iconset"
-mkdir -p "$iconset"
-svg="$root/packaging/linux/$bin_name.svg"
-source_png="$staging/icon-1024.png"
+step "Building the icons"
+# Two of them. One .icns holds every size the Finder, the Dock and Spotlight
+# ask for, and a .aprj in a folder should look like a document rather than
+# like a second copy of the application.
 
-if command -v rsvg-convert >/dev/null; then
-  rsvg-convert -w 1024 -h 1024 "$svg" -o "$source_png"
-elif command -v magick >/dev/null; then
-  magick -background none "$svg" -resize 1024x1024 "$source_png"
-elif command -v qlmanage >/dev/null; then
-  # Nothing installed, so fall back to what macOS itself can already do.
-  qlmanage -t -s 1024 -o "$staging" "$svg" >/dev/null 2>&1 || true
-  [ -f "$staging/$(basename "$svg").png" ] && mv "$staging/$(basename "$svg").png" "$source_png"
-fi
+render_1024() {
+  local svg="$1" out="$2"
+  # Already a raster: sips resizes from it directly, so nothing has to render
+  # an SVG at all.
+  case "$svg" in
+    *.png) cp "$svg" "$out"; return ;;
+  esac
+  if command -v rsvg-convert >/dev/null; then
+    rsvg-convert -w 1024 -h 1024 "$svg" -o "$out"
+  elif command -v magick >/dev/null; then
+    magick -background none "$svg" -resize 1024x1024 "$out"
+  elif command -v qlmanage >/dev/null; then
+    # Nothing installed, so fall back to what macOS itself can already do.
+    qlmanage -t -s 1024 -o "$(dirname "$out")" "$svg" >/dev/null 2>&1 || true
+    [ -f "$(dirname "$out")/$(basename "$svg").png" ] \
+      && mv "$(dirname "$out")/$(basename "$svg").png" "$out"
+  fi
+}
 
-if [ -f "$source_png" ]; then
-  for size in 16 32 64 128 256 512; do
-    sips -z $size $size "$source_png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
-    sips -z $((size * 2)) $((size * 2)) "$source_png" \
-      --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+make_icns() {
+  local svg="$1" name="$2"
+  local iconset="$staging/$name.iconset"
+  local source_png="$staging/$name-1024.png"
+  mkdir -p "$iconset"
+  render_1024 "$svg" "$source_png"
+  if [ -f "$source_png" ]; then
+    for size in 16 32 64 128 256 512; do
+      sips -z $size $size "$source_png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+      sips -z $((size * 2)) $((size * 2)) "$source_png" \
+        --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$iconset" -o "$app/Contents/Resources/$name.icns"
+    echo "  $name built"
+  else
+    warn "could not render $(basename "$svg"), so $name will fall back"
+    warn "install librsvg (brew install librsvg) and run again to fix it"
+  fi
+  rm -rf "$iconset" "$source_png"
+}
+
+# Either format, a PNG preferred when both are there.
+artwork() {
+  local base="$root/packaging/linux/$1"
+  for candidate in "$base.png" "$base.svg"; do
+    [ -f "$candidate" ] && { printf '%s' "$candidate"; return; }
   done
-  iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
-  echo "  icon built"
-else
-  warn "could not render the SVG, so the bundle will use the default icon"
-  warn "install librsvg (brew install librsvg) and run again to fix it"
-fi
-rm -rf "$iconset" "$source_png"
+}
+icon_src="$(artwork "$bin_name")"
+make_icns "$icon_src" AppIcon
+# Until the document artwork exists the application icon stands in, so this
+# never fails a build; it simply looks like it does today.
+doc_src="$(artwork alterion-project-document)"
+[ -n "$doc_src" ] || doc_src="$icon_src"
+make_icns "$doc_src" DocumentIcon
 
 step "Signing"
 if [ -n "${SIGN_ID:-}" ]; then

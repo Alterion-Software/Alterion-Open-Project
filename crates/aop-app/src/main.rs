@@ -258,6 +258,10 @@ fn App() -> Element {
     // signal so that moving a mouse never redraws a window: the live timer
     // below is the only thing that reads it, and it reads it with `peek`.
     let pointing = use_context_provider(|| crate::state::Pointing(Signal::new(None))).0;
+    // What is being typed into a cell and not committed. Its own signal for
+    // the same reason: a keystroke is not a change to the plan, and holding
+    // it on the plan's state would redraw the window on every letter.
+    let drafting = use_context_provider(|| crate::state::Drafting(Signal::new(None))).0;
     let mut viewport = use_context_provider(|| Signal::new(crate::state::Viewport::default()));
 
     // Snapshot the plan on a timer so that a crash, a kill, or a power cut
@@ -271,25 +275,82 @@ fn App() -> Element {
         }
     });
 
-    // The live socket runs on a thread of its own and the plan may only be
-    // written where the interface does, so what arrives is collected here
-    // rather than pushed from the socket. Cheap when nothing is connected:
-    // `poll_live` returns at once when there is no socket.
+    // What arrives on the live socket. The socket runs on a thread of its own
+    // and the plan may only be written where the interface does, so arrivals
+    // are collected here rather than pushed.
+    //
+    // The write handle is taken only when something is actually queued, and
+    // that is what makes this affordable at this rate: taking one marks the
+    // state dirty and redraws the window, so a session where nobody is doing
+    // anything must be able to find that out without one.
     use_future(move || async move {
         let interval = std::time::Duration::from_millis(crate::state::LIVE_POLL_MILLIS);
         loop {
             tokio::time::sleep(interval).await;
-            // Asked before the write, because taking a write handle is what
-            // marks the state dirty. Doing that every tick would redraw the
-            // whole window three times a second for a socket nobody opened.
-            if state.read().live.is_some() {
-                // Peeked rather than read: a future that subscribed to the
-                // pointer would be torn down and started again every time the
-                // mouse moved.
-                let at = *pointing.peek();
-                let mut writer = state.write();
-                writer.poll_live();
-                writer.announce(at);
+            let anything = state
+                .read()
+                .live
+                .as_ref()
+                .is_some_and(crate::cloud::live::Live::has_incoming);
+            if anything {
+                state.write().poll_live();
+            }
+        }
+    });
+
+    // What goes out: where this planner is, and the work they have done.
+    //
+    // Its own timer because the two directions want different things. What
+    // arrives should arrive as soon as it is there; what is sent is capped
+    // however fast a mouse moves, and the socket itself does that capping.
+    //
+    // Nothing here takes a write handle to say where a pointer is. That is
+    // the whole arrangement: `announce` takes `&self`, the socket remembers
+    // what it last said, and moving a mouse never redraws the window.
+    use_future(move || async move {
+        let interval = std::time::Duration::from_millis(crate::state::EPHEMERAL_POLL_MILLIS);
+        loop {
+            tokio::time::sleep(interval).await;
+            // Peeked rather than read: a future that subscribed to these
+            // would be torn down and started again on every keystroke.
+            let (at, draft) = (*pointing.peek(), drafting.peek().clone());
+            let (held, due) = {
+                let live = state.read();
+                if live.live.is_none() {
+                    continue;
+                }
+                live.announce(at, draft);
+                (live.held_work_due(), live.stream_due())
+            };
+            // Somebody else's work that waited for a cell editor to close
+            // goes in first: it was made against a cursor this copy has not
+            // reached, so anything offered before it would only be refused.
+            if held {
+                state.write().apply_held_live();
+            }
+            if due {
+                state.write().stream_changes();
+            }
+            // The server asking for a fresh whole plan. Answered here rather
+            // than by whoever next presses Sync, because with streaming
+            // nobody presses Sync for hours and the ask would go unheard.
+            if state.read().snapshot_wanted() {
+                crate::collaborate::send_snapshot(state);
+            }
+        }
+    });
+
+    // The local copy of a plan that came off a server, kept up to date so
+    // that closing the window does not lose work that has no file behind it.
+    // Debounced, and the write itself happens on a thread of its own.
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                crate::state::LOCAL_COPY_AFTER_MILLIS / 4,
+            ))
+            .await;
+            if state.read().local_copy_due() {
+                state.write().write_local_copy();
             }
         }
     });

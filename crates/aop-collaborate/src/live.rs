@@ -16,6 +16,8 @@ use std::sync::{Mutex, PoisonError};
 
 use aop_core::history::Change;
 use serde::{Deserialize, Serialize};
+
+use crate::sync::Assigned;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
@@ -36,8 +38,19 @@ pub enum ClientMessage {
         after: Option<i64>,
         #[serde(default)]
         name: Option<String>,
+        /// Where this planner's face is, if their provider serves one. A URL
+        /// the identity provider hosts, never image data: a socket that
+        /// carried pictures would carry megabytes to say who is here.
+        #[serde(default)]
+        picture: Option<String>,
     },
     /// Where this planner is looking, so others can show it.
+    ///
+    /// The ephemeral half of the protocol. Nothing here is stored, nothing
+    /// gets a seq, and nothing is replayed on a reconnect: it is where
+    /// somebody is right now, and when they go it goes with them. Putting any
+    /// of it in the log would give "moved the mouse" a sequence number for a
+    /// rebase to resolve.
     Presence {
         #[serde(default)]
         row: Option<i64>,
@@ -45,9 +58,46 @@ pub enum ClientMessage {
         /// only a row selection does not blank everybody else's view of it.
         #[serde(default)]
         at: Option<Pointer>,
+        /// The cell they have open for editing, so two people do not both
+        /// start on one without knowing. Absent means unchanged and `null`
+        /// means they have closed it, which are different things.
+        #[serde(default, deserialize_with = "some_option")]
+        editing: Option<Option<Cell>>,
+        /// What they have typed into it and not committed yet. Never goes
+        /// near the log: an abandoned edit would otherwise become a permanent
+        /// record of something that never happened.
+        #[serde(default, deserialize_with = "some_option")]
+        draft: Option<Option<String>>,
+    },
+    /// Work this planner has done, offered over the socket instead of over
+    /// the REST push.
+    ///
+    /// The durable half. It is answered by exactly the same four decisions a
+    /// REST push is answered by, because it is the same protocol: two
+    /// transports with two implementations means the one used less is the one
+    /// that is quietly wrong, and the day you find out is a conflict.
+    Changes {
+        #[serde(default)]
+        after: Option<i64>,
+        changes: Vec<Change>,
     },
     /// Keepalive, for clients that would rather not use websocket pings.
     Ping,
+}
+
+/// Read a field that may be absent, null, or a value, keeping all three apart.
+///
+/// `Option<Option<T>>` with plain `#[serde(default)]` collapses null and
+/// absent into the same `None`, and on this message they mean opposite things:
+/// absent is "nothing new to say" and null is "it has gone". Without this, a
+/// client reporting a pointer move would close everybody else's view of the
+/// cell it has open.
+fn some_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// What the server says.
@@ -64,6 +114,31 @@ pub enum ServerMessage {
     Gap { head: i64, oldest: Option<i64> },
     /// One appended change, as it happened.
     Change { seq: i64, change: Change },
+    /// The answer to a batch of changes that went in: which seq each one was
+    /// given, so the client can mark its own work as sent.
+    Applied {
+        head: i64,
+        applied: Vec<Assigned>,
+        /// The server asking for a fresh whole plan. It stores commands and
+        /// has no engine to replay them with, so it cannot fold its own log
+        /// into a plan and has to ask whoever it is talking to. Carried here
+        /// as well as on the REST answer, because with streaming nobody
+        /// presses Sync for hours and the ask would never be heard.
+        snapshot_wanted: bool,
+    },
+    /// Somebody else got there first. Carries what was missed, so the client
+    /// can replay its own work on top and offer it again, which is the same
+    /// answer and the same rebase the REST push gets.
+    Behind {
+        head: i64,
+        after: i64,
+        changes: Vec<Change>,
+        /// Whether more is waiting beyond this page.
+        more: bool,
+    },
+    /// This client's cursor is past the end of the log, so the two are not
+    /// the same log and appending would interleave two histories.
+    Ahead { head: i64, cursor: i64 },
     Presence(Presence),
     Joined { subject: String, name: String },
     Left { subject: String },
@@ -100,6 +175,16 @@ pub enum Pointer {
     Chart { row: i64, minutes: i64 },
 }
 
+/// A cell somebody has open for editing, in the plan rather than on a screen.
+///
+/// The same reasoning as [`Pointer`]: a pixel rectangle means nothing on
+/// somebody else's window, so what travels is which row and which column.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Cell {
+    pub row: i64,
+    pub column: u16,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Presence {
     pub subject: String,
@@ -111,13 +196,34 @@ pub struct Presence {
     /// no pointer drawn for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<Pointer>,
+    /// Where their face is, if their provider serves one. Absent is the
+    /// ordinary case rather than a fault: most accounts have no picture, and
+    /// whatever draws one falls back to initials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    /// The cell they have open, if any.
+    ///
+    /// Always stated, unlike the pointer. A client sends only what changed,
+    /// because it knows what it last said; this direction states the whole
+    /// answer, because the copy receiving it has no way to tell an absent
+    /// field from a cell that has just been closed and would have to guess.
+    /// Guessing wrong leaves somebody's abandoned half word on screen, or
+    /// clears a cell they are still typing into, and the few bytes this costs
+    /// on a message that already carries a pointer are not worth that.
+    pub editing: Option<Cell>,
+    /// What they have typed into it and not committed. Stated whole for the
+    /// same reason.
+    pub draft: Option<String>,
 }
 
 struct Peer {
     subject: String,
     name: String,
+    picture: Option<String>,
     row: Option<i64>,
     at: Option<Pointer>,
+    editing: Option<Cell>,
+    draft: Option<String>,
     outbox: UnboundedSender<String>,
 }
 
@@ -143,10 +249,19 @@ impl Hub {
     ) -> ConnId {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
-        rooms
-            .entry(project)
-            .or_default()
-            .insert(id, Peer { subject, name, row: None, at: None, outbox });
+        rooms.entry(project).or_default().insert(
+            id,
+            Peer {
+                subject,
+                name,
+                picture: None,
+                row: None,
+                at: None,
+                editing: None,
+                draft: None,
+                outbox,
+            },
+        );
         id
     }
 
@@ -162,23 +277,34 @@ impl Hub {
         }
     }
 
-    /// The display name a client asked to be known by. The token has no name
-    /// in it, so this is the only place one comes from.
-    pub fn set_name(&self, project: Uuid, id: ConnId, name: String) {
+    /// The name and picture a client asked to be known by. The token carries
+    /// neither, so this is the only place either comes from.
+    pub fn set_identity(
+        &self,
+        project: Uuid,
+        id: ConnId,
+        name: Option<String>,
+        picture: Option<String>,
+    ) {
         let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(peer) = rooms.get_mut(&project).and_then(|room| room.get_mut(&id)) {
-            peer.name = name;
+            if let Some(name) = name {
+                peer.name = name;
+            }
+            if picture.is_some() {
+                peer.picture = picture;
+            }
         }
     }
 
-    /// This connection's name and selected row, for the messages that echo
-    /// them back to everybody else.
-    pub fn describe(&self, project: Uuid, id: ConnId) -> (String, Option<i64>) {
+    /// This connection's name and picture, for the messages that echo them
+    /// back to everybody else.
+    pub fn describe(&self, project: Uuid, id: ConnId) -> (String, Option<String>) {
         let rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
         rooms
             .get(&project)
             .and_then(|room| room.get(&id))
-            .map(|peer| (peer.name.clone(), peer.row))
+            .map(|peer| (peer.name.clone(), peer.picture.clone()))
             .unwrap_or_default()
     }
 
@@ -200,6 +326,45 @@ impl Hub {
         }
     }
 
+    /// Record the cell somebody has open and what they have typed into it.
+    ///
+    /// In memory only, like the pointer and for the same reason: an
+    /// uncommitted value is not work, it is somebody mid-keystroke, and
+    /// writing it anywhere would turn an abandoned edit into a record of
+    /// something that never happened. The outer option is "nothing new to
+    /// say", the inner one is "it has gone".
+    pub fn set_editing(
+        &self,
+        project: Uuid,
+        id: ConnId,
+        editing: Option<Option<Cell>>,
+        draft: Option<Option<String>>,
+    ) {
+        let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(peer) = rooms.get_mut(&project).and_then(|room| room.get_mut(&id)) {
+            if let Some(editing) = editing {
+                peer.editing = editing;
+            }
+            if let Some(draft) = draft {
+                peer.draft = draft.map(|text| tidy(&text, MAX_DRAFT));
+            }
+        }
+    }
+
+    /// The cell and draft this connection has, as stored.
+    ///
+    /// Read back rather than taken from the message being answered, because
+    /// what goes out is the whole answer rather than the difference: a client
+    /// sends only what changed and the room is what knows the rest.
+    pub fn what_is_open(&self, project: Uuid, id: ConnId) -> (Option<Cell>, Option<String>) {
+        let rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
+        rooms
+            .get(&project)
+            .and_then(|room| room.get(&id))
+            .map(|peer| (peer.editing, peer.draft.clone()))
+            .unwrap_or_default()
+    }
+
     /// Who else is in this project, not counting the connection asking.
     pub fn peers(&self, project: Uuid, except: Option<ConnId>) -> Vec<Presence> {
         let rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
@@ -213,6 +378,9 @@ impl Hub {
                         name: peer.name.clone(),
                         row: peer.row,
                         at: peer.at,
+                        picture: peer.picture.clone(),
+                        editing: peer.editing,
+                        draft: peer.draft.clone(),
                     })
                     .collect()
             })
@@ -260,4 +428,29 @@ impl Hub {
             .map(HashMap::len)
             .unwrap_or(0)
     }
+}
+
+/// How much of a name, a picture address or a draft is carried.
+///
+/// The frame limit already stops anything absurd, but these are echoed to
+/// every other connection on the project, so one client sending a megabyte of
+/// "draft" would cost every peer in the room a megabyte. A cell holds a task
+/// name or a date, and a picture is a URL, so both caps are generous.
+const MAX_PICTURE: usize = 2048;
+const MAX_DRAFT: usize = 512;
+
+/// Trim a piece of client text to something worth relaying.
+fn tidy(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
+/// A picture address worth keeping, or nothing.
+///
+/// The value is not trusted here beyond its size: what a URL is allowed to be
+/// is a question about the window that would load it, and it is answered on
+/// the client that draws it rather than guessed at here.
+pub fn picture_worth_keeping(picture: Option<String>) -> Option<String> {
+    picture
+        .map(|url| tidy(url.trim(), MAX_PICTURE))
+        .filter(|url| !url.is_empty())
 }

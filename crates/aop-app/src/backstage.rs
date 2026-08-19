@@ -568,7 +568,16 @@ pub(crate) fn FileBrowser(
         } else {
             name.trim().to_string()
         };
-        state.write().save_to(dir().join(name));
+        let target = dir().join(name);
+        // Ask before writing over somebody's file. `save_to` writes without
+        // looking, so Save As silently replaced whatever was already there,
+        // which is the kind of loss nobody notices until they need the file.
+        if target.exists() {
+            let beside = crate::state::free_name_beside(&target).unwrap_or_else(|| target.clone());
+            state.write().dialog = Some(Dialog::ConfirmOverwrite { path: target, beside });
+            return;
+        }
+        state.write().save_to(target);
     };
 
     rsx! {

@@ -308,6 +308,7 @@ Section "${APPNAME} (required)" SecCore
   File "LICENSE.txt"
   File "README.md"
   File "app.ico"
+  File "document.ico"
 
   ; Present only when the build script found them. A MinGW built binary can
   ; need a few runtime libraries beside it, and the WebView2 bootstrapper is
@@ -438,7 +439,7 @@ SectionEnd
 Section "Open .aprj files with ${APPNAME}" SecAssoc
   WriteRegStr SHCTX "Software\Classes\${EXTENSION}" "" "${PROGID}"
   WriteRegStr SHCTX "Software\Classes\${PROGID}" "" "Alterion Project"
-  WriteRegStr SHCTX "Software\Classes\${PROGID}\DefaultIcon" "" "$INSTDIR\app.ico,0"
+  WriteRegStr SHCTX "Software\Classes\${PROGID}\DefaultIcon" "" "$INSTDIR\document.ico,0"
   WriteRegStr SHCTX "Software\Classes\${PROGID}\shell\open\command" "" '"$INSTDIR\${EXENAME}" "%1"'
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
 SectionEnd
@@ -604,6 +605,7 @@ Section "Uninstall"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\app.ico"
+  Delete "$INSTDIR\document.ico"
   Delete "$INSTDIR\uninstall.exe"
   Delete "$INSTDIR\MicrosoftEdgeWebview2Setup.exe"
   Delete "$INSTDIR\*.dll"

@@ -21,6 +21,7 @@
 //! of 0 means "the log is empty". That keeps the arithmetic free of options
 //! everywhere except the wire, where `null` is friendlier than 0.
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 /// What the server currently holds for one project.
@@ -131,6 +132,19 @@ impl PushDecision {
     pub fn is_conflict(&self) -> bool {
         !matches!(self, Self::Append { .. })
     }
+}
+
+/// One pushed change, and the seq the log gave it.
+///
+/// The client made the change up under its own numbering and has no way to
+/// know what the log called it, so the answer has to name both: the local id
+/// is how the client finds the entry it sent, and the seq is what it becomes
+/// in the record everybody shares. The same pair goes back over both
+/// transports, because it is the same answer to the same question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Assigned {
+    pub local_id: u64,
+    pub seq: i64,
 }
 
 /// Seq numbers a run of `count` pushed changes will be given.

@@ -237,6 +237,15 @@ fn SyncStanding() -> Element {
                             onclick: move |_| crate::collaborate::sync(state),
                             "Sync now"
                         }
+                        // Asking to see what is there, which is not the same
+                        // as offering what is here. The preview it opens is
+                        // the one a refused push opens, and so is the rebase
+                        // behind it.
+                        button {
+                            class: "btn",
+                            onclick: move |_| crate::collaborate::pull(state),
+                            "Pull changes"
+                        }
                         button {
                             class: "btn",
                             onclick: move |_| crate::collaborate::check(state),

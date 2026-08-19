@@ -7,6 +7,10 @@
     <magic priority="60">
       <match type="string" value="APRJ" offset="0"/>
     </magic>
-    <icon name="alterion-open-project"/>
+    <!-- No icon element: the desktop looks for an icon named after the type
+         itself, `application-x-alterion-project`, which install.sh places
+         when the document artwork exists. Naming the application's icon here
+         is what made a plan in a folder look like a second copy of the
+         application. -->
   </mime-type>
 </mime-info>

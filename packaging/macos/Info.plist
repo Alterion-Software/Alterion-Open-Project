@@ -22,7 +22,7 @@
       <key>CFBundleTypeName</key>         <string>Alterion Project</string>
       <key>CFBundleTypeRole</key>         <string>Editor</string>
       <key>LSHandlerRank</key>            <string>Owner</string>
-      <key>CFBundleTypeIconFile</key>     <string>AppIcon</string>
+      <key>CFBundleTypeIconFile</key>     <string>DocumentIcon</string>
       <key>LSItemContentTypes</key>
       <array><string>com.alterion.openproject.aprj</string></array>
     </dict>

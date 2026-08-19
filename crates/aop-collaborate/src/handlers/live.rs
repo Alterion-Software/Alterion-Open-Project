@@ -18,9 +18,12 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use uuid::Uuid;
 
 use crate::auth::bearer_or_query;
+use aop_core::history::Change;
+
 use crate::entity::changes as change_rows;
 use crate::error::SyncError;
 use crate::live::{ClientMessage, ConnId, ServerMessage};
+use crate::sync::PushDecision;
 use crate::state::AppState;
 
 /// How long a connection has to introduce itself before the live stream
@@ -42,8 +45,9 @@ pub async fn live(
     let token = bearer_or_query(&req).ok_or(SyncError::Unauthenticated)?;
     let who = state.idp.verify(&token).await?;
     let id = path.into_inner();
-    // Any member may watch. Writing still goes through the REST push, which
-    // checks the role again, so a viewer cannot append by holding a socket.
+    // Any member may watch. Writing is checked again inside `changes::land`,
+    // whichever transport asked, so a viewer cannot append by holding a
+    // socket and an editor who is removed stops being able to mid-session.
     super::role_on(&state.db, id, &who.subject).await?;
 
     let (response, session, stream) =
@@ -89,10 +93,13 @@ async fn pump(
     let greeting = tokio::time::timeout(HELLO_TIMEOUT, stream.next()).await;
     if let Ok(Some(Ok(AggregatedMessage::Text(text)))) = greeting {
         match serde_json::from_str::<ClientMessage>(&text) {
-            Ok(ClientMessage::Hello { after, name }) => {
-                if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
-                    state.hub.set_name(project, conn, name);
-                }
+            Ok(ClientMessage::Hello { after, name, picture }) => {
+                state.hub.set_identity(
+                    project,
+                    conn,
+                    name.filter(|n| !n.trim().is_empty()),
+                    crate::live::picture_worth_keeping(picture),
+                );
                 for message in catch_up(&state, project, conn, after).await {
                     if send(&mut session, &message).await.is_err() {
                         return finish(&state, project, conn, &subject, session).await;
@@ -161,14 +168,24 @@ async fn on_client_message(
     text: &str,
 ) -> bool {
     match serde_json::from_str::<ClientMessage>(text) {
-        Ok(ClientMessage::Presence { row, at }) => {
+        Ok(ClientMessage::Presence { row, at, editing, draft }) => {
             state.hub.set_row(project, conn, row);
             // Absent means unchanged, so a client reporting only a selection
             // does not blank everybody else's view of its pointer.
             if at.is_some() {
                 state.hub.set_pointer(project, conn, at);
             }
-            let (name, _) = state.hub.describe(project, conn);
+            // Absent means unchanged on the way in, so a pointer move does
+            // not close the cell this planner has open.
+            state.hub.set_editing(project, conn, editing, draft);
+            let (name, picture) = state.hub.describe(project, conn);
+            // Read back rather than relayed straight through. What goes out
+            // is the whole answer, not the difference, because the copies
+            // receiving it cannot tell an absent field from a cell that has
+            // just been closed. It is also where the cap on a draft is
+            // applied, which relaying the message straight through would make
+            // decorative.
+            let (editing, draft) = state.hub.what_is_open(project, conn);
             state.hub.broadcast(
                 project,
                 &ServerMessage::Presence(crate::live::Presence {
@@ -176,10 +193,16 @@ async fn on_client_message(
                     name,
                     row,
                     at,
+                    picture,
+                    editing,
+                    draft,
                 }),
                 Some(conn),
             );
             true
+        }
+        Ok(ClientMessage::Changes { after, changes }) => {
+            stream_in(state, project, conn, subject, session, after, changes).await
         }
         Ok(ClientMessage::Ping) => send(session, &ServerMessage::Pong).await.is_ok(),
         // A second hello is a client that lost track of its own state. It is
@@ -193,6 +216,51 @@ async fn on_client_message(
         .await
         .is_ok(),
     }
+}
+
+/// Work offered over the socket rather than over the REST push.
+///
+/// The answer is worked out by the same function the REST push uses and is
+/// then said in this transport's words. Nothing here decides anything: if it
+/// did, there would be two protocols to keep in step and only one of them
+/// would be exercised on an ordinary day.
+async fn stream_in(
+    state: &web::Data<AppState>,
+    project: Uuid,
+    conn: ConnId,
+    subject: &str,
+    session: &mut actix_ws::Session,
+    after: Option<i64>,
+    changes: Vec<Change>,
+) -> bool {
+    let answer = match super::changes::land(state, project, subject, after, &changes, Some(conn))
+        .await
+    {
+        Ok(super::changes::Landed::Applied { head, applied, snapshot_wanted }) => {
+            ServerMessage::Applied { head, applied, snapshot_wanted }
+        }
+        Ok(super::changes::Landed::Behind { head, after, changes, more }) => {
+            ServerMessage::Behind { head, after, changes, more }
+        }
+        Ok(super::changes::Landed::Refused(PushDecision::Ahead { head, cursor })) => {
+            ServerMessage::Ahead { head, cursor }
+        }
+        Ok(super::changes::Landed::Refused(PushDecision::Gap { head, oldest })) => {
+            ServerMessage::Gap { head, oldest }
+        }
+        // The other two are not refusals and `land` never returns them here.
+        Ok(super::changes::Landed::Refused(_)) => {
+            ServerMessage::Error { message: "that could not be applied".into() }
+        }
+        Err(err) => {
+            log::warn!("a streamed push failed on {project}: {err}");
+            // Deliberately vague. The client's own work is untouched and it
+            // will offer it again, and the detail belongs in the server's log
+            // rather than on somebody's screen.
+            ServerMessage::Error { message: "those changes could not be applied".into() }
+        }
+    };
+    send(session, &answer).await.is_ok()
 }
 
 /// What a reconnecting client missed, or the refusal that says it cannot be

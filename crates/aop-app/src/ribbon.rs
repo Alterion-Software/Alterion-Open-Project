@@ -1358,6 +1358,14 @@ fn ViewTab() -> Element {
                     enabled: cannot_sync.is_none(),
                     on: move |_| crate::collaborate::sync(state),
                 }
+                // Deliberate, and separate from Sync on purpose: this takes
+                // what is on the server and shows what it would do before it
+                // touches the plan, without offering anything back.
+                SmallBtn {
+                    glyph: "file-input".to_string(), caption: "Pull Changes".to_string(),
+                    enabled: cannot_sync.is_none(),
+                    on: move |_| crate::collaborate::pull(state),
+                }
                 SmallBtn {
                     glyph: "compare".to_string(), caption: "Check Server".to_string(),
                     enabled: cannot_sync.is_none(),

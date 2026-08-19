@@ -90,6 +90,12 @@ fn PickerCellEditor(row: usize, column: Column) -> Element {
         draft.set(state.peek().cell_draft.clone());
     });
 
+    // What is being typed, for anybody else with this plan open. Its own
+    // signal so a keystroke never redraws the window, and cleared when this
+    // editor goes so nobody is left watching an abandoned word.
+    let mut shared = use_context::<crate::state::Drafting>().0;
+    use_drop(move || shared.set(None));
+
     let mut commit = move || {
         let text = draft();
         // Only when it says something different from the plan. Ticking a box in
@@ -113,7 +119,10 @@ fn PickerCellEditor(row: usize, column: Column) -> Element {
                 onmousedown: move |event| event.stop_propagation(),
                 ondoubleclick: move |event| event.stop_propagation(),
                 onmouseup: move |event| event.stop_propagation(),
-                oninput: move |event| draft.set(event.value()),
+                oninput: move |event| {
+                draft.set(event.value());
+                shared.set(Some(event.value()));
+            },
                 // Clicking inside the picker does not blur this box, because
                 // the picker prevents it, so a blur means the planner has
                 // clicked away and whatever they typed should be kept.
@@ -147,6 +156,16 @@ fn CellEditor(row: usize, column: Column, initial: String) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let mut draft = use_signal(|| initial.clone());
     let mut settled = use_signal(|| false);
+    // What is being typed, for anybody else with this plan open. Its own
+    // signal rather than a field on the plan, so a keystroke never redraws the
+    // window, and never anywhere near the change log: an abandoned edit must
+    // not become a permanent record of something that never happened.
+    let mut shared = use_context::<crate::state::Drafting>().0;
+
+    // Cleared when this editor goes, however it goes. The cell is released by
+    // the same act, so nobody is left looking at half a word somebody
+    // abandoned two minutes ago.
+    use_drop(move || shared.set(None));
 
     let mut commit = move || {
         if settled() {
@@ -177,7 +196,10 @@ fn CellEditor(row: usize, column: Column, initial: String) -> Element {
             onmousedown: move |event| event.stop_propagation(),
             ondoubleclick: move |event| event.stop_propagation(),
             onmouseup: move |event| event.stop_propagation(),
-            oninput: move |event| draft.set(event.value()),
+            oninput: move |event| {
+                draft.set(event.value());
+                shared.set(Some(event.value()));
+            },
             onblur: move |_| commit(),
             onkeydown: move |event| match event.key() {
                 Key::Enter => commit(),

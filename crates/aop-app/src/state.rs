@@ -5,6 +5,7 @@
 //! views, so undo snapshots and rescheduling can never be forgotten.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use aop_core::draw::{
     snap_vertical, Anchor, BarPoint, Drawing, DrawingId, Extent, ShapeKind,
@@ -16,6 +17,7 @@ use aop_core::{
 };
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 
+use crate::cloud::collab::CollabError;
 use crate::gantt::{bar_edges, chart_range, Scale, ROW_H};
 use crate::macros::cmd::{Cmd, ResourceField, Row, ViewOption};
 
@@ -258,6 +260,20 @@ pub struct Hovered(pub dioxus::prelude::Signal<Option<usize>>);
 /// to a few messages a second rather than one per movement.
 #[derive(Clone, Copy)]
 pub struct Pointing(pub dioxus::prelude::Signal<Option<crate::cloud::live::Pointer>>);
+
+/// What this planner has typed into a cell and not committed yet.
+///
+/// The most valuable thing on the ephemeral channel and the most dangerous
+/// place to put it: a keystroke is not a change to the plan, and holding it
+/// on `AppState` would redraw the window on every letter. So it lives here,
+/// beside [`Pointing`], for the same reason and read the same way. Nothing
+/// renders from it. The timer that offers presence to the socket peeks at it.
+///
+/// It must never reach the change log. An abandoned edit would otherwise
+/// become a permanent record of something that never happened, with an author
+/// and a moment against it.
+#[derive(Clone, Copy)]
+pub struct Drafting(pub dioxus::prelude::Signal<Option<String>>);
 
 impl ColumnSpec {
     pub fn new(field: Field) -> Self {
@@ -638,6 +654,15 @@ pub enum Dialog {
     /// A newer release, what this copy may do about it, and how to get it
     /// where it may not.
     UpdateAvailable,
+    /// Saving would write over a file that is already there. Carrying the
+    /// path rather than reading it back from the pane, because the pane can
+    /// be typed into while the question is on screen.
+    ConfirmOverwrite {
+        path: PathBuf,
+        /// The name that would be used instead, worked out once so the button
+        /// can say it rather than promising something vague.
+        beside: PathBuf,
+    },
     /// A link somebody opened, and the server it says to go and ask.
     ///
     /// Always asked before anything is fetched. A link is an instruction from
@@ -745,9 +770,53 @@ pub enum Column {
 ///
 /// The socket runs on a thread of its own and the plan may only be written
 /// where the interface does, so arrivals are collected rather than pushed.
-/// Fast enough that somebody else's typing appears while they are still doing
-/// it, slow enough that it is not a redraw loop.
-pub const LIVE_POLL_MILLIS: u64 = 350;
+///
+/// This used to be one timer doing two jobs at three hundred and fifty
+/// milliseconds, and it showed: a plan change arriving a third of a second
+/// late is fine, and somebody's pointer arriving three times a second is a
+/// slideshow. It is now fast enough for a pointer, which it can afford to be
+/// because a tick that finds nothing queued costs nothing at all: the socket
+/// says whether anything is waiting before a write handle to the plan is
+/// taken, and taking one is what redraws the window. A quiet session is
+/// silent, and a busy one redraws at the rate things are actually happening.
+pub const LIVE_POLL_MILLIS: u64 = 100;
+
+/// How often this planner's own position is offered to the socket.
+///
+/// Its own timer, because the two directions want different things: what
+/// arrives should arrive as soon as it is there, and what is sent should be
+/// capped however fast a mouse moves. The socket sends nothing unless the
+/// position actually changed, so this is an upper bound rather than a rate.
+pub const EPHEMERAL_POLL_MILLIS: u64 = 120;
+
+/// How long an edit waits before it is offered to the live session.
+///
+/// Long enough that typing a task name is one message rather than one per
+/// keystroke, short enough that somebody watching sees it as it happens
+/// rather than afterwards. Every entry still goes in the log first; this is
+/// only how long it sits there before being offered.
+pub const STREAM_AFTER_MILLIS: u64 = 250;
+
+/// How long the local copy of a server plan waits before being rewritten.
+///
+/// A local file, so this is cheap, but it is still a whole plan serialised
+/// and it must not happen per keystroke.
+pub const LOCAL_COPY_AFTER_MILLIS: u64 = 2_000;
+
+/// How many entries one streamed batch carries.
+///
+/// The server refuses more than a page in a single push, and a copy that has
+/// been offline for a day can easily have more than that waiting. What is left
+/// over goes in the next batch, once this one has been answered and the cursor
+/// has moved, which is also how a reconnect drains without a special case.
+pub const STREAM_BATCH: usize = 200;
+
+/// How long to wait before offering work the server has just refused.
+///
+/// Whatever refused it will refuse it again a millisecond later, and a socket
+/// that is already open makes a tight retry loop very easy to write by
+/// accident. The work is not lost by waiting: it is in the log.
+pub const STREAM_RETRY_MILLIS: u64 = 5_000;
 
 /// What the network is doing, so a button can say so rather than looking
 /// broken.
@@ -1096,14 +1165,45 @@ pub struct AppState {
     pub live_wanted: bool,
     /// Who else has this plan open.
     pub peers: Vec<crate::cloud::live::Peer>,
-    /// The row the others were last told this planner is on. Remembered so
-    /// only a move is sent: the socket is polled several times a second, and
-    /// saying "still on row 12" that often is a lot of frames to say nothing.
-    told_row: Option<i64>,
-    /// Where the others were last told this planner's pointer is. Remembered
-    /// for the same reason the row is: the timer asks several times a second,
-    /// and a pointer that has not moved anywhere new is not worth a frame.
-    told_at: Option<crate::cloud::live::Pointer>,
+    /// Somebody else's work that arrived while a cell was open for editing.
+    ///
+    /// With streaming, being behind stops being rare and becomes constant, so
+    /// a dialog every few seconds would be worse than no live editing at all
+    /// and a rebase that applies cleanly simply happens. The one thing it must
+    /// not do is happen underneath somebody's fingers: a change that touches
+    /// the task they have a cell open on waits here until they are done, then
+    /// goes in exactly as it would have. Nothing is lost by waiting, because
+    /// the cursor does not move until it lands.
+    held_live: Vec<aop_core::history::Change>,
+    /// When the work waiting here should next be offered to the live
+    /// session. `None` means there is nothing waiting to offer.
+    ///
+    /// A moment rather than a flag, because it is a debounce: typing a task
+    /// name pushes it forward and the batch goes once the typing stops.
+    stream_due: Option<std::time::Instant>,
+    /// Whether a batch is already with the server and unanswered.
+    ///
+    /// One at a time, because the cursor a batch was made against is only
+    /// right until the answer moves it. Two in flight would have the second
+    /// one built on a head the server has already left behind.
+    streaming: bool,
+    /// The server asking for a fresh whole plan, once its log has run far
+    /// enough past the newest stored one. Housekeeping, with no decision in
+    /// it for a planner, so it is answered rather than shown.
+    snapshot_wanted: bool,
+    /// Where this plan is kept on this machine when it has no file of its
+    /// own, because it came off a server.
+    ///
+    /// Not a backup and never described as one: one copy, overwritten as work
+    /// happens, so that closing the window does not lose a plan that was
+    /// never saved anywhere.
+    pub local_copy: Option<std::path::PathBuf>,
+    /// When that copy should next be written. `None` means it matches.
+    local_due: Option<std::time::Instant>,
+    /// Whether a local copy is being written right now. Shared with the
+    /// thread doing it, so a second write cannot overtake the first and leave
+    /// the older plan on disk.
+    local_writing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// What the server said when it was last asked.
     pub checked: Option<Checked>,
     /// Who this plan is shared with, once somebody has asked. `None` means
@@ -1290,10 +1390,15 @@ impl AppState {
             cloud_message: None,
             link: None,
             live: None,
+            held_live: Vec::new(),
+            stream_due: None,
+            streaming: false,
+            snapshot_wanted: false,
+            local_copy: None,
+            local_due: None,
+            local_writing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             live_wanted: false,
             peers: Vec::new(),
-            told_row: None,
-            told_at: None,
             checked: None,
             sharing: None,
             sharing_for: None,
@@ -1592,6 +1697,11 @@ impl AppState {
         self.project
             .history
             .record(author, script, summary, Local::now().naive_local());
+        // Every entry, and only entries. The log is the record and it is also
+        // what streams: there is no quicker path that skips it, because the
+        // record is what makes a message somebody missed recoverable rather
+        // than lost.
+        self.work_to_offer();
     }
 
     /// Carry something out without recording the commands inside it.
@@ -1727,6 +1837,13 @@ impl AppState {
     /// have this one syncing into somebody else's project, and versions left
     /// over would offer the wrong plan back.
     fn plan_changed(&mut self) {
+        // The local copy belongs to whichever plan was on screen, not to this
+        // one. Let go of it rather than delete it: that plan is still shared,
+        // still on the server, and its copy is still its home.
+        self.local_copy = None;
+        self.local_due = None;
+        self.held_live.clear();
+        self.snapshot_wanted = false;
         self.restore_link();
         self.versions = crate::versions::read(self.file_path.as_deref());
         self.version_selected = None;
@@ -2256,6 +2373,29 @@ impl AppState {
     /// Keyed by where the plan lives on this machine, so a copy of a plan is a
     /// separate client of the same project rather than a second copy of one
     /// cursor.
+    /// A plan that now lives somewhere new on this machine.
+    ///
+    /// **Save As on a shared plan keeps the link.** Somebody who wants a real
+    /// file in their documents folder should get one, and it should still be
+    /// the same plan: same project, same cursor, still syncing. Saving a copy
+    /// is not the same as leaving a shared plan, and reading the link back off
+    /// the new path, which is what used to happen, quietly conflated the two.
+    ///
+    /// The local copy goes at the same moment. Two copies of one plan, both
+    /// being written to, is the state this whole protocol exists to prevent,
+    /// and the file somebody chose is the one that should win.
+    fn moved_to(&mut self, path: &std::path::Path) {
+        match self.link.clone() {
+            Some(link) => {
+                crate::cloud::link::save(path, &link);
+                self.drop_the_local_copy();
+                self.sharing = None;
+                self.sharing_for = None;
+            }
+            None => self.restore_link(),
+        }
+    }
+
     pub fn restore_link(&mut self) {
         self.link = self
             .file_path
@@ -2453,15 +2593,69 @@ impl AppState {
         Some((session, offer))
     }
 
+    /// Hand over what a fresh whole plan for the server needs, if it asked.
+    ///
+    /// Cleared as it is taken, so a request that fails is not retried on
+    /// every tick at a server that is already having a bad time. The server
+    /// asks again on the next batch that lands.
+    pub fn start_snapshot(
+        &mut self,
+    ) -> Option<(crate::cloud::Session, String, String, i64, Project)> {
+        if !self.snapshot_wanted || self.sync_blocked().is_some() {
+            return None;
+        }
+        let link = self.link.clone()?;
+        let server = self.collaborate_server.trim().to_string();
+        let plan = self.project.clone();
+        let session = self.hand_over(Working::Syncing)?;
+        self.snapshot_wanted = false;
+        Some((session, server, link.project, link.cursor, plan))
+    }
+
+    /// Whether the server is waiting on a fresh whole plan.
+    pub fn snapshot_wanted(&self) -> bool {
+        self.snapshot_wanted && self.working.is_none()
+    }
+
+    /// Gather a pull: what the server has, without offering anything.
+    ///
+    /// The same call a sync makes with nothing in it, which is exactly what a
+    /// pull is: an empty offer is how a client asks "am I still current?",
+    /// and the answer to a client that is not carries what it missed. Reusing
+    /// it means a pull is answered by the same decision, previewed by the
+    /// same dialog and applied by the same rebase as everything else.
+    pub fn start_pull(&mut self) -> Option<(crate::cloud::Session, crate::cloud::work::Offer)> {
+        if self.sync_blocked().is_some() {
+            return None;
+        }
+        let link = self.link.clone()?;
+        let offer = crate::cloud::work::Offer {
+            server: self.collaborate_server.trim().to_string(),
+            project: link.project,
+            after: link.cursor,
+            // Deliberately nothing. Asking to see what is there is not asking
+            // to hand over what is here, and a pull that quietly pushed would
+            // be a sync under another name.
+            changes: Vec::new(),
+            plan: self.project.clone(),
+        };
+        let session = self.hand_over(Working::Syncing)?;
+        Some((session, offer))
+    }
+
     /// What the server said about a push.
-    pub fn sync_landed(&mut self, outcome: Result<crate::cloud::collab::Pushed, String>) {
+    pub fn sync_landed(&mut self, outcome: Result<crate::cloud::collab::Pushed, CollabError>) {
         use crate::cloud::collab::Pushed;
 
         self.working = None;
         let now = Local::now().naive_local();
         let pushed = match outcome {
             Ok(pushed) => pushed,
-            Err(why) => {
+            Err(error) => {
+                let why = error.to_string();
+                if matches!(error, CollabError::NoSuchProject) {
+                    self.no_longer_on_the_server();
+                }
                 self.checked = Some(Checked {
                     at: now,
                     outcome: CheckOutcome::Failed(why.clone()),
@@ -2481,6 +2675,7 @@ impl AppState {
                     self.project.history.mark_pushed(highest);
                 }
                 self.remember_cursor(head);
+                self.touch_local_copy();
                 self.checked = Some(Checked {
                     at: now,
                     outcome: CheckOutcome::Current,
@@ -2823,7 +3018,7 @@ impl AppState {
         // where this copy syncs.
         self.collaborate_server = server;
         self.link = Some(crate::cloud::link::Link {
-            project,
+            project: project.clone(),
             cursor: head,
         });
         self.checked = Some(Checked {
@@ -2835,12 +3030,66 @@ impl AppState {
         self.clamp_selection();
         self.reschedule();
         self.status = "Opened from a link".into();
+        // Written straight away, because the gap between "it is on screen"
+        // and "it exists somewhere" is exactly the gap this closes.
+        self.keep_a_local_copy(&project);
+        self.remember_cursor(head);
         self.cloud_message = Some(
-            "This plan came from the server and has not been saved on this machine yet. \
-             Save it somewhere to keep it, and to remember how far down the server's log \
-             this copy has read."
-                .into(),
+            "This plan came from the server. It is kept on this machine so that closing \
+             the window does not lose it, but that copy is not a backup and it is not \
+             yours to find: use Save As to put the plan where you want it, and it stays \
+             the same shared plan.".into(),
         );
+    }
+
+    /// Open a plan from the local copy this machine already has.
+    ///
+    /// The point of the cursor. A plan opened for the second time is on screen
+    /// as fast as a file opens, and what happened while it was closed comes
+    /// down as a handful of log entries rather than as a whole plan. Anything
+    /// that never reached the server is still in the log, and still unsent.
+    pub fn open_local_copy(&mut self, server: String, project: String) -> bool {
+        let Some((path, plan)) = crate::cloud::local::load(&project) else {
+            return false;
+        };
+        // The cursor lives beside the copy rather than inside it, so that a
+        // plan file handed to somebody else never claims to have read work it
+        // has never seen.
+        let cursor = crate::cloud::link::load(&path)
+            .map(|link| link.cursor)
+            .unwrap_or(0);
+
+        // Whatever was open before was a different plan, and a socket into it
+        // has nothing to do with this one.
+        self.stop_live(None);
+        self.snapshot_wanted = false;
+        self.project = plan;
+        self.file_path = None;
+        self.local_copy = Some(path);
+        self.local_due = None;
+        self.dirty = false;
+        self.undo.clear();
+        self.redo.clear();
+        self.pending.clear();
+        self.collaborate_server = server;
+        self.link = Some(crate::cloud::link::Link { project, cursor });
+        self.versions = aop_core::versions::Versions::new();
+        self.checked = None;
+        self.dialog = None;
+        self.selection = if self.project.tasks.is_empty() { Vec::new() } else { vec![0] };
+        self.clamp_selection();
+        self.reschedule();
+        let waiting = self.project.history.unsent().len();
+        self.status = "Opened the copy on this machine".into();
+        self.cloud_message = Some(match waiting {
+            0 => "Opened from the copy on this machine. Catching up with the server.".to_string(),
+            1 => "Opened from the copy on this machine. 1 change was still waiting to go."
+                .to_string(),
+            many => format!(
+                "Opened from the copy on this machine. {many} changes were still waiting to go."
+            ),
+        });
+        true
     }
 
     /// Take somebody else's work, keeping this planner's on top of it.
@@ -2886,6 +3135,7 @@ impl AppState {
         // The entries are the record of what was done, so they go in with the
         // work rather than being left to a later sync to discover.
         self.project.history.merge(changes);
+        self.touch_local_copy();
         self.undo.push(before);
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
@@ -2916,8 +3166,16 @@ impl AppState {
         incoming: &[aop_core::history::Change],
     ) -> (Vec<aop_core::compare::Difference>, usize, usize) {
         let mine = self.project.clone();
+        // What is on screen is not part of the question. Replaying their
+        // commands runs the real ones, and those move a selection and close
+        // whatever cell is open for editing, so a preview would quietly throw
+        // away somebody's half typed word to answer a question about it.
+        let selection = self.selection.clone();
+        let editing = self.editing;
         let (replayed, asked) = self.replay(incoming);
         let theirs = std::mem::replace(&mut self.project, mine);
+        self.selection = selection;
+        self.editing = editing;
         (
             aop_core::compare::compare(&self.project, &theirs),
             replayed,
@@ -2958,6 +3216,89 @@ impl AppState {
         (replayed, asked)
     }
 
+    /// The server no longer has this plan for this account.
+    ///
+    /// Deleted by its owner, or this account taken out of it. Either way there
+    /// is nothing left to sync with, and a local copy left behind would be a
+    /// plan that quietly came back the next time somebody opened the same
+    /// link. So it goes, along with the cursor beside it, and the plan that is
+    /// open stays open as an ordinary unsaved plan that somebody can put
+    /// wherever they like.
+    fn no_longer_on_the_server(&mut self) {
+        self.stop_live(None);
+        self.drop_the_local_copy();
+        if let Some(path) = self.file_path.clone() {
+            crate::cloud::link::forget(&path);
+        }
+        self.link = None;
+        // Unsaved on purpose. The work is still here and still theirs, and
+        // this copy is now the only one of it.
+        self.dirty = true;
+    }
+
+    // ---- the local copy of a plan that lives on a server ------------------
+
+    /// Note that the local copy no longer matches what is on screen.
+    ///
+    /// A moment rather than a flag, because it is a debounce: a run of edits
+    /// pushes it forward and the write happens once the run stops.
+    fn touch_local_copy(&mut self) {
+        if self.local_copy.is_none() {
+            return;
+        }
+        if self.local_due.is_none() {
+            self.local_due =
+                Some(std::time::Instant::now() + Duration::from_millis(LOCAL_COPY_AFTER_MILLIS));
+        }
+    }
+
+    /// Whether the local copy is out of date and its moment has come.
+    ///
+    /// Asked before a write handle is taken, for the same reason everything
+    /// else on these timers is: a plan nobody is editing must not redraw.
+    pub fn local_copy_due(&self) -> bool {
+        self.local_copy.is_some()
+            && self
+                .local_due
+                .is_some_and(|due| due <= std::time::Instant::now())
+    }
+
+    /// Write the local copy, on a thread of its own.
+    pub fn write_local_copy(&mut self) {
+        let Some(path) = self.local_copy.clone() else {
+            return;
+        };
+        self.local_due = None;
+        crate::cloud::local::write_in_background(
+            path,
+            self.project.clone(),
+            std::sync::Arc::clone(&self.local_writing),
+        );
+    }
+
+    /// Start keeping a local copy of this plan, and write one now.
+    ///
+    /// Called the moment a plan arrives from a server, because the window
+    /// between "it is on screen" and "it exists somewhere" is exactly the
+    /// window this is meant to close.
+    fn keep_a_local_copy(&mut self, project: &str) {
+        self.local_copy = crate::cloud::local::path_for(project);
+        self.local_due = Some(std::time::Instant::now());
+    }
+
+    /// Stop keeping one, and remove what is there.
+    ///
+    /// Two copies of one plan, both being written to, is the state this whole
+    /// protocol exists to prevent, so the local copy goes the moment there is
+    /// a real file: whichever way somebody opens the plan next, there is one
+    /// home for it and one cursor beside it.
+    fn drop_the_local_copy(&mut self) {
+        if let Some(path) = self.local_copy.take() {
+            crate::cloud::local::discard(&path);
+        }
+        self.local_due = None;
+    }
+
     /// Remember how far down the server's log this copy has read.
     ///
     /// Only ever forward. A cursor that went backwards would ask for changes
@@ -2989,16 +3330,29 @@ impl AppState {
             "" => "Someone".to_string(),
             name => name.to_string(),
         };
+        // The provider's address for this account's face, so the others can
+        // draw it rather than a pair of letters. Absent is the ordinary case.
+        let picture = self
+            .account
+            .as_ref()
+            .and_then(|account| account.picture.clone());
         match crate::cloud::live::Live::connect(
             self.collaborate_server.trim(),
             &token,
             &link.project,
             link.cursor,
             &name,
+            picture.as_deref(),
         ) {
             Ok(live) => {
                 self.live = Some(live);
                 self.live_wanted = true;
+                // Whatever this copy has not sent goes as soon as the socket
+                // is up. That is the other half of a reconnect: the catch-up
+                // brings in what was missed, and this offers what was made
+                // while there was nowhere to offer it.
+                self.streaming = false;
+                self.stream_due = Some(std::time::Instant::now());
                 self.status = "Live editing is on".into();
             }
             Err(error) => {
@@ -3013,10 +3367,15 @@ impl AppState {
         self.live = None;
         self.live_wanted = false;
         self.peers.clear();
-        // Forgotten as well as cleared, so the next session says where this
-        // planner is rather than assuming the others already know.
-        self.told_row = None;
-        self.told_at = None;
+        // The next session has told nobody anything, and what this one said
+        // went with it.
+        // Nothing is in flight any more, and what was in flight was never
+        // acknowledged, so it is still unsent work and stays in the log.
+        self.streaming = false;
+        self.stream_due = None;
+        // Held work was never applied and the cursor never moved past it, so
+        // dropping it loses nothing: the next sync asks for it again.
+        self.held_live.clear();
         if let Some(why) = why {
             self.status = why.clone();
             self.cloud_message = Some(why);
@@ -3029,8 +3388,6 @@ impl AppState {
     /// only be written where the interface runs and the socket is on a thread
     /// of its own.
     pub fn poll_live(&mut self) {
-        use crate::cloud::live::Incoming;
-
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -3038,11 +3395,22 @@ impl AppState {
         if batch.is_empty() {
             return;
         }
+        self.take_live_arrivals(batch);
+    }
+
+    /// Act on one batch of messages, whichever socket they came off.
+    ///
+    /// Split from the poll so that what the protocol does with each answer can
+    /// be checked without a server, a socket or a thread. The protocol is the
+    /// part that can be wrong in a way that loses somebody's work.
+    fn take_live_arrivals(&mut self, batch: Vec<crate::cloud::live::Incoming>) {
+        use crate::cloud::live::Incoming;
 
         let mut incoming = Vec::new();
         let mut cursor = None;
         let mut ended = None;
         let mut gap = false;
+        let mut ahead = None;
 
         for message in batch {
             match message {
@@ -3060,6 +3428,60 @@ impl AppState {
                     cursor = Some(seq.max(cursor.unwrap_or(seq)));
                     incoming.push(change);
                 }
+                Incoming::Applied { head, applied, snapshot_wanted } => {
+                    // Marked by the local id the server acknowledged rather
+                    // than by counting, because an answer that came back out
+                    // of order must not mark work nobody has seen as sent.
+                    self.streaming = false;
+                    if let Some(highest) = applied.iter().map(|(local, _)| *local).max() {
+                        self.project.history.mark_pushed(highest);
+                    }
+                    // Remembered here rather than gathered with the rest,
+                    // because this head is one nothing else has to be applied
+                    // to reach: an answer of "applied" means nobody else got
+                    // in, so the log's end is this copy's own last change.
+                    self.remember_cursor(head);
+                    // Whatever did not fit in that batch goes in the next one.
+                    if !self.project.history.unsent().is_empty() {
+                        self.stream_due = Some(std::time::Instant::now());
+                    }
+                    self.snapshot_wanted |= snapshot_wanted;
+                    self.touch_local_copy();
+                }
+                Incoming::Behind { head, changes, .. } => {
+                    // Nothing was written, so the work offered is still
+                    // unsent and still in the log. What came back is what was
+                    // missed, and it goes in the same way a live change does:
+                    // replayed onto this copy, or refused outright.
+                    self.streaming = false;
+                    cursor = Some(head.max(cursor.unwrap_or(head)));
+                    incoming.extend(changes);
+                    // Offered again once their work is in, which is what a
+                    // rebase is. Leaving it for somebody to press Sync is how
+                    // an afternoon of work quietly never goes anywhere.
+                    self.stream_due = Some(std::time::Instant::now());
+                }
+                Incoming::Ahead { head, cursor: mine } => {
+                    self.streaming = false;
+                    ahead = Some((head, mine));
+                }
+                Incoming::Refused(why) => {
+                    // Nothing was written, so the batch is still unsent work
+                    // and is offered again after a pause. A pause rather than
+                    // at once, because whatever refused it will refuse it
+                    // again a millisecond later and this is a socket, not a
+                    // retry loop.
+                    self.streaming = false;
+                    self.stream_due = Some(
+                        std::time::Instant::now() + Duration::from_millis(STREAM_RETRY_MILLIS),
+                    );
+                    if !why.trim().is_empty() {
+                        self.cloud_message = Some(format!(
+                            "The server would not take a change: {why}. It is still here and \
+                             will be offered again."
+                        ));
+                    }
+                }
                 Incoming::Gap { .. } => gap = true,
                 Incoming::Presence(peer) => {
                     match self
@@ -3069,10 +3491,20 @@ impl AppState {
                     {
                         Some(held) => {
                             held.row = peer.row;
-                            // Absent means unchanged. Copying it across
-                            // regardless would blank somebody's pointer every
-                            // time they moved their selection, which is the
-                            // one thing the protocol says not to do.
+                            held.name = peer.name;
+                            held.picture = peer.picture;
+                            // These two are stated whole every time, so what
+                            // arrives is the answer and not a difference: a
+                            // cell that has been closed and one that was
+                            // simply not mentioned would otherwise look the
+                            // same, and guessing wrong leaves somebody's
+                            // abandoned half word on screen.
+                            held.editing = peer.editing;
+                            held.draft = peer.draft;
+                            // The pointer is the exception, because there is
+                            // no such thing as a pointer going away. Copying
+                            // an absent one across would blank somebody's
+                            // pointer every time they moved their selection.
                             if peer.at.is_some() {
                                 held.at = peer.at;
                             }
@@ -3084,6 +3516,15 @@ impl AppState {
                 Incoming::Left { subject } => self.peers.retain(|held| held.subject != subject),
                 Incoming::Closed(why) => ended = Some(why),
             }
+        }
+
+        if let Some((head, cursor)) = ahead {
+            // Two logs that share numbers but not events. Appending would
+            // interleave them, so the socket goes and the question is put in
+            // front of somebody rather than guessed at.
+            self.stop_live(None);
+            self.dialog = Some(Dialog::SyncAhead { head, cursor });
+            return;
         }
 
         if gap {
@@ -3105,33 +3546,157 @@ impl AppState {
         }
     }
 
-    /// Tell the others where this planner is, when that has changed.
+    /// Tell the others what this planner is doing, when any of it is news.
     ///
-    /// Sent from the same timer that reads the socket rather than from
-    /// wherever the selection moves or the pointer goes, because those happen
-    /// in a dozen places and every one of them would have to remember to say
-    /// so. The timer is also the throttle: a mouse produces events far faster
-    /// than a socket should carry them, and one message per movement would
-    /// flood it to say almost nothing.
+    /// Everything ephemeral in one call: the selected row, what the pointer is
+    /// over, the cell that is open, and what has been typed into it and not
+    /// committed. None of it goes in the log, none of it gets a seq, and none
+    /// of it survives the connection, which is right: it is where somebody is
+    /// now, not what they did.
     ///
-    /// `at` is where the pointer is now, which the interface keeps out of the
-    /// plan's state so that moving a mouse does not redraw a window. Nothing
-    /// is sent unless the row or the pointer has actually moved somewhere new.
-    pub fn announce(&mut self, at: Option<crate::cloud::live::Pointer>) {
-        let row = self.primary().map(|row| row as i64);
-        let moved = at.filter(|at| Some(*at) != self.told_at);
-        if row == self.told_row && moved.is_none() {
+    /// `&self` on purpose, and that is the whole reason this is arranged the
+    /// way it is. It is called several times a second while a mouse is
+    /// moving; taking a write handle to the plan would redraw the window for
+    /// every pointer position. The socket keeps its own memory of what it last
+    /// said and works out the difference itself, so nothing here has to.
+    ///
+    /// `at` and `draft` come from signals nothing renders from, peeked rather
+    /// than read, for exactly the same reason.
+    pub fn announce(&self, at: Option<crate::cloud::live::Pointer>, draft: Option<String>) {
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        let editing = self.editing_cell();
+        live.looking_at(&crate::cloud::live::Presence {
+            row: self.primary().map(|row| row as i64),
+            at,
+            editing,
+            // A draft belongs to the cell it is being typed into. Sending one
+            // with no cell open would leave somebody's half typed word on
+            // screen after they had abandoned it.
+            draft: draft.filter(|_| editing.is_some()),
+        });
+    }
+
+    /// The cell this planner has open, in the form the others can place.
+    ///
+    /// The stored form is a row and which *kind* of column is being edited;
+    /// what travels is a row and a column number, because the receiving copy
+    /// may not be showing the same columns in the same order and a number is
+    /// something it can look up in its own layout.
+    fn editing_cell(&self) -> Option<crate::cloud::live::Cell> {
+        let (row, column) = self.editing?;
+        let index = self.columns.iter().position(|held| {
+            matches!(
+                (held.field, column),
+                (Field::Name, Column::Name)
+                    | (Field::Duration, Column::Duration)
+                    | (Field::Start, Column::Start)
+                    | (Field::Finish, Column::Finish)
+                    | (Field::Predecessors, Column::Predecessors)
+                    | (Field::ResourceNames, Column::Resources)
+            )
+        })?;
+        Some(crate::cloud::live::Cell {
+            row: row as i64,
+            column: u16::try_from(index).unwrap_or(u16::MAX),
+        })
+    }
+
+    // ---- streaming work out ----------------------------------------------
+
+    /// Whether there is work waiting whose moment has come.
+    ///
+    /// Asked before a write handle is taken, so that a live session with
+    /// nothing happening does not redraw the window on every tick.
+    pub fn stream_due(&self) -> bool {
+        self.live.is_some()
+            && !self.streaming
+            // Work of somebody else's is waiting to go in ahead of this. It
+            // was made against a cursor this copy has not reached, so offering
+            // anything now would only be told it is behind by that.
+            && self.held_live.is_empty()
+            && self
+                .stream_due
+                .is_some_and(|due| due <= std::time::Instant::now())
+            && !self.project.history.unsent().is_empty()
+    }
+
+    /// Offer this copy's unsent work over the live socket.
+    ///
+    /// The socket is already open, so there is no handshake to pay for and no
+    /// reason to batch harder than the debounce already does. What goes is
+    /// what the log says has not been sent, in the order it was done, against
+    /// the cursor this copy has read to. The server answers with the same four
+    /// decisions a REST push is answered with, because it is the same
+    /// protocol reached a different way.
+    pub fn stream_changes(&mut self) {
+        // A REST sync moves the same work and marks the same entries. Two of
+        // them running at once would offer the same commands twice, and the
+        // second offer would be told it is behind by its own first one.
+        if matches!(
+            self.working,
+            Some(Working::Syncing | Working::Publishing | Working::Fetching)
+        ) {
             return;
         }
+        if !self.stream_due() {
+            return;
+        }
+        let Some(after) = self.link.as_ref().map(|link| link.cursor) else {
+            return;
+        };
+        // Capped, because the server refuses a batch bigger than one page and
+        // a copy that has been offline all day can easily have more than that
+        // waiting. What is left goes in the next batch, once this one is
+        // answered and the cursor has moved.
+        let batch: Vec<aop_core::history::Change> = self
+            .project
+            .history
+            .unsent()
+            .iter()
+            .take(STREAM_BATCH)
+            .cloned()
+            .collect();
         if let Some(live) = self.live.as_ref() {
-            live.looking_at(row, moved);
-            self.told_row = row;
-            if let Some(at) = moved {
-                self.told_at = Some(at);
-            }
+            live.send_changes(after, &batch);
+            self.streaming = true;
+            self.stream_due = None;
         }
     }
 
+    /// Whether work held back for an editor can go in now.
+    pub fn held_work_due(&self) -> bool {
+        !self.held_live.is_empty() && self.editing.is_none()
+    }
+
+    /// Bring in the work that was waiting for somebody to finish typing.
+    pub fn apply_held_live(&mut self) {
+        if !self.held_work_due() {
+            return;
+        }
+        let held = std::mem::take(&mut self.held_live);
+        // No head to remember: the cursor moves with whatever answer carried
+        // these, and a batch applied late must not claim to have read further
+        // than it has.
+        self.take_live_batch(&held, None);
+    }
+
+    /// Work that has been done here and not sent, from now on.
+    ///
+    /// Called wherever an entry lands in the log. The entry is what is offered
+    /// and the entry is what is stored: there is no faster path that skips the
+    /// record, because the record is the thing that makes a missed message
+    /// recoverable rather than fatal.
+    fn work_to_offer(&mut self) {
+        if self.stream_due.is_none() {
+            self.stream_due =
+                Some(std::time::Instant::now() + Duration::from_millis(STREAM_AFTER_MILLIS));
+        }
+        self.touch_local_copy();
+    }
+
+    /// Bring one batch of live changes in.
     /// Bring one batch of live changes in.
     fn take_live_batch(&mut self, incoming: &[aop_core::history::Change], head: Option<i64>) {
         // A change already in the log is one that arrived twice, which the
@@ -3157,6 +3722,22 @@ impl AppState {
         }
 
         let (differences, replayed, asked) = self.preview_incoming(&fresh);
+
+        // A clean rebase applies quietly, and that is the decision: with
+        // streaming, "behind" is the ordinary state rather than an event, and
+        // a modal every few seconds would make live editing worse than not
+        // having it. The exception is a change to the very task somebody has a
+        // cell open on, which would move the ground under them mid-word. That
+        // waits until they are done. Anything that will not apply cleanly is
+        // still refused outright, which is the rule that has not changed.
+        if let Some(row) = self.editing.map(|(row, _)| row)
+            && let Some(id) = self.project.tasks.get(row).map(|task| task.id)
+            && differences.iter().any(|one| one.task() == Some(id))
+        {
+            self.held_live.extend(fresh);
+            return;
+        }
+
         let before = self.project.clone();
         let applied = aop_core::compare::apply(&mut self.project, &differences);
         let brought = BroughtIn {
@@ -3183,6 +3764,7 @@ impl AppState {
         }
 
         self.project.history.merge(fresh.clone());
+        self.touch_local_copy();
         self.undo.push(before);
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
@@ -3557,14 +4139,14 @@ impl AppState {
                 self.dirty = false;
                 self.push_recent(&written);
                 let first_save = self.file_path.as_ref() != Some(&written);
-                self.file_path = Some(written);
+                self.file_path = Some(written.clone());
                 self.backstage = None;
 
                 // A plan saved somewhere new takes its versions with it: they
                 // are keyed by where the plan lives, and Save As is the plan
                 // moving rather than a different plan.
                 if first_save {
-                    self.restore_link();
+                    self.moved_to(&written);
                 }
                 self.keep_version(aop_core::versions::Taken::Save);
 
@@ -6089,6 +6671,38 @@ fn save_qat(commands: &[QatCommand]) {
     }
 }
 
+/// A name beside `path` that is not taken.
+///
+/// `plan.aprj` becomes `plan (1).aprj`, then `plan (2).aprj`, which is what
+/// every file manager does and therefore what people expect. The number goes
+/// before the extension, not after: `plan.aprj (1)` is not a plan file any
+/// more, and the application would refuse to open it.
+///
+/// Bounded, because a folder containing every name up to the bound is a
+/// stranger situation than one more overwrite prompt, and an unbounded loop
+/// on a filesystem that answers slowly is a hang.
+pub fn free_name_beside(path: &std::path::Path) -> Option<PathBuf> {
+    if !path.exists() {
+        return Some(path.to_path_buf());
+    }
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let stem = path.file_stem()?.to_string_lossy().to_string();
+    let extension = path.extension().map(|e| e.to_string_lossy().to_string());
+
+    for n in 1..=999u32 {
+        let mut name = format!("{stem} ({n})");
+        if let Some(extension) = &extension {
+            name.push('.');
+            name.push_str(extension);
+        }
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// The default folder the Save As and Open panes start in.
 ///
 /// `HOME` is a Unix variable. Windows does not set it and uses `USERPROFILE`,
@@ -7229,6 +7843,143 @@ mod tests {
             script: script.into(),
             summary: summary.into(),
         }
+    }
+
+    // ---- streaming, both ways -------------------------------------------
+
+    #[test]
+    fn an_edit_arms_the_stream_and_lands_in_the_log_first() {
+        // The log is the record and the log is what streams. There is no
+        // quicker path that skips it: an entry nobody wrote down is one a
+        // client that missed the message can never be told about.
+        let mut state = linked();
+        assert!(state.project.history.unsent().is_empty());
+
+        state.append_task("Pour the foundations");
+
+        assert_eq!(state.project.history.unsent().len(), 1, "written down first");
+        assert!(state.stream_due.is_some(), "and waiting to go");
+        // Not yet, because there is no socket. The work simply waits, which is
+        // what a dropped socket looks like too.
+        assert!(!state.stream_due(), "nothing streams without a session");
+    }
+
+    #[test]
+    fn work_the_socket_took_is_marked_as_sent_by_the_id_that_came_back() {
+        // By the local id the server acknowledged rather than by counting: an
+        // answer that came back out of order must not mark work nobody has
+        // seen as sent.
+        use crate::cloud::live::Incoming;
+        let mut state = linked();
+        let first = state.project.history.record(
+            "Ada", "append_task(\"A\");", "Added A", Local::now().naive_local(),
+        );
+        state.streaming = true;
+
+        state.take_live_arrivals(vec![Incoming::Applied {
+            head: 8,
+            applied: vec![(first, 8)],
+            snapshot_wanted: false,
+        }]);
+
+        assert!(state.project.history.unsent().is_empty(), "it went");
+        assert_eq!(state.link.as_ref().map(|link| link.cursor), Some(8));
+        assert!(!state.streaming, "and the socket is free to carry the next batch");
+    }
+
+    #[test]
+    fn a_streamed_push_that_was_beaten_to_it_keeps_its_work_and_offers_it_again() {
+        // Nothing is written on a refusal, so the work is still unsent and
+        // still in the log. What came back is what was missed, and it goes in
+        // the same way a live change does.
+        use crate::cloud::live::Incoming;
+        let mut state = linked();
+        let mine = state.project.history.record(
+            "Ada", "append_task(\"Mine\");", "Added Mine", Local::now().naive_local(),
+        );
+        state.streaming = true;
+
+        state.take_live_arrivals(vec![Incoming::Behind {
+            head: 6,
+            changes: vec![theirs(90, "append_task(\"Theirs\");", "Added Theirs")],
+            more: false,
+        }]);
+
+        assert!(
+            state.project.history.unsent().iter().any(|change| change.id == mine),
+            "a refusal writes nothing, so this is still waiting to go",
+        );
+        assert!(state.stream_due.is_some(), "and is offered again once theirs is in");
+        assert!(!state.streaming);
+        assert!(
+            state.project.tasks.iter().any(|task| task.name == "Theirs"),
+            "their work applied quietly, because it applied cleanly",
+        );
+        assert!(state.dialog.is_none(), "and without a modal in front of somebody typing");
+    }
+
+    #[test]
+    fn a_streamed_push_onto_a_log_this_copy_is_past_is_refused_out_loud() {
+        // Two logs that share numbers but not events. There is no quiet
+        // answer to this one, so live editing stops and the question is put.
+        use crate::cloud::live::Incoming;
+        let mut state = linked();
+        state.take_live_arrivals(vec![Incoming::Ahead { head: 3, cursor: 7 }]);
+        assert!(
+            matches!(state.dialog, Some(Dialog::SyncAhead { head: 3, cursor: 7 })),
+            "got {:?}", state.dialog,
+        );
+    }
+
+    #[test]
+    fn a_rebase_waits_rather_than_moving_the_ground_under_somebody_typing() {
+        // With streaming, being behind is the ordinary state rather than an
+        // event, so a clean rebase applies quietly. The exception is the task
+        // somebody has a cell open on: that one waits until they are done,
+        // and nothing is lost by waiting because the cursor does not move
+        // until it lands.
+        use crate::cloud::live::Incoming;
+        let mut state = linked();
+        state.append_task("Pour the foundations");
+        state.append_task("Cure");
+        state.editing = Some((0, Column::Name));
+        let cursor_was = state.link.as_ref().map(|link| link.cursor);
+
+        state.take_live_arrivals(vec![Incoming::Change {
+            seq: 6,
+            change: theirs(
+                91,
+                "set_field(1, Name, \"Pour the piles\");",
+                "Changed a duration",
+            ),
+        }]);
+
+
+        assert!(!state.held_live.is_empty(), "held while the cell is open");
+        assert_eq!(state.link.as_ref().map(|link| link.cursor), cursor_was,
+                   "and the cursor stays put, so nothing is claimed as read");
+        assert!(!state.stream_due(), "nor is anything of this copy's offered past it");
+
+        // The editor closes, and it goes in exactly as it would have.
+        state.editing = None;
+        assert!(state.held_work_due());
+        state.apply_held_live();
+        assert!(state.held_live.is_empty(), "in it goes");
+    }
+
+    #[test]
+    fn a_dropped_socket_keeps_the_work_it_never_managed_to_send() {
+        // The other half of the recovery story. The catch-up brings in what
+        // was missed; this is what makes sure nothing of this copy's own is
+        // lost while there was nowhere to send it.
+        let mut state = linked();
+        state.append_task("Pour the foundations");
+        state.streaming = true;
+
+        state.stop_live(Some("Live editing stopped.".into()));
+
+        assert_eq!(state.project.history.unsent().len(), 1, "still waiting");
+        assert!(!state.streaming, "and no longer thought to be in flight");
     }
 
     #[test]

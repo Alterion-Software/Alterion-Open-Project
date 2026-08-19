@@ -70,6 +70,62 @@ pub fn sync(mut state: Signal<AppState>) {
     );
 }
 
+/// Ask for what is on the server, see what it would do, and decide.
+///
+/// A pull rather than a sync: nothing here is offered, and that is the
+/// difference. It reuses the push with an empty batch, because an empty push
+/// is already how a client asks "am I still current?", and the answer to a
+/// client that is not carries exactly what it missed. So the preview it opens
+/// is [`Dialog::SyncBehind`], which is the same preview and the same rebase
+/// used everywhere else.
+///
+/// **Why this always shows the preview**, when a rebase that arrives on the
+/// live socket does not: asking for it is asking to see it. Somebody who has
+/// had live editing off, or who has been away, presses this precisely because
+/// they want to know what happened before it lands on their plan. A change
+/// arriving on a socket was not asked for and interrupting typing to announce
+/// it, several times a minute, is worse than not showing it at all.
+pub fn pull(mut state: Signal<AppState>) {
+    let Some((session, offer)) = state.write().start_pull() else {
+        return;
+    };
+    cloud::off_thread(
+        move || cloud::work::sync(session, offer),
+        move |done| match done {
+            Some((session, outcome)) => {
+                let mut writer = state.write();
+                writer.hand_back(session);
+                writer.sync_landed(outcome);
+            }
+            None => state.write().worker_lost("The pull"),
+        },
+    );
+}
+
+/// Give the server the fresh whole plan it asked for.
+///
+/// Housekeeping, so nothing waits on it and nothing is said about it. The
+/// server stores commands and cannot fold its own log into a plan, so it asks
+/// whoever it is talking to; before edits streamed, that ask was answered by
+/// whoever next pressed Sync, and with streaming nobody presses Sync for
+/// hours.
+pub fn send_snapshot(mut state: Signal<AppState>) {
+    let Some((session, server, project, head, plan)) = state.write().start_snapshot() else {
+        return;
+    };
+    cloud::off_thread(
+        move || cloud::work::snapshot(session, server, project, head, plan),
+        move |done| match done {
+            Some((session, _)) => {
+                let mut writer = state.write();
+                writer.working = None;
+                writer.hand_back(session);
+            }
+            None => state.write().worker_lost("Sending a copy of the plan"),
+        },
+    );
+}
+
 /// Ask the server where this plan has got to, rather than assuming.
 pub fn check(mut state: Signal<AppState>) {
     let (server, project) = {
@@ -190,6 +246,15 @@ pub fn live(mut state: Signal<AppState>, on: bool) {
 /// is also why nothing gets here without somebody having read the address on
 /// the dialog first.
 pub fn open_link(mut state: Signal<AppState>, share: cloud::share::Share) {
+    // The copy on this machine first. It carries the plan, the change log and
+    // anything that never reached the server, and the cursor beside it turns
+    // what happened since into a handful of entries rather than a download.
+    // That is what the cursor is for, and it is the difference between
+    // opening instantly and waiting on a whole plan.
+    if state.write().open_local_copy(share.server.clone(), share.project.clone()) {
+        pull(state);
+        return;
+    }
     let Some(session) = state.write().hand_over(Working::Fetching) else {
         return;
     };

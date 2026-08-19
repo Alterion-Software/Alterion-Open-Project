@@ -396,7 +396,7 @@ fn a_client_that_sends_no_pointer_is_still_a_peer() {
     let msg: crate::live::ClientMessage =
         serde_json::from_str(r#"{"type":"presence","row":4}"#).expect("older client must parse");
     match msg {
-        crate::live::ClientMessage::Presence { row, at } => {
+        crate::live::ClientMessage::Presence { row, at, .. } => {
             assert_eq!(row, Some(4));
             assert!(at.is_none(), "no pointer means none, not a default position");
         }
@@ -416,13 +416,17 @@ fn a_pointer_survives_the_round_trip_in_plan_coordinates() {
     .expect("chart pointer");
 
     match table {
-        crate::live::ClientMessage::Presence { at: Some(crate::live::Pointer::Table { row, column }), .. } => {
+        crate::live::ClientMessage::Presence {
+            at: Some(crate::live::Pointer::Table { row, column }), ..
+        } => {
             assert_eq!((row, column), (2, 5));
         }
         _ => panic!("expected a table pointer"),
     }
     match chart {
-        crate::live::ClientMessage::Presence { row, at: Some(crate::live::Pointer::Chart { row: r, minutes }) } => {
+        crate::live::ClientMessage::Presence {
+            row, at: Some(crate::live::Pointer::Chart { row: r, minutes }), ..
+        } => {
             // A pointer with no selection is normal: moving the mouse is not
             // selecting anything.
             assert!(row.is_none());
@@ -441,6 +445,9 @@ fn presence_without_a_pointer_does_not_serialise_the_field() {
         name: "Ada".into(),
         row: Some(1),
         at: None,
+        picture: None,
+        editing: None,
+        draft: None,
     })
     .expect("serialises");
     assert!(!json.contains("\"at\""), "absent pointer must be omitted, got {json}");
@@ -658,5 +665,186 @@ mod sharing {
         assert_eq!(address(""), None);
         // A primary key nobody else should have to pay for.
         assert_eq!(address(&format!("{}@example.com", "a".repeat(300))), None);
+    }
+}
+
+// ── The picture on a presence ────────────────────────────────────────────────
+
+#[test]
+fn a_client_that_sends_no_picture_is_still_a_peer() {
+    // The field was added after the first clients shipped, so an older hello
+    // has to keep working and simply have no face drawn for it.
+    let older: crate::live::ClientMessage =
+        serde_json::from_str(r#"{"type":"hello","after":42,"name":"Grace"}"#)
+            .expect("an older hello must parse");
+    match older {
+        crate::live::ClientMessage::Hello { after, name, picture } => {
+            assert_eq!(after, Some(42));
+            assert_eq!(name.as_deref(), Some("Grace"));
+            assert!(picture.is_none(), "no picture means none, not a placeholder");
+        }
+        _ => panic!("wrong variant"),
+    }
+
+    let newer: crate::live::ClientMessage = serde_json::from_str(
+        r#"{"type":"hello","after":42,"name":"Grace","picture":"https://idp.example.test/g.png"}"#,
+    )
+    .expect("a newer hello must parse");
+    match newer {
+        crate::live::ClientMessage::Hello { picture, .. } => {
+            assert_eq!(picture.as_deref(), Some("https://idp.example.test/g.png"));
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn a_presence_with_no_picture_does_not_serialise_the_field() {
+    // Most accounts have no picture, and presence is the most frequent
+    // message on the socket: an absent one must not cost bytes.
+    let json = serde_json::to_string(&crate::live::Presence {
+        subject: "s".into(),
+        name: "Ada".into(),
+        row: Some(1),
+        at: None,
+        picture: None,
+        editing: None,
+        draft: None,
+    })
+    .expect("serialises");
+    assert!(!json.contains("picture"), "absent picture must be omitted, got {json}");
+    // The cell and the draft are the exception, and deliberately so: they are
+    // stated whole every time, because a copy receiving one cannot tell an
+    // absent field from a cell that has just been closed.
+    assert!(json.contains("\"editing\":null"), "the cell is stated whole, got {json}");
+    assert!(json.contains("\"draft\":null"), "and so is the draft, got {json}");
+}
+
+#[test]
+fn a_picture_address_is_bounded_before_it_is_relayed() {
+    // Whatever one client sends here is echoed to everybody in the room, so
+    // its size is everybody's problem. What the URL is allowed to *be* is
+    // decided by the copy that would load it, not guessed at here.
+    let long = "https://idp.example.test/".to_string() + &"a".repeat(9_000);
+    let kept = crate::live::picture_worth_keeping(Some(long)).expect("kept, but shorter");
+    assert!(kept.len() <= 2048);
+    assert_eq!(crate::live::picture_worth_keeping(Some("   ".into())), None);
+    assert_eq!(crate::live::picture_worth_keeping(None), None);
+}
+
+// ── The ephemeral channel ────────────────────────────────────────────────────
+
+#[test]
+fn an_absent_cell_means_unchanged_and_a_null_one_means_closed() {
+    // These are opposite instructions and plain serde collapses them into one
+    // answer. A pointer move would otherwise close everybody else's view of
+    // the cell somebody has open.
+    let moved: crate::live::ClientMessage = serde_json::from_str(
+        r#"{"type":"presence","at":{"pane":"table","row":2,"column":1}}"#,
+    )
+    .expect("a pointer move");
+    let closed: crate::live::ClientMessage =
+        serde_json::from_str(r#"{"type":"presence","editing":null,"draft":null}"#)
+            .expect("an edit being abandoned");
+    let opened: crate::live::ClientMessage = serde_json::from_str(
+        r#"{"type":"presence","editing":{"row":4,"column":1},"draft":"Pour the "}"#,
+    )
+    .expect("an edit in progress");
+
+    match moved {
+        crate::live::ClientMessage::Presence { editing, draft, .. } => {
+            assert!(editing.is_none(), "absent is nothing to say");
+            assert!(draft.is_none());
+        }
+        _ => panic!("wrong variant"),
+    }
+    match closed {
+        crate::live::ClientMessage::Presence { editing, draft, .. } => {
+            assert_eq!(editing, Some(None), "null is a cell being closed");
+            assert_eq!(draft, Some(None));
+        }
+        _ => panic!("wrong variant"),
+    }
+    match opened {
+        crate::live::ClientMessage::Presence { editing, draft, .. } => {
+            assert_eq!(editing, Some(Some(crate::live::Cell { row: 4, column: 1 })));
+            assert_eq!(draft.flatten().as_deref(), Some("Pour the "));
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+// ── Changes over the socket ──────────────────────────────────────────────────
+
+#[test]
+fn work_offered_over_the_socket_carries_the_same_cursor_a_push_does() {
+    // The socket is a second way to reach the push, not a second protocol, so
+    // the message it carries is the same question: here is work made after
+    // cursor N.
+    let msg: crate::live::ClientMessage = serde_json::from_str(
+        r#"{"type":"changes","after":42,"changes":[
+            {"id":7,"at":"2026-08-18T09:00:00","author":"Grace",
+             "script":"indent();","summary":"Indented a task"}]}"#,
+    )
+    .expect("a streamed batch");
+    match msg {
+        crate::live::ClientMessage::Changes { after, changes } => {
+            assert_eq!(after, Some(42));
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].id, 7);
+        }
+        _ => panic!("wrong variant"),
+    }
+
+    // And a client that has never synced says so the same way a push does.
+    let first: crate::live::ClientMessage =
+        serde_json::from_str(r#"{"type":"changes","changes":[]}"#).expect("an empty first offer");
+    match first {
+        crate::live::ClientMessage::Changes { after, changes } => {
+            assert!(after.is_none(), "no cursor is how a client says it has never synced");
+            assert!(changes.is_empty());
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn the_socket_says_which_seq_each_change_was_given() {
+    // The client numbers its own work and cannot know what the log called it,
+    // so the answer has to name both or nothing can be marked as sent.
+    let message = crate::live::ServerMessage::Applied {
+        head: 45,
+        applied: vec![
+            crate::sync::Assigned { local_id: 7, seq: 44 },
+            crate::sync::Assigned { local_id: 8, seq: 45 },
+        ],
+        snapshot_wanted: false,
+    };
+    let text = message.encode().expect("encodes");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+    assert_eq!(value["type"], "applied");
+    assert_eq!(value["head"], 45);
+    assert_eq!(value["applied"][0]["local_id"], 7);
+    assert_eq!(value["applied"][0]["seq"], 44);
+}
+
+#[test]
+fn a_streamed_refusal_says_the_same_four_things_a_rest_refusal_does() {
+    // The client already knows how to answer behind, gap and ahead, because
+    // the REST push taught it. The socket must not invent new words for them.
+    let behind = crate::live::ServerMessage::Behind {
+        head: 45,
+        after: 42,
+        changes: Vec::new(),
+        more: false,
+    };
+    let ahead = crate::live::ServerMessage::Ahead { head: 12, cursor: 60 };
+    let gap = crate::live::ServerMessage::Gap { head: 45, oldest: Some(38) };
+
+    for (message, expected) in [(behind, "behind"), (ahead, "ahead"), (gap, "gap")] {
+        let text = message.encode().expect("encodes");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["type"], expected);
+        assert!(value["head"].as_i64().is_some(), "every refusal names the head");
     }
 }
