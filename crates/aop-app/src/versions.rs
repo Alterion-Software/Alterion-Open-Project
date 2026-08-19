@@ -22,10 +22,7 @@ use crate::state::{AppState, CheckOutcome, Dialog};
 
 /// Where the versions live.
 fn directory() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("alterion-open-project").join("versions"))
+    crate::settings::config_root().map(|dir| dir.join("versions"))
 }
 
 /// The file one plan's versions are kept in.

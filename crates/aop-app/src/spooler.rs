@@ -18,6 +18,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use crate::quiet::Quiet;
 
 /// A print queue, as CUPS reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +78,7 @@ pub fn printers() -> Result<Vec<Printer>, NoPrinters> {
 /// is what the destination list wants to show.
 #[cfg(target_os = "windows")]
 fn printers_windows() -> Result<Vec<Printer>, NoPrinters> {
-    let listing = Command::new("powershell")
+    let listing = Command::new("powershell").quiet()
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -88,7 +89,7 @@ fn printers_windows() -> Result<Vec<Printer>, NoPrinters> {
         .map_err(|_| NoPrinters::NotInstalled)?;
 
     let text = String::from_utf8_lossy(&listing.stdout);
-    let default = Command::new("powershell")
+    let default = Command::new("powershell").quiet()
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -118,7 +119,7 @@ fn printers_windows() -> Result<Vec<Printer>, NoPrinters> {
 
 #[cfg(not(target_os = "windows"))]
 fn printers_cups() -> Result<Vec<Printer>, NoPrinters> {
-    let listing = Command::new("lpstat").arg("-p").arg("-d").output();
+    let listing = Command::new("lpstat").quiet().arg("-p").arg("-d").output();
 
     let output = match listing {
         Ok(output) => output,
@@ -222,7 +223,7 @@ fn spool_windows(
 
     let target = path.display().to_string();
     for _ in 0..copies.max(1) {
-        let sent = Command::new("powershell")
+        let sent = Command::new("powershell").quiet()
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -256,7 +257,7 @@ fn spool_cups(
     document: &[u8],
     copies: u16,
 ) -> Result<String, String> {
-    let mut child = Command::new("lp")
+    let mut child = Command::new("lp").quiet()
         .arg("-d")
         .arg(printer)
         .arg("-n")

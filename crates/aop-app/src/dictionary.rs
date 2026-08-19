@@ -17,10 +17,8 @@ use aop_core::spelling::Dictionary;
 
 /// Where the assembled copy is kept.
 fn cache_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("alterion-open-project").join("dictionary.txt"))
+    let base = crate::settings::config_root()?;
+    Some(base.join("dictionary.txt"))
 }
 
 /// Where the user's own additions live, kept apart from the assembled copy so

@@ -6012,10 +6012,7 @@ pub fn format_date_long(value: NaiveDateTime) -> String {
 // ---- recent file list ---------------------------------------------------
 
 fn recent_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("alterion-open-project").join("recent.json"))
+    crate::settings::config_root().map(|dir| dir.join("recent.json"))
 }
 
 fn load_recent() -> Vec<RecentEntry> {

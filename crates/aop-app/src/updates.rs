@@ -104,6 +104,7 @@ use sha2::{Digest, Sha256};
 
 use crate::state::AppState;
 use crate::welcome::RUNNING;
+use crate::quiet::Quiet;
 
 /// The project on GitLab, url encoded, and its mirror on GitHub.
 ///
@@ -277,7 +278,7 @@ fn in_windows_system_location(path: &str, roots: &[String]) -> bool {
 fn package_manager_for(path: &Path) -> Option<Install> {
     use std::process::{Command, Stdio};
 
-    let owned = Command::new("pacman")
+    let owned = Command::new("pacman").quiet()
         .arg("-Qo")
         .arg(path)
         .stdin(Stdio::null())
@@ -1091,11 +1092,8 @@ pub fn run_installer(path: &Path, want: &str) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
+        use crate::quiet::{DETACHED_PROCESS, CREATE_NO_WINDOW};
         use std::os::windows::process::CommandExt;
-
-        /// Not attached to this process's console, so nothing about it ends
-        /// when this process does.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
 
         std::process::Command::new(path)
             .arg("/S")
@@ -1104,7 +1102,10 @@ pub fn run_installer(path: &Path, want: &str) -> Result<(), String> {
             // current, and renaming files in there is how the installer gets
             // past a copy of this application that has not quite gone yet.
             .current_dir(std::env::temp_dir())
-            .creation_flags(DETACHED_PROCESS)
+            // Detached so it outlives this process, which is the whole
+            // mechanism, and windowless so the update does not end with a
+            // console flashing up as the application closes.
+            .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

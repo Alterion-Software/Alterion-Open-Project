@@ -37,10 +37,7 @@ pub struct Link {
 
 /// Where the links live: beside the settings, not beside the user's plans.
 fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("alterion-open-project").join("collaborate.cfg"))
+    crate::settings::config_root().map(|dir| dir.join("collaborate.cfg"))
 }
 
 /// Turn the stored lines into pairs, skipping anything that no longer parses.

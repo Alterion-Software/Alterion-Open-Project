@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::cloud::SignInError;
+use crate::quiet::Quiet;
 
 /// What is asked for. Only what the application actually reads: the subject to
 /// tell accounts apart, and a name and address to show whose account it is.
@@ -572,6 +573,7 @@ pub fn open_in_browser(url: &str) -> Result<(), SignInError> {
     #[cfg(target_os = "linux")]
     let mut command = {
         let mut command = Command::new("xdg-open");
+        command.quiet();
         command.arg(url);
         command
     };
@@ -579,6 +581,7 @@ pub fn open_in_browser(url: &str) -> Result<(), SignInError> {
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new("open");
+        command.quiet();
         command.arg(url);
         command
     };
@@ -589,6 +592,7 @@ pub fn open_in_browser(url: &str) -> Result<(), SignInError> {
         // the ampersands between the query parameters as its own punctuation
         // and open the browser at a truncated address.
         let mut command = Command::new("rundll32.exe");
+        command.quiet();
         command.arg("url.dll,FileProtocolHandler").arg(url);
         command
     };
@@ -596,6 +600,7 @@ pub fn open_in_browser(url: &str) -> Result<(), SignInError> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let mut command = {
         let mut command = Command::new("xdg-open");
+        command.quiet();
         command.arg(url);
         command
     };

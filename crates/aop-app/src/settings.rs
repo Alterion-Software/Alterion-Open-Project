@@ -151,12 +151,41 @@ impl Default for Settings {
     }
 }
 
-/// Where the file lives.
-pub fn path() -> Option<PathBuf> {
+/// The folder this application keeps everything of its own in.
+///
+/// One answer, because there were six and every one of them was Unix only:
+/// `XDG_CONFIG_HOME`, or `HOME/.config`. Windows sets neither, so all six
+/// returned `None` there and the settings, the recent list, the added
+/// dictionary words, the crash recovery snapshots and the port file the
+/// single instance check depends on were silently never written. Nothing
+/// failed; everything simply forgot itself on every launch.
+///
+/// `APPDATA` is where Windows keeps exactly this kind of file, and it roams
+/// with the account. The Unix answer is unchanged, so nobody's existing
+/// settings move.
+pub fn config_root() -> Option<PathBuf> {
+    if cfg!(windows) {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let appdata = PathBuf::from(appdata);
+            if !appdata.as_os_str().is_empty() {
+                return Some(appdata.join("Alterion Open Project"));
+            }
+        }
+        // Last resort, and better than forgetting everything: a folder beside
+        // the profile rather than none at all.
+        return crate::state::home_dir()
+            .map(|home| home.join("AppData").join("Roaming").join("Alterion Open Project"));
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("alterion-open-project").join("config.cfg"))
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| crate::state::home_dir().map(|home| home.join(".config")))?;
+    Some(base.join("alterion-open-project"))
+}
+
+/// Where the file lives.
+pub fn path() -> Option<PathBuf> {
+    config_root().map(|dir| dir.join("config.cfg"))
 }
 
 impl Settings {

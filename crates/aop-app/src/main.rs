@@ -23,6 +23,7 @@ mod icons;
 mod macros;
 mod popups;
 mod preview;
+mod quiet;
 mod spooler;
 mod settings;
 mod ribbon;

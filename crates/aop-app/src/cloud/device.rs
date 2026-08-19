@@ -177,7 +177,8 @@ fn read_file(path: &str) -> Option<String> {
 /// Run a command and take its output, if it runs at all.
 #[cfg(not(target_os = "linux"))]
 fn run(program: &str, arguments: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program)
+    use crate::quiet::Quiet;
+    let output = std::process::Command::new(program).quiet()
         .args(arguments)
         .stderr(std::process::Stdio::null())
         .output()

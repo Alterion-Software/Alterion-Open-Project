@@ -70,11 +70,7 @@ static ARRIVALS: OnceLock<Inbox> = OnceLock::new();
 
 /// Where the port of the copy in charge is written down.
 fn port_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
-    Some(base.join("alterion-open-project").join("running.port"))
+    crate::settings::config_root().map(|dir| dir.join("running.port"))
 }
 
 /// What a launch should do next.

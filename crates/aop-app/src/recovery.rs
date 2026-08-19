@@ -26,10 +26,8 @@ pub const INTERVAL_SECONDS: u64 = 30;
 /// Where snapshots live: beside the other application state, not beside the
 /// user's plans, so a recovery file never turns up in their documents.
 fn directory() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("alterion-open-project").join("recovery"))
+    let base = crate::settings::config_root()?;
+    Some(base.join("recovery"))
 }
 
 /// This session's snapshot, named for the process that owns it.

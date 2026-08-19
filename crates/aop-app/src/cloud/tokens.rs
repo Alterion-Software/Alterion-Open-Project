@@ -427,11 +427,7 @@ pub trait TokenStore: Send + Sync {
 
 /// The directory the application keeps its own things in.
 fn config_directory() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
-    Some(base.join("alterion-open-project"))
+    crate::settings::config_root()
 }
 
 /// Where the session file lives on the platforms that use one.
@@ -543,7 +539,8 @@ pub struct KeychainStore;
 #[cfg(target_os = "macos")]
 impl KeychainStore {
     fn run(arguments: &[&str]) -> Result<Option<String>, String> {
-        let output = std::process::Command::new("security")
+        use crate::quiet::Quiet;
+        let output = std::process::Command::new("security").quiet()
             .args(arguments)
             .output()
             .map_err(|error| format!("the security tool could not be run ({error})"))?;
@@ -738,7 +735,8 @@ impl RegistryStore {
     const VALUE: &'static str = "CloudSession";
 
     fn run(arguments: &[&str]) -> Option<String> {
-        let output = std::process::Command::new("reg.exe")
+        use crate::quiet::Quiet;
+        let output = std::process::Command::new("reg.exe").quiet()
             .args(arguments)
             .stderr(std::process::Stdio::null())
             .output()
