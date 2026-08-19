@@ -2264,17 +2264,6 @@ button { font: inherit; color: inherit; }
 .print-go[disabled] { opacity: 0.45; cursor: default; }
 
 /* Paging through the preview, the way Project's print view does. */
-.print-pager {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 8px 0 2px;
-}
-.print-pager .btn { min-width: 30px; padding: 4px 8px; }
-.print-pager .btn[disabled] { opacity: 0.35; cursor: default; }
-.print-pager-at { color: var(--ink-soft); font-size: 11px; margin: 0 10px; }
-
 .print-range { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .print-range label { color: var(--ink-soft); font-size: 11px; flex: none; }
 .print-range input {

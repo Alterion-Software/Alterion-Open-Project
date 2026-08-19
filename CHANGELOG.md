@@ -4,6 +4,13 @@ Notable changes, newest first. Dates are the day a version was tagged.
 
 ## 1.0.5-beta
 
+**Print preview shows the whole document.** It paged one sheet at a time
+behind four buttons, which meant scrolling a printed document was something you
+could only do after saving it. It is now the document, scrolled. It is also the
+same bytes that get printed rather than a second render of a one page range, so
+the two cannot disagree, and turning a page no longer costs a full render of the
+plan.
+
 **Live collaborate actually carries what you do.** Everything in 1.0.4 was
 correct about what to send and when; the socket could not be written to
 between frames from the server.
