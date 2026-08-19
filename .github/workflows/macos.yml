@@ -1,0 +1,64 @@
+# Build the macOS disk image. Run by hand from the Actions tab.
+#
+# This exists because Apple's SDK may not be redistributed, so there is no
+# cross-compile from Linux and no way to produce a .dmg on the machine the rest
+# of the release is built on. A hosted Mac runner is the only route that does
+# not need somebody to own a Mac and remember to use it.
+#
+# Deliberately manual: a release is a decision, and a tag push should not start
+# spending build minutes or attaching files to a release on its own.
+name: macOS installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Attach the .dmg to this release (leave blank to just keep the artifact)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write        # only used when release_tag is filled in
+
+jobs:
+  dmg:
+    # Apple silicon runner. The build is universal either way (the script joins
+    # both architectures with lipo), so this only affects build speed.
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      # Two architectures means two full builds, so the cache earns its keep.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+
+      - name: Build the disk image
+        run: packaging/macos/build-dmg.sh
+
+      - name: Name what was built
+        id: found
+        run: |
+          dmg="$(ls packaging/macos/dist/*.dmg | head -1)"
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$dmg")" >> "$GITHUB_OUTPUT"
+          # Printed so the checksum is in the log even if nothing is attached.
+          shasum -a 256 "$dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.found.outputs.name }}
+          path: ${{ steps.found.outputs.dmg }}
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.found.outputs.dmg }}" --clobber

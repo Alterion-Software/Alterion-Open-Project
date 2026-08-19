@@ -28,6 +28,19 @@
     </dict>
   </array>
 
+  <!-- A shared plan is handed around as an aop:// link, and clicking one has
+       to reach the application rather than a browser. Declaring the scheme is
+       what makes the system route it here. -->
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>          <string>Alterion Open Project link</string>
+      <key>CFBundleTypeRole</key>         <string>Editor</string>
+      <key>CFBundleURLSchemes</key>
+      <array><string>aop</string></array>
+    </dict>
+  </array>
+
   <!-- Declaring the type, rather than only claiming to open it, is what lets
        the Finder show the right icon and description for a .aprj file. -->
   <key>UTExportedTypeDeclarations</key>

@@ -952,6 +952,9 @@ button { font: inherit; color: inherit; }
 }
 
 .dlg textarea { height: auto; }
+/* A value that is shown rather than set here. Still legible: it is being read,
+   which is the whole reason it is on the page. */
+.bs-input:disabled { background: var(--surface-2); color: var(--ink-soft); }
 .bs-input::placeholder, .dlg input::placeholder { color: var(--ink-faint); }
 .bs-input:focus, .dlg input:focus, .dlg select:focus, .dlg textarea:focus {
   outline: none;
@@ -1754,6 +1757,10 @@ button { font: inherit; color: inherit; }
   background: var(--surface);
   overflow: auto;
   min-width: 0;
+  /* So other people's pointers can be placed in the table's own coordinates.
+     They are children of this box, which means the pane scrolls them along
+     with the rows they are on and clips the ones that have scrolled off. */
+  position: relative;
 }
 
 /* The table pane is sized to its columns exactly. A vertical scrollbar here
@@ -1897,7 +1904,18 @@ button { font: inherit; color: inherit; }
 .dlg .picker .ctxheader { display: none; }
 .dlg .picker .pred-list { max-height: 300px; }
 
-.picker-cell { display: flex; align-items: center; width: 100%; height: 100%; }
+/* Lifted over the picker's scrim, which covers the whole window while the list
+   is open. The box and the list are one edit, so a click meant for the box has
+   to reach it: without this, moving the caret, or pressing the caret button to
+   bring the list back, lands on the scrim and abandons the edit instead. */
+.picker-cell {
+  position: relative;
+  z-index: 82;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+}
 .picker-cell .cell-input { flex: 1; min-width: 0; }
 /* The cell looks like a plain text box otherwise, and nothing says a list is
    behind it. */
@@ -1913,6 +1931,63 @@ button { font: inherit; color: inherit; }
   background: transparent;
 }
 .picker-caret:hover { color: var(--accent-bright); }
+
+/* ---------- other people's pointers ---------- */
+
+/* Never in the way. A pointer sits over cells that are clicked, typed in and
+   dragged, so the whole layer is transparent to the mouse: nothing under one
+   of these ever becomes unreachable because somebody else is looking at it. */
+.cursors {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* Over the rows and the bars, under the sticky headers, which have to stay
+     readable and are not part of the plan anybody is pointing at. */
+  z-index: 2;
+}
+
+/* The tip is the point. Everything else hangs off it, so the arrow's own
+   corner is what lands on the coordinate. */
+.cursor { position: absolute; }
+
+.cursor-arrow { display: block; }
+
+.cursor-label {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px 2px 2px;
+  border-radius: 999px;
+  /* White on the peer's own colour, which is chosen light enough to carry it
+     in either theme. */
+  color: #0d1717;
+  font-size: 10.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  box-shadow: var(--shadow);
+}
+
+.cursor-name { font-weight: 600; max-width: 132px; overflow: hidden; text-overflow: ellipsis; }
+
+.cursor-face {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 999px;
+  object-fit: cover;
+  background: var(--surface);
+}
+
+/* The letters stand in for a face. Centred by grid rather than by line height
+   so a pair of capitals sits properly in a circle this small. */
+.cursor-face.initials {
+  display: grid;
+  place-items: center;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
 
 /* ---------- critical path report ---------- */
 
@@ -2796,6 +2871,12 @@ button { font: inherit; color: inherit; }
 
 .ctx-scrim { position: fixed; inset: 0; z-index: 80; }
 
+/* A panel that places itself, for the pickers, which have no stack to be
+   placed by. Without it a panel lays out in the flow beneath a window that is
+   already the full height, so it is never seen, while the scrim beside it
+   still covers everything and swallows the clicks meant for the cell. */
+.ctx-anchored { position: fixed; z-index: 81; }
+
 .ctxmenu {
   /* Sits inside the stack, so it is the menu that scrolls when the pair is
      taller than the room available, never the toolbar above it. */
@@ -3006,6 +3087,407 @@ button { font: inherit; color: inherit; }
   line-height: 1.7;
   white-space: pre-line;
 }
+
+/* ---------- history and sync ---------- */
+
+.sync-view {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: var(--surface);
+}
+
+/* The same shell the spelling panel uses, a little wider: these rows are
+   sentences about what a server said, not single words. */
+.sync-side { width: 560px; }
+.sync-side-count { margin-left: auto; margin-right: 10px; color: var(--ink-faint); font-size: 11px; }
+
+.sync-panel {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-3);
+  padding: 12px 14px 14px;
+}
+
+/* A label and an answer, rather than a table: the answers are sentences of
+   very different lengths and a column would set itself by the longest. */
+.sync-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 12px;
+}
+.sync-row:last-of-type { border-bottom: none; }
+.sync-key { width: 168px; flex: none; color: var(--ink-soft); }
+.sync-value { flex: 1; color: var(--ink); line-height: 1.55; }
+.sync-value.mono { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+.sync-value.good { color: var(--accent-bright); }
+.sync-value.warn { color: var(--warn); }
+.sync-value.bad { color: var(--danger); }
+
+.sync-actions { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+/* Why the button beside it is disabled. Beside rather than in a tooltip: a
+   greyed control nobody can hover is a control nobody can ask about. */
+.sync-why { color: var(--ink-soft); font-size: 11px; line-height: 1.5; }
+
+.ver-row { cursor: default; }
+.ver-row.selected td { background: var(--selection); }
+.ver-why { color: var(--ink); }
+.ver-note { color: var(--ink-faint); font-size: 11px; }
+
+.ver-diff {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-line);
+  border-radius: 6px;
+  background: var(--accent-dim);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.ver-diff-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--accent-bright);
+  margin-bottom: 6px;
+}
+.ver-diff button { margin-top: 10px; }
+
+/* ---------- the sync dialogs ---------- */
+
+/* Their work, filed under what it is about. Enough to recognise the plan in,
+   which is what the question needs; the sentence above says how big it is. */
+.diff-list {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-3);
+  padding: 4px 0;
+}
+.diff-group { padding: 6px 12px; border-bottom: 1px solid var(--line-soft); }
+.diff-group:last-child { border-bottom: none; }
+.diff-subject { font-size: 12px; color: var(--ink); margin-bottom: 3px; }
+.diff-line { font-size: 11.5px; color: var(--ink-soft); padding-left: 12px; line-height: 1.6; }
+
+.sync-drift {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-top: 12px;
+  padding: 9px 11px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  background: var(--danger-bg);
+  color: var(--ink);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+.sync-drift > span:first-child { color: var(--danger); flex: none; }
+
+/* ---------- the health check ---------- */
+
+.health-list { margin-top: 12px; display: flex; flex-direction: column; gap: 2px; }
+.health-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.health-row:last-child { border-bottom: none; }
+.health-badge {
+  flex: none;
+  width: 84px;
+  text-align: center;
+  padding: 2px 0;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 10.5px;
+  letter-spacing: 0.3px;
+}
+.health-badge.good { color: var(--accent-bright); border-color: var(--accent-line); background: var(--accent-dim); }
+.health-badge.warn { color: var(--warn); border-color: var(--warn); }
+.health-badge.bad { color: var(--danger); border-color: var(--danger); background: var(--danger-bg); }
+/* Not checked is its own thing rather than a pale pass: a question that was
+   not asked has not been answered. */
+.health-badge.idle { color: var(--ink-faint); }
+.health-text { flex: 1; min-width: 0; }
+.health-asked { font-size: 12px; color: var(--ink); }
+.health-detail { font-size: 11.5px; color: var(--ink-soft); line-height: 1.6; margin-top: 2px; }
+
+/* ---------- gated ribbon commands ---------- */
+
+/* Why the buttons beside it are grey. In the group rather than in a tooltip,
+   because a disabled button is one nobody can hover to find out. */
+.rwhy {
+  max-width: 176px;
+  align-self: center;
+  padding: 0 6px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--ink-faint);
+}
+
+/* ---------- collaborate options ---------- */
+
+.opt-actions { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; flex-wrap: wrap; }
+.opt-why { color: var(--ink-soft); font-size: 11px; line-height: 1.5; flex: 1; min-width: 200px; }
+
+/* A line that qualifies the control above it. Quieter than .opt-note, which
+   is a box and pulls the eye: these are things to notice while reading past,
+   not things to stop at. */
+.opt-aside {
+  color: var(--ink-soft);
+  font-size: 11px;
+  line-height: 1.55;
+  margin: -4px 0 12px 226px;
+  max-width: 520px;
+}
+
+/* ---------- the account card ---------- */
+
+/* Who is signed in, as one object rather than a stack of sentences. The
+   avatar, the name and the address are what somebody checks; the buttons sit
+   at the far end so the card reads left to right as "this is you, and here is
+   what you can do about it". */
+.acct-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  margin-bottom: 12px;
+}
+
+.acct-avatar {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-line);
+  color: var(--accent-bright);
+}
+
+/* Signed out there is nobody to draw, so the circle is plainly empty rather
+   than a face-shaped gap waiting to be filled. */
+.acct-avatar.nobody { background: var(--surface-3); border-color: var(--line); color: var(--ink-faint); }
+
+.acct-face { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* Sized and spaced like a monogram, not like text that failed to load. */
+.acct-initials {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  line-height: 1;
+}
+
+.acct-who { flex: 1; min-width: 0; }
+.acct-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acct-email {
+  font-size: 11.5px;
+  color: var(--ink-soft);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acct-actions { flex: none; display: flex; align-items: center; gap: 8px; }
+
+/* Facts that are worth keeping and not worth reading twice. */
+.acct-details { margin: 0 0 14px; }
+.acct-details > summary {
+  cursor: default;
+  font-size: 11.5px;
+  color: var(--ink-soft);
+  padding: 3px 0;
+  list-style: none;
+}
+.acct-details > summary::-webkit-details-marker { display: none; }
+.acct-details > summary::before { content: "\25b8 "; color: var(--ink-faint); }
+.acct-details[open] > summary::before { content: "\25be "; }
+.acct-details > summary:hover { color: var(--ink); }
+.acct-details p {
+  margin: 6px 0 0 14px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--ink-faint);
+  max-width: 560px;
+}
+
+/* ---------- the licence, the notes and the ask ---------- */
+
+/* Over the splash as well, and with no click-through: on a first run the
+   licence is the whole window until it has been answered. */
+.welcome-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  background: rgba(4, 8, 8, 0.86);
+  display: grid;
+  place-items: center;
+  padding: 32px;
+}
+
+.welcome {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  box-shadow: var(--shadow);
+  width: min(760px, 100%);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.welcome-head {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 22px 26px 18px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.welcome-mark { flex: none; }
+.welcome-heading { min-width: 0; }
+.welcome-title { font-size: 17px; font-weight: 600; color: var(--ink); }
+.welcome-sub { font-size: 12.5px; color: var(--ink-soft); margin-top: 4px; line-height: 1.5; }
+
+.welcome-body { padding: 20px 26px; overflow-y: auto; }
+
+.welcome-lead {
+  margin: 0 0 16px;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--ink-soft);
+}
+
+.welcome-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 26px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.welcome-foot .grow { flex: 1; }
+.welcome-note { font-size: 11px; color: var(--ink-faint); }
+
+/* The licence verbatim, so its own line breaks are kept and it can be
+   selected and copied like the text file it is. */
+.licence-text {
+  margin: 0;
+  padding: 16px 18px;
+  max-height: 46vh;
+  overflow-y: auto;
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.notes { font-size: 12.5px; line-height: 1.65; }
+.notes-head {
+  margin: 18px 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.3px;
+}
+.notes-head:first-child { margin-top: 0; }
+.notes-text { margin: 0 0 10px; color: var(--ink-soft); }
+.notes-bullet {
+  display: flex;
+  gap: 9px;
+  margin-bottom: 7px;
+  color: var(--ink-soft);
+}
+.notes-bullet.nested { padding-left: 20px; }
+.notes-bullet strong { color: var(--ink); font-weight: 600; }
+.notes-dot { flex: none; color: var(--accent); }
+
+.give {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
+  background: var(--surface-3);
+}
+
+.give-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.give-note { margin: 7px 0 12px; font-size: 11.5px; color: var(--ink-soft); line-height: 1.55; }
+
+.give-details { display: flex; flex-direction: column; gap: 2px; }
+
+.give-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 12px;
+}
+
+.give-row:last-child { border-bottom: none; }
+.give-row .k { flex: none; width: 130px; color: var(--ink-soft); }
+.give-row .v {
+  flex: 1;
+  font-family: var(--mono);
+  color: var(--ink);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* The About page's row of things to open. */
+.about-actions { display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; }
+.about-actions .about-attr-btn { margin: 24px 0 0; }
+
+/* A new version, said quietly and out of the way. */
+.chip.link {
+  border: 0;
+  background: transparent;
+  color: var(--accent-bright);
+  font: inherit;
+  cursor: default;
+  padding: 0;
+}
+.chip.link:hover { text-decoration: underline; }
 "##;
 
 /// The light palette, as rules that can stand alone or sit inside a query.
@@ -3152,6 +3634,62 @@ mod tests {
     fn every_choice_survives_a_round_trip_through_its_label() {
         for choice in ThemeChoice::ORDER {
             assert_eq!(ThemeChoice::from_label(choice.label()), choice);
+        }
+    }
+
+    /// The rule for one class, from the opening brace to the closing one.
+    ///
+    /// Crude on purpose: the sheet is a string constant with no nesting, so a
+    /// rule runs from its selector to the next `}` and nothing has to parse
+    /// CSS to find it.
+    fn rule_for(class: &str) -> Option<&'static str> {
+        let opened = CSS.find(&format!(".{class} {{"))?;
+        let rest = &CSS[opened..];
+        let closed = rest.find('}')?;
+        Some(&rest[..closed])
+    }
+
+    /// Whether any of a class list is positioned the way it needs to be.
+    fn is_placed(classes: &str, how: &str) -> bool {
+        classes
+            .split_whitespace()
+            .filter_map(rule_for)
+            .any(|rule| rule.contains(how))
+    }
+
+    /// Every panel the code places by writing coordinates into its style has
+    /// to be taken out of the flow by the sheet, or the coordinates mean
+    /// nothing.
+    ///
+    /// This is not hypothetical. `.ctxmenu` used to position itself, and when
+    /// that moved to the `.ctx-stack` a context menu shares with its mini
+    /// toolbar, the pickers kept writing `left` and `top` onto a panel that no
+    /// longer answered to them. The panel laid out in the flow underneath a
+    /// window that is already the full height and was never seen again, while
+    /// its scrim went on covering the window and swallowing the clicks meant
+    /// for the cell underneath: both ways into a Predecessors or Resources
+    /// cell dead, and nothing on screen to say why.
+    #[test]
+    fn a_panel_placed_by_hand_is_taken_out_of_the_flow() {
+        for (classes, how) in [
+            // Against the window: the predecessor and resource pickers, a
+            // context menu with its mini toolbar, and the lists a dropdown
+            // drops. None of these has a positioned ancestor to hang from.
+            (crate::popups::ANCHORED_CLASS, "position: fixed"),
+            ("ctx-stack", "position: fixed"),
+            ("dd-list", "position: fixed"),
+            // Against a pane instead, which is the whole point: a peer's
+            // pointer is written in that pane's own scrolling coordinates, so
+            // it has to be absolute inside it rather than fixed to the window.
+            ("cursor", "position: absolute"),
+            ("cursors", "position: absolute"),
+            ("grid-pane", "position: relative"),
+        ] {
+            assert!(
+                is_placed(classes, how),
+                "\"{classes}\" is placed by hand, so the sheet has to give one \
+                 of its classes {how}"
+            );
         }
     }
 }

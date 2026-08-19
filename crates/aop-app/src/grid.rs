@@ -223,6 +223,11 @@ pub fn TaskGrid() -> Element {
     // Which column is being resized, where the drag started and its width then.
     let mut resizing = use_signal(|| None::<(usize, f64, f64)>);
 
+    // Where this planner's pointer is, for the others in a live session. Kept
+    // out of the plan's state so that moving a mouse across the table does not
+    // redraw it; the live timer picks it up a few times a second.
+    let mut pointing = use_context::<crate::state::Pointing>().0;
+
     // Only the rows inside the scrolled viewport are drawn; the rest are stood
     // in for by a spacer, so the pane still scrolls its full height.
     let mut scroll = use_signal(PaneScroll::default);
@@ -395,6 +400,16 @@ pub fn TaskGrid() -> Element {
                                             // on a table row, so reordering runs on plain
                                             // pointer events instead.
                                             onmousemove: move |event| {
+                                                // The row is the event's own
+                                                // element, so its coordinates
+                                                // are already the table's: no
+                                                // rectangle to measure and no
+                                                // scroll offset to subtract.
+                                                let along = event.element_coordinates().x;
+                                                let at = state.peek().table_pointer(index, along);
+                                                if *pointing.peek() != Some(at) {
+                                                    pointing.set(Some(at));
+                                                }
                                                 if resizing().is_none() && state.read().drag_row.is_some() {
                                                     let mode = drop_zone(event.element_coordinates().y);
                                                     state.write().hover_drop(index, mode);
@@ -581,6 +596,11 @@ pub fn TaskGrid() -> Element {
                     }
                 }
             }
+
+            // Inside the pane and after the table, so the pane's own scrolling
+            // carries other people's pointers along with the rows they are on
+            // and clips the ones that have scrolled off.
+            crate::cursors::TableCursors {}
         }
     }
 }

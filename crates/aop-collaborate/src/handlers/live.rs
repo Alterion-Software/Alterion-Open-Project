@@ -161,8 +161,13 @@ async fn on_client_message(
     text: &str,
 ) -> bool {
     match serde_json::from_str::<ClientMessage>(text) {
-        Ok(ClientMessage::Presence { row }) => {
+        Ok(ClientMessage::Presence { row, at }) => {
             state.hub.set_row(project, conn, row);
+            // Absent means unchanged, so a client reporting only a selection
+            // does not blank everybody else's view of its pointer.
+            if at.is_some() {
+                state.hub.set_pointer(project, conn, at);
+            }
             let (name, _) = state.hub.describe(project, conn);
             state.hub.broadcast(
                 project,
@@ -170,6 +175,7 @@ async fn on_client_message(
                     subject: subject.to_string(),
                     name,
                     row,
+                    at,
                 }),
                 Some(conn),
             );

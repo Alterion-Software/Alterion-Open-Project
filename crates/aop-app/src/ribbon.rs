@@ -129,7 +129,7 @@ fn view_from(value: &str) -> Option<ViewKind> {
 #[component]
 pub fn TitleBar() -> Element {
     let mut state = use_context::<Signal<AppState>>();
-    let (title, can_undo, can_redo, has_selection, qat) = {
+    let (title, can_undo, can_redo, has_selection, qat, cannot_sync, live_on) = {
         let s = state.read();
         (
             s.document_title(),
@@ -137,6 +137,10 @@ pub fn TitleBar() -> Element {
             s.can_redo(),
             !s.selection.is_empty(),
             s.qat.clone(),
+            // Why sharing cannot be pressed, when it cannot. Read here rather
+            // than inside the loop so a toolbar of eight buttons asks once.
+            s.sync_blocked(),
+            s.live.is_some(),
         )
     };
 
@@ -149,13 +153,35 @@ pub fn TitleBar() -> Element {
                             QatCommand::Undo => can_undo,
                             QatCommand::Redo => can_redo,
                             QatCommand::Link | QatCommand::Unlink | QatCommand::TaskInformation => has_selection,
+                            // Turning it on needs a server and a sign in.
+                            // Copying the link while it is already on needs
+                            // neither, so a running session is never gated.
+                            QatCommand::Collaborate => cannot_sync.is_none() || live_on,
                             _ => true,
+                        };
+                        // One button that does two things has to say which one
+                        // it will do next, or it is a button nobody can
+                        // predict. It is icon sized, so the tooltip is where
+                        // its words fit, and the reason it is grey goes in the
+                        // same place rather than nowhere.
+                        let title = match (command, live_on, &cannot_sync) {
+                            (QatCommand::Collaborate, true, _) => {
+                                "Copy the link to this plan again (live editing is already on)"
+                                    .to_string()
+                            }
+                            (QatCommand::Collaborate, false, Some(why)) => {
+                                format!("Collaborate: {why}")
+                            }
+                            (QatCommand::Collaborate, false, None) => {
+                                "Start live editing and copy the link to this plan".to_string()
+                            }
+                            _ => command.label().to_string(),
                         };
                         rsx! {
                             button {
                                 key: "{command:?}",
                                 class: "qat-btn",
-                                title: "{command.label()}",
+                                title: "{title}",
                                 disabled: !enabled,
                                 onclick: move |_| run_qat(&mut state, command),
                                 {icon(command.glyph(), 15)}
@@ -355,6 +381,11 @@ pub fn run_qat(state: &mut Signal<AppState>, command: QatCommand) {
             let z = state.read().zoom.zoom_out();
             state.write().zoom = z;
         }
+        QatCommand::Cloud => {
+            let open = state.read().sync_open;
+            state.write().sync_open = !open;
+        }
+        QatCommand::Collaborate => crate::collaborate::share(*state),
     }
 }
 
@@ -1102,6 +1133,11 @@ fn ViewTab() -> Element {
         )
     };
 
+    // Read once for the whole tab: the reason the collaborate commands cannot
+    // be used, or nothing when they can.
+    let cannot_sync = state.read().sync_blocked();
+    let live_on = state.read().live.is_some();
+
     rsx! {
         Group { title: "Task Views".to_string(), launcher: false,
             MenuBtn {
@@ -1298,6 +1334,53 @@ fn ViewTab() -> Element {
                             ViewKind::TaskUsage
                         };
                     } }
+            }
+        }
+
+        // Everything that needs a server is disabled rather than hidden, and
+        // the group says which of the three reasons it is. A hidden button
+        // teaches nobody that the feature exists; a disabled one that says
+        // "not signed in" teaches them what to do next.
+        Group { title: "Collaborate".to_string(), launcher: false,
+            BigBtn {
+                glyph: "history".to_string(), caption: "History and Sync".to_string(),
+                // Not gated: the versions half is this machine's own, and the
+                // sync half is where the reason for the rest is spelled out.
+                enabled: true,
+                on: move |_| {
+                    let open = state.read().sync_open;
+                    state.write().sync_open = !open;
+                },
+            }
+            div { class: "rcol",
+                SmallBtn {
+                    glyph: "sync".to_string(), caption: "Sync Now".to_string(),
+                    enabled: cannot_sync.is_none(),
+                    on: move |_| crate::collaborate::sync(state),
+                }
+                SmallBtn {
+                    glyph: "compare".to_string(), caption: "Check Server".to_string(),
+                    enabled: cannot_sync.is_none(),
+                    on: move |_| crate::collaborate::check(state),
+                }
+                // A button rather than a tick box, so it can be disabled and
+                // say why like the two above it. The caption carries the state
+                // that the tick would have.
+                SmallBtn {
+                    glyph: "team-planner".to_string(),
+                    caption: if live_on {
+                        "Live Editing: On".to_string()
+                    } else {
+                        "Live Editing: Off".to_string()
+                    },
+                    // Turning it off is always allowed: a socket that is
+                    // already open is not waiting on anything.
+                    enabled: cannot_sync.is_none() || live_on,
+                    on: move |_| crate::collaborate::live(state, !live_on),
+                }
+            }
+            if let Some(why) = &cannot_sync {
+                div { class: "rwhy", "{why}" }
             }
         }
 
@@ -1501,6 +1584,7 @@ fn FormatTab() -> Element {
 #[component]
 fn HelpTab() -> Element {
     let mut state = use_context::<Signal<AppState>>();
+    let checking = state.read().working.is_some();
 
     rsx! {
         Group { title: "Help".to_string(), launcher: false,
@@ -1508,6 +1592,17 @@ fn HelpTab() -> Element {
                 on: move |_| state.write().backstage = Some(BackstagePage::About) }
             BigBtn { glyph: "training".to_string(), caption: "About".to_string(), enabled: true,
                 on: move |_| state.write().backstage = Some(BackstagePage::About) }
+        }
+
+        // Never gated, which is the point. The server's own check needs no
+        // sign in, so this is the one command that still answers when signing
+        // in is the thing that is broken.
+        Group { title: "Collaborate".to_string(), launcher: false,
+            BigBtn {
+                glyph: "inspect".to_string(), caption: "Check Collaborate".to_string(),
+                enabled: !checking,
+                on: move |_| crate::collaborate::health(state),
+            }
         }
     }
 }

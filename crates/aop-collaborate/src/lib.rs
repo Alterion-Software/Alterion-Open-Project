@@ -27,6 +27,7 @@ pub mod error;
 pub mod handlers;
 pub mod live;
 pub mod schema;
+pub mod sharing;
 pub mod state;
 pub mod sync;
 

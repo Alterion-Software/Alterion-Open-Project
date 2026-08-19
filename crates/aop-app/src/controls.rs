@@ -317,3 +317,49 @@ pub fn ComboBox(
         }
     }
 }
+
+/// Put one value on the system clipboard.
+///
+/// Through the webview, which is the only clipboard this build can reach. The
+/// value is encoded as JSON rather than pasted into the script, so a value
+/// containing a quote is a string containing a quote and not a syntax error.
+///
+/// Here rather than beside whichever page wanted it first, because three
+/// unrelated places now copy something and a second copy of this would be a
+/// second place for the escaping to be got wrong.
+///
+/// Two routes, and the second is not a nicety. `navigator.clipboard` exists
+/// only in a secure context. WebKitGTK treats this application's own protocol
+/// as trusted and hands it over; WebView2 does not, so on Windows the object
+/// is undefined and the previous `navigator.clipboard && ...` short circuited
+/// to nothing at all: every copy in the application silently did nothing, with
+/// no error anywhere, which is the worst way for a feature to be missing.
+///
+/// `execCommand` is deprecated and works in a plain context, which is exactly
+/// the case that needs it.
+pub fn copy_to_clipboard(value: &str) {
+    let Ok(encoded) = serde_json::to_string(value) else {
+        return;
+    };
+    document::eval(&format!(
+        r#"(function (text) {{
+             if (navigator.clipboard && window.isSecureContext) {{
+               navigator.clipboard.writeText(text);
+               return;
+             }}
+             // The fallback has to be attached to the document and selected
+             // before the copy will take, and reading it back is what the
+             // browser refuses off screen, so it is placed out of sight
+             // rather than hidden.
+             var box = document.createElement("textarea");
+             box.value = text;
+             box.setAttribute("readonly", "");
+             box.style.position = "fixed";
+             box.style.top = "-1000px";
+             document.body.appendChild(box);
+             box.select();
+             try {{ document.execCommand("copy"); }} catch (e) {{}}
+             document.body.removeChild(box);
+           }})({encoded});"#
+    ));
+}

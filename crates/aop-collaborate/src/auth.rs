@@ -46,8 +46,30 @@ pub struct Introspection {
     pub active: bool,
     #[serde(default)]
     pub sub: Option<String>,
-    #[serde(default)]
+    /// RFC 7662 says this is one space separated string. Providers that store
+    /// scopes as a list send an array instead, and refusing to parse them
+    /// would fail closed on a difference that changes nothing. Both are read;
+    /// only the string form is produced.
+    #[serde(default, deserialize_with = "scope_string_or_list")]
     pub scope: Option<String>,
+}
+
+fn scope_string_or_list<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Scope {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match Option::<Scope>::deserialize(deserializer)? {
+        Some(Scope::One(text)) => Some(text),
+        Some(Scope::Many(list)) => Some(list.join(" ")),
+        None => None,
+    })
 }
 
 impl Introspection {
@@ -68,6 +90,30 @@ impl Introspection {
 pub struct Discovery {
     pub issuer: String,
     pub introspection_endpoint: String,
+    /// Optional here and required by OpenID Connect. A provider that omits it
+    /// can still have its tokens introspected, so refusing to start over it
+    /// would break syncing for the sake of a feature only claiming an invite
+    /// uses. The refusal happens at the claim instead, where it can name the
+    /// endpoint that is missing.
+    #[serde(default)]
+    pub userinfo_endpoint: Option<String>,
+}
+
+/// What the provider says about the account a token belongs to.
+///
+/// Two fields, both about one question: which address is this, and does the
+/// provider vouch for it. Nothing else from `userinfo` is read, because
+/// nothing else is acted on.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct UserInfo {
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Standard OIDC, and load bearing. An address a provider has not verified
+    /// is an address the account holder typed, so accepting one would mean
+    /// anybody with an account could claim anybody's invite by writing their
+    /// address into their own profile.
+    #[serde(default)]
+    pub email_verified: Option<bool>,
 }
 
 /// Where the discovery document lives for a given issuer.
@@ -184,11 +230,20 @@ impl IdpClient {
     /// fetch that fails says which URL it tried, which is the setting the
     /// self-hoster got wrong.
     pub async fn introspection_endpoint(&self) -> Result<String, SyncError> {
+        Ok(self.discovery().await?.introspection_endpoint)
+    }
+
+    /// The issuer's discovery document, fetched once and then remembered.
+    ///
+    /// Split out from [`Self::introspection_endpoint`] when a second endpoint
+    /// came to be needed, so that the check on who the document claims to be
+    /// is written once rather than once per endpoint that trusts it.
+    pub async fn discovery(&self) -> Result<Discovery, SyncError> {
         if let Some(known) = self
             .discovery
             .read()
             .ok()
-            .and_then(|held| held.as_ref().map(|d| d.introspection_endpoint.clone()))
+            .and_then(|held| held.as_ref().cloned())
         {
             return Ok(known);
         }
@@ -218,11 +273,50 @@ impl IdpClient {
             )));
         }
 
-        let endpoint = discovery.introspection_endpoint.clone();
         if let Ok(mut held) = self.discovery.write() {
-            *held = Some(discovery);
+            *held = Some(discovery.clone());
         }
-        Ok(endpoint)
+        Ok(discovery)
+    }
+
+    /// Which address the provider says this token belongs to.
+    ///
+    /// Deliberately not cached, and deliberately not part of [`Verified`].
+    /// Introspection answers "is this token real and whose is it", which every
+    /// request needs; this answers "what is that person's address", which one
+    /// endpoint needs. Holding an address in the token cache would mean this
+    /// server kept a table of who is who in memory, for the benefit of a call
+    /// that happens once per person per plan.
+    ///
+    /// Every failure here is [`SyncError::Idp`]. That is the point: a claim
+    /// that cannot be checked must not be answered as a claim that was checked
+    /// and refused, and the two reach the caller as 502 and 404 respectively.
+    pub async fn userinfo(&self, token: &str) -> Result<UserInfo, SyncError> {
+        let endpoint = self.discovery().await?.userinfo_endpoint.ok_or_else(|| {
+            SyncError::Idp(format!(
+                "{} advertises no userinfo_endpoint, so this server cannot ask it which \
+                 address a token belongs to. Claiming an invite needs that endpoint",
+                discovery_url(&self.issuer)
+            ))
+        })?;
+
+        let response = self
+            .http
+            .get(&endpoint)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| SyncError::Idp(format!("userinfo: {e}")))?;
+        if !response.status().is_success() {
+            return Err(SyncError::Idp(format!(
+                "userinfo answered {}",
+                response.status()
+            )));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| SyncError::Idp(format!("parse userinfo: {e}")))
     }
 
     /// Who this token belongs to, from cache if it was checked recently.

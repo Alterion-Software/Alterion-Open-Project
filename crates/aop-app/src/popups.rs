@@ -9,13 +9,35 @@ use crate::controls::{Choice, Dropdown};
 use crate::icons::icon;
 use crate::state::{AppState, Column};
 
+/// What the anchored panel is dressed and placed by.
+///
+/// Two classes, and the split is the point. `ctxmenu` is the look of a menu
+/// panel and nothing else; `ctx-anchored` is what takes this one out of the
+/// flow so that writing coordinates into its style places it. A context menu
+/// gets that second half from the `ctx-stack` it shares with its mini toolbar,
+/// which this has no use for, so it carries its own.
+pub const ANCHORED_CLASS: &str = "ctx-anchored ctxmenu";
+
 /// Shared shell: a scrim that closes on click, plus an anchored panel.
 #[component]
 fn Anchored(width: f64, children: Element) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let (x, y) = state.read().popup_at;
-    let left = x.max(6.0);
-    let top = (y + 4.0).max(6.0);
+    let (view_w, view_h) = use_context::<Signal<crate::state::Viewport>>()();
+
+    // Kept inside the window. A cell near the right edge would otherwise
+    // anchor the panel past it, and a panel nobody can see is the same thing
+    // to the planner as no panel at all.
+    let left = x.min(view_w - width - 6.0).max(6.0);
+
+    // Low on the screen the panel hangs upward from the cell instead of
+    // running off the bottom. Anchoring it by its bottom edge does that
+    // without anything having to know how tall the list turned out.
+    let vertical = if y > view_h * 0.55 {
+        format!("bottom: {}px;", (view_h - y).max(6.0))
+    } else {
+        format!("top: {}px;", (y + 4.0).max(6.0))
+    };
 
     rsx! {
         div {
@@ -29,8 +51,8 @@ fn Anchored(width: f64, children: Element) -> Element {
             },
         }
         div {
-            class: "ctxmenu",
-            style: "left: {left}px; top: {top}px; width: {width}px; max-height: 70vh; overflow-y: auto; padding: 10px;",
+            class: "{ANCHORED_CLASS}",
+            style: "left: {left}px; {vertical} width: {width}px; max-height: 70vh; overflow-y: auto; padding: 10px;",
             onclick: move |event| event.stop_propagation(),
             // Keeps the caret in the cell's own text box while boxes are
             // ticked, so typing and picking are one continuous edit.

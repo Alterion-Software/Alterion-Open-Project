@@ -12,7 +12,7 @@ name = "alterion-open-project"
 path = "src/main.rs"
 
 [dependencies]
-aop-core = { version = "1.0.0-beta", path = "../aop-core" }
+aop-core = { version = "1.0.1-beta", path = "../aop-core" }
 chrono.workspace = true
 dioxus = { version = "0.7.10" }
 serde.workspace = true
@@ -21,6 +21,14 @@ tokio = { version = "1.53.1", features = ["time", "rt"] }
 dioxus-native = { version = "0.7.10", optional = true }
 ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 sha2 = "0.11.0"
+# Only for reading a release tarball. Already in the tree by way of
+# aop-core's .aprj container, and pinned to the same version, so naming it
+# here adds a line rather than a build.
+flate2 = "1.1"
+# The live socket. Already in the tree by way of dioxus-desktop, and pinned to
+# the same version so naming it here adds a line rather than a build. rustls
+# for the same reason ureq uses it: one TLS stack, not two.
+tungstenite = { version = "0.28.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 
 # Refusing a close has to be done at the toolkit layer: the portable event loop
 # carries out a close request before any handler can object to it. Pinned to the

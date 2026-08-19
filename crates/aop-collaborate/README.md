@@ -19,6 +19,7 @@ merges, and it never replays: it has no scheduling engine, on purpose.
 |-------------------|------------------------------------------------------------|
 | `aop.projects`    | one plan, its owner's subject, and `head_seq`               |
 | `aop.project_members` | who can see it, and in what role                        |
+| `aop.project_invites` | addresses invited and not yet claimed                   |
 | `aop.changes`     | the log, keyed by `(project_id, seq)`                       |
 | `aop.snapshots`   | a whole plan as of some seq, for clients that cannot replay |
 
@@ -55,7 +56,7 @@ bind_port = 8090
 url = postgres://aop:aop@localhost:5432/aop_sync
 
 [idp]
-issuer = https://auth.coraldune.cloud
+issuer =
 client_id =
 client_secret =
 token_cache_secs = 60
@@ -72,7 +73,14 @@ level = info
 
 ### Pointing it at your own identity provider
 
-Change `issuer`. That is the whole change.
+Set `issuer`. That is the whole configuration.
+
+There is no default, and the server refuses to start without one. That is
+deliberate: this server sends bearer tokens to the issuer to have them
+introspected, so a default issuer would mean an unconfigured deployment
+handing its users' tokens to whoever owns that address. It also refuses a
+plain `http://` issuer for the same reason, unless it is loopback, which never
+leaves the machine and is how you test without certificates.
 
 Every endpoint this server talks to is read from
 `{issuer}/.well-known/openid-configuration`, so the introspection URL follows
@@ -100,6 +108,11 @@ PUT    /api/projects/{id}/snapshot         store a fresh snapshot
 GET    /api/projects/{id}/changes?after=N  everything after cursor N
 POST   /api/projects/{id}/changes          push
 DELETE /api/projects/{id}                  owner only
+GET    /api/projects/{id}/members          who it is shared with; any member
+POST   /api/projects/{id}/invites          invite an address; owner only
+DELETE /api/projects/{id}/invites?email=   withdraw an invitation; owner only
+DELETE /api/projects/{id}/members?subject= take somebody out; owner only
+POST   /api/projects/{id}/claim            present yourself for an invitation
 GET    /api/projects/{id}/live             websocket
 ```
 
@@ -183,6 +196,65 @@ A change can arrive both in a `catchup` and again live, if it landed while the
 catch-up was being read. That is harmless: a change already in a client's
 history is ignored by its merge rather than applied twice.
 
+## Sharing
+
+Nobody knows anybody else's `sub`. It is a UUID the identity provider minted,
+it appears in no interface, and an endpoint that took one would be asking a
+person to look up something they cannot look up. People know addresses.
+
+Resolving an address to a subject here would mean asking the provider "who is
+ada@example.com". That is a user enumeration endpoint: anybody who can call it
+learns which addresses have accounts behind them, one guess at a time. So it is
+not built, and none is asked for.
+
+Instead the address waits, and the person it names proves it is theirs:
+
+```
+owner: POST /api/projects/{id}/invites   { "email": "ada@example.com",
+                                           "role": "editor" }
+    -> a pending row. Nothing was looked up, and nobody was told whether
+       that address belongs to anyone.
+
+Ada:   POST /api/projects/{id}/claim     with her own bearer token
+    -> the server asks the provider's userinfo endpoint which address *that
+       token* belongs to, which is a question about the caller and nobody
+       else, and matches the answer against the pending row.
+    -> they agree: a membership is written and the invitation is deleted, in
+       one transaction.
+```
+
+Three things follow from that shape.
+
+**Nothing is ever looked up by address**, so no request to this server can be
+used to probe who exists. **The invitee proves who they are with their own
+token**, so an invitation sent to the wrong address grants nothing to whoever
+holds the wrong address. And **an invitation is single use**, because claiming
+deletes the row: somebody removed from a plan cannot walk back in through the
+invitation they came by.
+
+`userinfo` is called on this one path and nowhere else, and nothing about it is
+cached. Its answer is acted on only when `email_verified` is `true`: an address
+a provider has not confirmed is an address the account holder typed, and
+accepting one would mean anybody with an account could claim any invitation by
+writing somebody else's address into their own profile. A provider that omits
+the claim is treated exactly like one that sends `false`.
+
+If the provider cannot be reached, the claim fails closed with `502` and says
+so. That is deliberately not the `404` that "there is no invitation for you"
+gets: one of those is worth trying again and the other is not.
+
+**Who sees an address.** Pending invitations, and the address on a member's own
+row, are sent to the owner and to nobody else. An editor listing the members
+sees who is in the plan and what they may do, `invites: null`, and no addresses
+at all. What is not in the answer cannot be drawn by any client.
+
+**Not found, never forbidden.** Every sharing route asks what the caller's role
+is first. A caller with no row is told the plan is not there, which is what an
+id that was never real gets; a member who is merely not the owner gets a real
+`403`, because a member already knows the plan is real. A claim that finds no
+invitation is a `404` for the same reason: it must not confirm which plan ids
+exist.
+
 ## Limits worth knowing before you deploy
 
 - The live hub is in process. Two instances behind a load balancer each only
@@ -192,7 +264,12 @@ history is ignored by its merge rather than applied twice.
 - Nothing trims the log yet, so `gap` cannot currently happen through normal
   use. The handling is there because trimming will come and because a restored
   backup produces the same situation.
-- Sharing has a table but no endpoint. Only the creator is a member.
+- Claiming an invitation requires `email_verified: true` from your identity
+  provider's `userinfo`. A provider that does not send it, or sends `false`,
+  admits nobody, and says so. See Sharing above.
+- There is no way to change a role or to pass a plan on. Both are a remove
+  followed by a fresh invitation, and the second is deliberate: a plan has one
+  owner and this server has no ceremony for handing that over.
 
 ## Tests
 
@@ -200,7 +277,8 @@ history is ignored by its merge rather than applied twice.
 cargo test -p aop-collaborate
 ```
 
-The push decision, the cursor arithmetic and the introspection cache all run
-without a database or an identity provider. The tests that need Postgres are
+The push decision, the cursor arithmetic, the introspection cache and every
+decision about who gets let into a plan all run without a database or an
+identity provider. The tests that need Postgres are
 ignored by default; set `AOP_COLLAB_TEST_DATABASE_URL` and run with
 `--ignored` to include them.

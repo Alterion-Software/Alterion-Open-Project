@@ -27,6 +27,7 @@ pub mod subproject;
 pub mod templates;
 pub mod textstyle;
 pub mod update;
+pub mod versions;
 
 pub use calendar::{CalendarException, DayShifts, Shift, WorkCalendar};
 pub use fields::{Align, Field, FieldGroup};

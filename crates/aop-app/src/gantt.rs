@@ -516,6 +516,18 @@ pub fn GanttChart(
         )
     };
 
+    // Where this planner's pointer is, for the others in a live session, and
+    // what it takes to work that out.
+    //
+    // A mouse move over a bar has the bar as its target, and a bar's own
+    // coordinates say nothing about the chart. Client coordinates are the same
+    // for every element, so what is missing is one offset between the two, and
+    // the transparent sheet under the whole chart is the one element that sees
+    // both on the same event. It is under everything, so it is crossed
+    // constantly and the offset is never stale for long.
+    let mut pointing = use_context::<crate::state::Pointing>().0;
+    let mut chart_origin = use_signal(|| None::<(f64, f64)>);
+
     // The placement maths lives in the core so screen and print cannot drift.
     // The map borrows the layout's bar geometry, so nothing here is rebuilt and
     // the plan's drawings are never copied to be drawn.
@@ -546,8 +558,23 @@ pub fn GanttChart(
                 state.write().open_chart_menu(point.x, point.y);
             },
             onmousemove: move |event| {
-                if interactive && state.read().bar_drag.is_some() {
+                if !interactive {
+                    return;
+                }
+                if state.read().bar_drag.is_some() {
                     state.write().update_bar_drag(event.client_coordinates().x);
+                }
+                // Every move, wherever in the pane it landed and whatever it
+                // landed on, once the sheet underneath has said where the
+                // chart begins.
+                if let Some((from_x, from_y)) = *chart_origin.peek() {
+                    let point = event.client_coordinates();
+                    let at = state
+                        .peek()
+                        .chart_pointer(point.x - from_x, point.y - from_y);
+                    if at.is_some() && *pointing.peek() != at {
+                        pointing.set(at);
+                    }
                 }
             },
             onmousedown: move |_| {
@@ -659,6 +686,34 @@ pub fn GanttChart(
 
             // ---- chart body ---------------------------------------------
             svg { class: "chart-svg", width: "{width}", height: "{body_h}",
+
+                // First, so everything else is painted over it and it takes a
+                // pointer only where the chart is otherwise bare. It exists to
+                // answer one question, which is where the chart's own
+                // coordinates start on the screen. A report has no live
+                // session to tell, so it does not get one.
+                if interactive {
+                    rect {
+                        x: "0", y: "0", width: "{width}", height: "{body_h}",
+                        fill: "transparent",
+                        onmousemove: move |event| {
+                            let here = event.element_coordinates();
+                            let screen = event.client_coordinates();
+                            let found = (screen.x - here.x, screen.y - here.y);
+                            // Only when it has actually moved. The pane scrolls
+                            // and the window moves, but neither happens on most
+                            // of the events this receives.
+                            let stale = chart_origin
+                                .peek()
+                                .is_none_or(|(x, y): (f64, f64)| {
+                                    (x - found.0).abs() >= 0.5 || (y - found.1).abs() >= 0.5
+                                });
+                            if stale {
+                                chart_origin.set(Some(found));
+                            }
+                        },
+                    }
+                }
 
                 for (index, x) in nonworking
                     .iter()
@@ -1088,6 +1143,13 @@ pub fn GanttChart(
                         onmouseup: move |_| state.write().finish_draw_drag(),
                     }
                 }
+            }
+
+            // Inside the pane, in the chart's own coordinates, so the pane
+            // carries other people's pointers along as it scrolls and clips
+            // the ones that have gone off it. A report has no peers.
+            if interactive {
+                crate::cursors::ChartCursors {}
             }
             }
         }

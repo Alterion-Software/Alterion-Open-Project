@@ -33,29 +33,53 @@
 //! because without that check anyone who can get the browser to visit a URL can
 //! sign this application in as themselves.
 
-// Nothing in the application calls into this module yet: the ribbon, the
-// dialogs and the options page that will are being built alongside it. In a
-// binary crate that makes every item here dead code, and a hundred warnings
-// about it is how a real one gets missed. Delete this line once the interface
-// is wired up.
-#![allow(dead_code, unused_imports)]
-
+pub mod collab;
 pub mod device;
+pub mod health;
+pub mod link;
+pub mod live;
 pub mod oauth;
+pub mod share;
 pub mod tokens;
+pub mod work;
+
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-pub use device::DeviceComponents;
-pub use oauth::{DEFAULT_ISSUER, Endpoints};
-pub use tokens::{MemoryStore, Stored, StoreError, TokenStore, use_store};
+pub use oauth::Endpoints;
+pub use tokens::Stored;
 
-/// The client id this application is registered under.
+/// How often a waiting task looks to see whether its worker has finished.
 ///
-/// Public, in the sense RFC 6749 means: it identifies the program, it is not a
-/// secret, and it is compiled in because everybody's copy has the same one. A
-/// self hosted deployment registers its own and overrides this.
-pub const DEFAULT_CLIENT_ID: &str = "alterion-open-project";
+/// Short enough that a sign in landing feels immediate, long enough that
+/// waiting five minutes for a browser costs a few thousand wake ups rather
+/// than a core.
+const LOOK_EVERY: Duration = Duration::from_millis(90);
+
+/// Run blocking work on a thread of its own, and take the answer on the
+/// interface's thread when it lands.
+///
+/// Every call in this module blocks, several of them for as long as a person
+/// takes to finish a page in a browser. None of them may run where the
+/// interface does, and none of them may be awaited by holding the interface
+/// still, so the work goes to a thread and the wait becomes a poll.
+///
+/// `landed` is given `None` when the worker did not come back at all. That is
+/// a panic, and the caller has to hear about it: the alternative is a button
+/// that says it is still working for the rest of the session.
+pub fn off_thread<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+    landed: impl FnOnce(Option<T>) + 'static,
+) {
+    dioxus::prelude::spawn(async move {
+        let worker = std::thread::spawn(work);
+        while !worker.is_finished() {
+            tokio::time::sleep(LOOK_EVERY).await;
+        }
+        landed(worker.join().ok());
+    });
+}
 
 /// Whoever signed in.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -68,7 +92,81 @@ pub struct Account {
     /// the part of the address before the at sign.
     pub name: String,
     pub email: String,
+    /// Where the account's picture is, when the provider serves one.
+    ///
+    /// `None` is the ordinary case, not a fault: the claim is optional in
+    /// OIDC and this deployment's provider does not send it yet. Whatever
+    /// draws an account falls back to [`Account::initials`] rather than
+    /// leaving a hole where a face would be.
+    ///
+    /// Only ever an address tokens would be safe on, checked where the claim
+    /// is read: this is a string the provider chooses and the webview would
+    /// otherwise be asked to fetch.
+    pub picture: Option<String>,
 }
+
+impl Account {
+    /// The letters to draw when there is no picture.
+    ///
+    /// Taken from the display name rather than the address, so the initials
+    /// and the name under them agree. First and last word, which is how a
+    /// person writes their own: "Ada Lovelace King" is AK, not AL.
+    pub fn initials(&self) -> String {
+        let letters: Vec<char> = self
+            .name
+            .split_whitespace()
+            .filter_map(|word| word.chars().find(|letter| letter.is_alphanumeric()))
+            .collect();
+        let picked: String = match letters.as_slice() {
+            // Nothing in the name to draw with. The address is the only other
+            // thing an account is sure to have, so it stands in.
+            [] => self
+                .email
+                .chars()
+                .find(|letter| letter.is_alphanumeric())
+                .into_iter()
+                .collect(),
+            [only] => only.to_string(),
+            [first, .., last] => format!("{first}{last}"),
+        };
+        picked.to_uppercase()
+    }
+}
+
+/// Where the provider keeps the page a person manages their own account on.
+///
+/// Nothing about a password, an address or a picture happens in this
+/// application. The browser already has a session with the provider, the
+/// provider owns those flows, and a desktop application that asks for a
+/// password is a place credentials can be collected for no reason. So this
+/// resolves to an address to open, and that is all it does.
+///
+/// Derived from the issuer rather than written down, because the provider is
+/// self hosted: there is no host to hardcode. `configured` is the settings
+/// key, for a deployment whose account page is not under its issuer, and it
+/// wins when it is set.
+///
+/// `None` when there is nothing worth opening, which is a button that is not
+/// drawn rather than one that opens a browser at nowhere.
+pub fn account_page(issuer: &str, configured: &str) -> Option<String> {
+    let configured = configured.trim().trim_end_matches('/');
+    if !configured.is_empty() {
+        return oauth::transport_is_safe(configured).then(|| configured.to_string());
+    }
+    let issuer = issuer.trim().trim_end_matches('/');
+    if issuer.is_empty() || !oauth::transport_is_safe(issuer) {
+        return None;
+    }
+    Some(format!("{issuer}{ACCOUNT_PATH}"))
+}
+
+/// What is put after the issuer when no account page has been set.
+///
+/// A guess, and knowingly one: only the provider knows where its own account
+/// page lives, and the discovery document has no field that says. It is the
+/// path the Alterion provider uses, and the settings key exists for every
+/// deployment where it is wrong.
+const ACCOUNT_PATH: &str = "/account";
 
 /// Everything that can stop a sign in, phrased as the thing to do about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +418,34 @@ impl Session {
         }
     }
 
+    /// Ask the provider who this is, again.
+    ///
+    /// The account page lives at the provider, so a name, an address or a
+    /// picture changes there and nothing here is told. Reading the claims
+    /// again is the only way to find out, and it is worth doing at the one
+    /// moment a change is likely rather than on a timer: this happens a
+    /// handful of times in an account's life, and a repeating call for it
+    /// would be waste that also keeps waking the interface.
+    ///
+    /// The refreshed claims go through exactly the same reading as the ones at
+    /// sign in, address check included. A claim is no more trustworthy for
+    /// having arrived second.
+    pub fn refresh_account(&mut self) -> Result<Account, SignInError> {
+        // Before the endpoints, because asking for a token can renew the
+        // session, and a renewal is a better moment to fail than half way
+        // through a request.
+        self.access_token()?;
+        let endpoints = self.resolve_endpoints()?;
+        let claims = oauth::userinfo(&endpoints, &self.access_token)?;
+        let account = account_from(&claims);
+        self.account = account.clone();
+        // Written down so the card says the same thing on the next start
+        // without asking again. Quiet on failure: an unwritable store is not
+        // a reason to throw away a session that works.
+        let _ = tokens::save_session(&self.stored());
+        Ok(account)
+    }
+
     /// The session as it is kept between runs.
     fn stored(&self) -> Stored {
         Stored {
@@ -331,6 +457,7 @@ impl Session {
             subject: self.account.subject.clone(),
             name: self.account.name.clone(),
             email: self.account.email.clone(),
+            picture: self.account.picture.clone(),
         }
     }
 }
@@ -451,6 +578,15 @@ fn account_from(claims: &oauth::Claims) -> Account {
         subject: claims.sub.clone(),
         name,
         email,
+        // Checked here rather than where it is drawn, so that having one at
+        // all means having one that is safe to fetch. The claim is a string
+        // the provider chooses, and it ends up as the source of an image the
+        // webview loads.
+        picture: claims
+            .picture
+            .clone()
+            .map(|url| url.trim().to_string())
+            .filter(|url| oauth::transport_is_safe(url)),
     }
 }
 
@@ -523,6 +659,9 @@ pub fn restore() -> Option<Session> {
             subject: stored.subject,
             name: stored.name,
             email: stored.email,
+            // Checked again on the way out: the record is written by this
+            // application but read from a file, and a file can be edited.
+            picture: stored.picture.filter(|url| oauth::transport_is_safe(url)),
         },
     })
 }
@@ -714,6 +853,7 @@ mod tests {
             name: Some("Ada Lovelace".into()),
             preferred_username: Some("ada".into()),
             email: Some("ada@example.org".into()),
+            picture: None,
         };
         let account = account_from(&claims);
         assert_eq!(account.name, "Ada Lovelace");
@@ -730,6 +870,7 @@ mod tests {
             name: None,
             preferred_username: Some("ada".into()),
             email: Some("ada@example.org".into()),
+            picture: None,
         };
         assert_eq!(account_from(&claims).name, "ada");
     }
@@ -741,6 +882,7 @@ mod tests {
             name: None,
             preferred_username: None,
             email: Some("ada@example.org".into()),
+            picture: None,
         };
         assert_eq!(account_from(&claims).name, "ada");
     }
@@ -753,6 +895,7 @@ mod tests {
             name: Some("   ".into()),
             preferred_username: None,
             email: None,
+            picture: None,
         };
         assert_eq!(account_from(&claims).name, "0198f0c2");
         assert!(!account_from(&claims).name.is_empty());
@@ -762,8 +905,8 @@ mod tests {
 
     fn session_expiring_in(seconds: i64) -> Session {
         Session {
-            issuer: DEFAULT_ISSUER.into(),
-            client_id: DEFAULT_CLIENT_ID.into(),
+            issuer: "https://auth.example.org".into(),
+            client_id: "a-client".into(),
             endpoints: None,
             access_token: "an-access-token".into(),
             refresh_token: String::new(),
@@ -794,11 +937,124 @@ mod tests {
     }
 
     #[test]
-    fn the_default_issuer_is_a_setting_not_a_certainty() {
-        // Everything else about the server is discovered, so changing this one
-        // value is all a self hosted deployment needs.
-        assert_eq!(DEFAULT_ISSUER, "https://auth.coraldune.cloud");
-        assert!(DEFAULT_ISSUER.starts_with("https://"));
-        assert!(!DEFAULT_ISSUER.ends_with('/'));
+    fn nothing_here_names_a_server() {
+        // The provider is self hosted and self deployable, so an address
+        // compiled in here would be one deployment signing in everybody who
+        // never looked at the setting. A session carries the issuer it was
+        // made against, and there is nowhere else for one to come from.
+        let session = session_expiring_in(3600);
+        assert_eq!(session.issuer(), "https://auth.example.org");
+    }
+
+    // ------------------------------------------------- the account card
+
+    fn named(name: &str) -> Account {
+        Account {
+            name: name.into(),
+            ..Account::default()
+        }
+    }
+
+    #[test]
+    fn an_account_with_no_picture_falls_back_to_its_initials() {
+        // The provider serves no picture claim yet, so this is what every card
+        // draws today. It has to read as a monogram rather than as a face that
+        // failed to arrive.
+        let account = Account {
+            name: "Ada Lovelace".into(),
+            email: "ada@example.org".into(),
+            ..Account::default()
+        };
+        assert_eq!(account.picture, None);
+        assert_eq!(account.initials(), "AL");
+    }
+
+    #[test]
+    fn initials_are_the_first_and_last_name_however_many_are_between() {
+        assert_eq!(named("Ada Lovelace King").initials(), "AK");
+        assert_eq!(named("ada lovelace").initials(), "AL");
+        assert_eq!(named("Ada").initials(), "A");
+    }
+
+    #[test]
+    fn a_name_that_gives_no_letters_falls_back_to_the_address() {
+        // An account always has something to draw with, so the circle is never
+        // simply blank.
+        let account = Account {
+            name: "  ".into(),
+            email: "ada@example.org".into(),
+            ..Account::default()
+        };
+        assert_eq!(account.initials(), "A");
+    }
+
+    #[test]
+    fn a_picture_the_provider_serves_is_kept_and_one_it_could_not_be_is_not() {
+        let with = account_from(&oauth::Claims {
+            sub: "a-subject".into(),
+            name: Some("Ada Lovelace".into()),
+            picture: Some("https://auth.example.org/faces/ada.png".into()),
+            ..oauth::Claims::default()
+        });
+        assert_eq!(
+            with.picture.as_deref(),
+            Some("https://auth.example.org/faces/ada.png")
+        );
+
+        // The claim is a string the provider chooses and it ends up as the
+        // source of an image the webview loads, so anything that is not an
+        // address a token would be safe on is dropped rather than drawn.
+        for unusable in ["javascript:alert(1)", "http://elsewhere.example/face.png", "  "] {
+            let account = account_from(&oauth::Claims {
+                sub: "a-subject".into(),
+                picture: Some(unusable.into()),
+                ..oauth::Claims::default()
+            });
+            assert_eq!(account.picture, None, "{unusable} should not be drawn");
+        }
+    }
+
+    #[test]
+    fn a_claim_with_no_picture_at_all_is_ordinary_rather_than_a_failure() {
+        let account = account_from(&oauth::Claims {
+            sub: "a-subject".into(),
+            name: Some("Ada Lovelace".into()),
+            ..oauth::Claims::default()
+        });
+        assert_eq!(account.picture, None);
+        assert_eq!(account.initials(), "AL");
+    }
+
+    // ------------------------------------------------- the account page
+
+    #[test]
+    fn the_account_page_is_derived_from_whichever_issuer_signed_this_copy_in() {
+        // No host is written down anywhere: the provider is self hosted, so
+        // the only address this application has is the one it was given.
+        assert_eq!(
+            account_page("https://auth.example.org", ""),
+            Some("https://auth.example.org/account".to_string())
+        );
+        assert_eq!(
+            account_page("https://auth.example.org/", ""),
+            Some("https://auth.example.org/account".to_string())
+        );
+    }
+
+    #[test]
+    fn a_deployment_that_keeps_its_account_page_elsewhere_is_followed() {
+        assert_eq!(
+            account_page("https://auth.example.org", "https://id.example.org/profile/"),
+            Some("https://id.example.org/profile".to_string())
+        );
+    }
+
+    #[test]
+    fn there_is_no_button_when_there_is_nowhere_to_open() {
+        assert_eq!(account_page("", ""), None);
+        // Same rule as everything else pointed at a provider: not encrypted,
+        // not opened.
+        assert_eq!(account_page("http://auth.example.org", ""), None);
+        assert_eq!(account_page("https://auth.example.org", "ftp://elsewhere"), None);
     }
 }

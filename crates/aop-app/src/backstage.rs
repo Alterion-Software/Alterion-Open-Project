@@ -13,7 +13,7 @@ use crate::preview::{mini_gantt, DARK};
 use crate::controls::{Choice, Dropdown};
 use crate::state::{
     documents_dir, format_date_long, next_monday, AppState, BackstagePage, Dialog, OptionsPage,
-    PendingAction, ViewKind,
+    PendingAction, ViewKind, Working,
 };
 
 #[component]
@@ -521,10 +521,7 @@ fn FileBrowser(saving: bool) -> Element {
                 }
                 if path.is_dir() {
                     folders.push((name, path));
-                } else if path.extension().is_some_and(|e| {
-                    e.eq_ignore_ascii_case(persist::FILE_EXTENSION)
-                        || (!saving && (e.eq_ignore_ascii_case("xml") || e.eq_ignore_ascii_case("mpp")))
-                }) {
+                } else if crate::state::offered_in_browser(&path, saving) {
                     files.push((name, path));
                 }
             }
@@ -1145,6 +1142,7 @@ const ATTRIBUTIONS: [(&str, &[Attribution]); 5] = [
 
 #[component]
 fn AboutPage() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
     let mut show_attributions = use_signal(|| false);
     let year = chrono::Local::now().year();
     let (logo_w, logo_h) = crate::brand::LOGO_VIEWBOX;
@@ -1186,11 +1184,30 @@ fn AboutPage() -> Element {
                 }
             }
 
-            button {
-                class: "about-attr-btn",
-                onclick: move |_| show_attributions.set(true),
-                {icon("package-mono", 15)}
-                span { "Open Source Attributions" }
+            div { class: "about-actions",
+                button {
+                    class: "about-attr-btn",
+                    onclick: move |_| show_attributions.set(true),
+                    {icon("package-mono", 15)}
+                    span { "Open Source Attributions" }
+                }
+                // Reachable on purpose, rather than only when the application
+                // happens to raise it after an update.
+                button {
+                    class: "about-attr-btn",
+                    onclick: move |_| state.write().show_support(),
+                    {icon("support", 15)}
+                    span { "Support development" }
+                }
+                button {
+                    class: "about-attr-btn",
+                    onclick: move |_| {
+                        crate::updates::ask_in_background(state);
+                        state.write().dialog = Some(crate::state::Dialog::UpdateAvailable);
+                    },
+                    {icon("sync", 15)}
+                    span { "Check for updates" }
+                }
             }
         }
         }
@@ -1310,19 +1327,59 @@ fn OptionsPageView() -> Element {
     }
 }
 
-/// Alterion Collaborate: where to sign in, and as what.
+/// Alterion Collaborate: which servers, and who this copy is signed in as.
 ///
-/// Only two things are settings, and neither is secret. Everything else about
-/// a provider comes from its own discovery document, so somebody running their
-/// own changes the address and nothing else. Tokens are never here: they live
-/// in whatever the platform provides for the purpose.
+/// Three addresses and no secret. Everything else about a provider comes from
+/// its own discovery document, so somebody running their own changes the
+/// address and nothing else follows. There are no defaults either: the
+/// identity provider is self hosted, and shipping one address as the out of
+/// the box answer would point every copy that never changed it at somebody
+/// else's server.
+///
+/// Nothing here is a client secret. This is a native application doing
+/// authorization code with PKCE, and a secret compiled into a desktop binary
+/// is a secret every copy of the binary carries.
 #[component]
 fn OptCollaborate() -> Element {
     let mut state = use_context::<Signal<AppState>>();
-    let (on, issuer, client_id) = {
+
+    // Read the account back from the provider when this page is opened.
+    //
+    // The window focus handler in `main.rs` is the other trigger, and it is
+    // the one that cannot be relied on: a compositor is under no obligation to
+    // report focus the way an application expects, and on Wayland it often
+    // does not. Opening this page is a deliberate act by somebody who wants to
+    // see their account, so it is a trigger that cannot be missed. The
+    // staleness floor is shared with the focus path, so opening the page
+    // repeatedly does not turn into a stream of requests.
+    use_effect(move || {
+        let due = {
+            let read = state.read();
+            read.session.is_some()
+                && read
+                    .account_checked_at
+                    .is_none_or(|at| at.elapsed() >= crate::state::ACCOUNT_RECHECK)
+        };
+        if due {
+            state.write().account_checked_at = Some(std::time::Instant::now());
+            crate::collaborate::refresh_account(state);
+        }
+    });
+
+    let (on, issuer, client_id, server) = {
         let s = state.read();
-        (s.collaborate, s.idp_issuer.clone(), s.idp_client_id.clone())
+        (
+            s.collaborate,
+            s.idp_issuer.clone(),
+            s.idp_client_id.clone(),
+            s.collaborate_server.clone(),
+        )
     };
+    let (working, message, linked) = {
+        let s = state.read();
+        (s.working, s.cloud_message.clone(), s.link.clone())
+    };
+    let cannot_publish = state.read().publish_blocked();
 
     let save = move |state: &mut AppState| {
         let settings = state.settings();
@@ -1341,6 +1398,13 @@ fn OptCollaborate() -> Element {
             on: move |_| {
                 let mut writer = state.write();
                 writer.collaborate = !writer.collaborate;
+                // Start up skips the token store when this is off, so turning
+                // it on part way through a session is the other moment a sign
+                // in from last time can be picked up. Reads a file and no
+                // more, so it costs nothing when there is nothing there.
+                if writer.collaborate && writer.account.is_none() {
+                    writer.restore_session();
+                }
                 save(&mut writer);
             },
         }
@@ -1348,8 +1412,8 @@ fn OptCollaborate() -> Element {
         if on {
             div { class: "sep" }
             Setting {
-                label: "Sign in at".to_string(),
-                hint: "The identity provider to use. Alterion hosts one, and you can run your own: everything else is read from the address you give here.".to_string(),
+                label: "Identity provider URL".to_string(),
+                hint: "The address you sign in at. Everything else about it, including where the browser goes, is read from its own discovery document. Whoever runs your Collaborate server issues this address; running your own means putting it here.".to_string(),
                 input {
                     class: "bs-input",
                     value: "{issuer}",
@@ -1363,11 +1427,12 @@ fn OptCollaborate() -> Element {
                 }
             }
             Setting {
-                label: "Application name".to_string(),
-                hint: "How this copy identifies itself when signing in. Your provider issues it. It is not a password, so it does not need hiding.".to_string(),
+                label: "Client ID".to_string(),
+                hint: "How this copy identifies itself to the identity provider. Your provider issues it when the application is registered. It is not a password, and there is no client secret to fill in: this application signs in with PKCE, and a secret inside a program anyone can download is not a secret.".to_string(),
                 input {
                     class: "bs-input",
                     value: "{client_id}",
+                    placeholder: "alterion-open-project",
                     onchange: move |event| {
                         let value = event.value().trim().to_string();
                         let mut writer = state.write();
@@ -1376,11 +1441,545 @@ fn OptCollaborate() -> Element {
                     },
                 }
             }
+            Setting {
+                label: "AOP Collaborate server URL".to_string(),
+                hint: "The server plans are kept and synced on. A separate address from the identity provider, and usually a separate machine: they go wrong one at a time. Whoever runs it gives you this address.".to_string(),
+                input {
+                    class: "bs-input",
+                    value: "{server}",
+                    placeholder: "https://collaborate.example.com",
+                    onchange: move |event| {
+                        let value = event.value().trim().trim_end_matches('/').to_string();
+                        let mut writer = state.write();
+                        writer.collaborate_server = value;
+                        save(&mut writer);
+                    },
+                }
+            }
 
             div { class: "sep" }
-            p { class: "opt-note",
-                "Signing in opens your browser. This copy is tied to this machine afterwards, so a stolen file is no use on another one, and signing in again is all it takes if the hardware changes."
+            h2 { class: "opt-head", "This machine" }
+
+            AccountCard {}
+
+            if let Some(working) = working {
+                p { class: "opt-note", "{working.waiting()}" }
+            } else if let Some(message) = &message {
+                p { class: "opt-note", "{message}" }
             }
+
+            div { class: "sep" }
+            h2 { class: "opt-head", "This plan" }
+
+            if let Some(link) = &linked {
+                p { class: "opt-note",
+                    "This plan is on the server as {link.project}. What is waiting to go, and \
+                     whether the server agrees this is the latest version, are in History and \
+                     Sync on the View tab."
+                }
+                SharedWith {}
+                div { class: "opt-actions",
+                    button {
+                        class: "btn",
+                        onclick: move |_| state.write().unlink_plan(),
+                        "Unlink this plan from the server"
+                    }
+                    span { class: "opt-why",
+                        "Nothing is removed from either side. This copy stops syncing and \
+                         forgets how far it had read, which is what to do when the plan on the \
+                         server turns out to be a different one."
+                    }
+                }
+            } else {
+                p { class: "opt-note",
+                    "This plan is on this machine only. Putting it on the server uploads it as \
+                     it stands and shares it with whoever you give access to."
+                }
+                div { class: "opt-actions",
+                    match &cannot_publish {
+                        Some(why) => rsx! {
+                            button { class: "btn", disabled: true, "Put this plan on the server" }
+                            span { class: "opt-why", "{why}" }
+                        },
+                        None => rsx! {
+                            button {
+                                class: "btn",
+                                onclick: move |_| crate::collaborate::publish(state),
+                                "Put this plan on the server"
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Who a plan is shared with, and the only place any of it can be changed.
+///
+/// **Why here and not in History and Sync.** That panel answers questions
+/// about the copy on screen: what is waiting to go, whether the server agrees
+/// this is the latest version, which version to go back to, and who happens to
+/// be looking at it right now. Those are all facts about a moment. Who has
+/// access is not a fact about a moment, it is an arrangement, and it is
+/// changed in the same breath as putting the plan on a server and taking it
+/// off again. Those two controls are already here, and this is the third verb
+/// of the same sentence. History and Sync goes on saying who is *here*; this
+/// says who may *come*.
+///
+/// **Addresses.** The server sends them to the owner and to nobody else, so an
+/// editor sees who is in the plan and not what their addresses are, and sees
+/// no pending invitations at all. That is not a decision this page makes and
+/// it is not one it can undo: what is not in the answer cannot be drawn.
+#[component]
+fn SharedWith() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    // Read the list when this page is opened on a plan it has not been read
+    // for. Not kept fresh afterwards, on purpose: somebody else can change the
+    // sharing from their own machine and nothing here would hear about it, so
+    // a list that refreshed itself would only be wrong less obviously. The
+    // Refresh button is how somebody asks again.
+    use_effect(move || {
+        let due = {
+            let read = state.read();
+            let project = read.link.as_ref().map(|link| link.project.clone());
+            project.is_some() && project != read.sharing_for && read.sharing_blocked().is_none()
+        };
+        if due {
+            crate::collaborate::sharing(state);
+        }
+    });
+
+    let (sharing, message, working, typed, role) = {
+        let s = state.read();
+        (
+            s.sharing.clone(),
+            s.sharing_message.clone(),
+            s.working,
+            s.invite_email.clone(),
+            s.invite_role.clone(),
+        )
+    };
+    let busy = working.is_some();
+    let blocked = state.read().sharing_blocked();
+
+    rsx! {
+        div { class: "sep" }
+        h2 { class: "opt-head", "Shared with" }
+
+        match &sharing {
+            None => rsx! {
+                p { class: "opt-note",
+                    match &blocked {
+                        Some(why) => why.clone(),
+                        None if busy => "Asking the server who this plan is shared with...".to_string(),
+                        None => "Not read yet.".to_string(),
+                    }
+                }
+            },
+            Some(sharing) => {
+                let owner = sharing.you_own_it();
+                let you = sharing.you.clone();
+                let owner_subject = sharing.owner.clone();
+                let members = sharing.members.clone();
+                let invites = sharing.invites.clone();
+                rsx! {
+                    p { class: "opt-note",
+                        if owner {
+                            "You made this plan, so you decide who else can reach it. Invite \
+                             somebody by their email address; they join the first time they \
+                             open the plan while signed in with that address. Nobody is looked \
+                             up: until they turn up holding their own sign in, this application \
+                             knows nothing about the address you typed."
+                        } else {
+                            "Whoever made this plan decides who can reach it. Ask them to \
+                             invite somebody, or to change what you can do here."
+                        }
+                    }
+
+                    table { class: "assign-table", style: "margin-top: 12px;",
+                        thead {
+                            tr {
+                                th { "Who" }
+                                th { style: "width: 132px;", "What they can do" }
+                                if owner {
+                                    th { style: "width: 96px;", "" }
+                                }
+                            }
+                        }
+                        tbody {
+                            for member in members.iter() {
+                                {
+                                    let label = who_is(member, &owner_subject, &you);
+                                    let is_owner = member.subject == owner_subject;
+                                    let subject = member.subject.clone();
+                                    let removing = label.clone();
+                                    rsx! {
+                                        tr { key: "m{member.subject}",
+                                            td { "{label}" }
+                                            td { "{what_they_can_do(&member.role)}" }
+                                            if owner {
+                                                td {
+                                                    // The owner is not offered a
+                                                    // button that would refuse. A
+                                                    // plan whose owner has been
+                                                    // removed is one nobody can
+                                                    // share and nobody can delete.
+                                                    if !is_owner {
+                                                        button {
+                                                            class: "btn danger",
+                                                            disabled: busy,
+                                                            onclick: move |_| crate::collaborate::remove_member(
+                                                                state,
+                                                                subject.clone(),
+                                                                removing.clone(),
+                                                            ),
+                                                            "Remove"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    match &invites {
+                        // Null rather than empty, from a server that does not
+                        // send other people's addresses to people who cannot
+                        // act on them. Said plainly, because a heading with
+                        // nothing under it reads as "nobody has been invited".
+                        None => rsx! {
+                            p { class: "hint", style: "margin-top: 10px;",
+                                "Invitations that have not been taken up yet are shown to \
+                                 whoever made the plan and to nobody else."
+                            }
+                        },
+                        Some(waiting) if waiting.is_empty() => rsx! {
+                            p { class: "hint", style: "margin-top: 10px;",
+                                "No invitations are waiting to be taken up."
+                            }
+                        },
+                        Some(waiting) => rsx! {
+                            h3 { class: "opt-sub", style: "margin-top: 14px;", "Waiting to be taken up" }
+                            table { class: "assign-table",
+                                thead {
+                                    tr {
+                                        th { "Address" }
+                                        th { style: "width: 132px;", "Would be able to" }
+                                        th { style: "width: 96px;", "Invited" }
+                                        th { style: "width: 96px;", "" }
+                                    }
+                                }
+                                tbody {
+                                    for invitation in waiting.iter() {
+                                        {
+                                            let email = invitation.email.clone();
+                                            rsx! {
+                                                tr { key: "i{invitation.email}",
+                                                    td { "{invitation.email}" }
+                                                    td { "{what_they_can_do(&invitation.role)}" }
+                                                    td { "{invitation.sent_on}" }
+                                                    td {
+                                                        button {
+                                                            class: "btn",
+                                                            disabled: busy,
+                                                            onclick: move |_| crate::collaborate::cancel_invite(
+                                                                state,
+                                                                email.clone(),
+                                                            ),
+                                                            "Withdraw"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    }
+
+                    if owner {
+                        div { class: "sep" }
+                        h3 { class: "opt-sub", "Invite somebody" }
+                        div { class: "ext-add",
+                            input {
+                                class: "bs-input",
+                                r#type: "email",
+                                placeholder: "their.address@example.com",
+                                value: "{typed}",
+                                oninput: move |event| state.write().invite_email = event.value(),
+                            }
+                            // Two buttons rather than a list to choose from.
+                            // There are two answers, and what each one means is
+                            // shorter written out than explained underneath.
+                            button {
+                                class: if role == "editor" { "btn primary" } else { "btn" },
+                                onclick: move |_| state.write().invite_role = "editor".into(),
+                                "Can edit"
+                            }
+                            button {
+                                class: if role == "viewer" { "btn primary" } else { "btn" },
+                                onclick: move |_| state.write().invite_role = "viewer".into(),
+                                "Can only look"
+                            }
+                            button {
+                                class: "btn primary",
+                                disabled: busy,
+                                onclick: move |_| crate::collaborate::invite(state),
+                                "Invite"
+                            }
+                        }
+                        p { class: "hint",
+                            "The address has to be the one they sign in with, and their \
+                             identity provider has to have confirmed it: an address nobody \
+                             has confirmed is one anybody could have typed, so the server \
+                             will not admit somebody on the strength of it. Send them the \
+                             share link as well, so their copy knows which plan to ask for."
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(message) = &message {
+            p { class: "opt-note", "{message}" }
+        }
+
+        div { class: "opt-actions",
+            match &blocked {
+                Some(why) => rsx! {
+                    button { class: "btn", disabled: true, "Refresh" }
+                    span { class: "opt-why", "{why}" }
+                },
+                None => rsx! {
+                    button {
+                        class: "btn",
+                        onclick: move |_| crate::collaborate::sharing(state),
+                        "Refresh"
+                    }
+                    span { class: "opt-why",
+                        "Read when this page opens, and not kept up to date afterwards. \
+                         Somebody else can change this from their own machine and nothing \
+                         here would hear about it."
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// What to call a member on screen.
+///
+/// The address when there is one, which there is for anybody who came in by an
+/// invitation and for nobody else. The subject is never shown: it is a UUID an
+/// identity provider minted, it means nothing to the person reading it, and a
+/// row labelled with one is a row nobody can safely press Remove on.
+fn who_is(member: &crate::cloud::collab::Member, owner: &str, you: &str) -> String {
+    if member.subject == you {
+        return "You".to_string();
+    }
+    match member.email.as_deref() {
+        Some(email) => email.to_string(),
+        None if member.subject == owner => "Whoever made this plan".to_string(),
+        // Reachable only for a membership that predates invitations, or one
+        // written into the database by hand. Saying so is better than showing
+        // an identifier that looks like it might mean something.
+        None => "Somebody added before invitations existed".to_string(),
+    }
+}
+
+/// A role, said as what it lets somebody do.
+fn what_they_can_do(role: &str) -> &'static str {
+    match role {
+        "owner" => "Everything",
+        "editor" => "Edit the plan",
+        "viewer" => "Look, not change",
+        _ => "Something this copy does not know",
+    }
+}
+
+/// Who this copy is signed in as, and the one place to do anything about it.
+///
+/// A card rather than a paragraph, because "who am I signed in as" is a thing
+/// people look at rather than read. Everything that is true but reassuring
+/// lives under Details: how long the pass lasts, which machine it is tied to,
+/// where the tokens sit. Said once, and out of the way of what somebody came
+/// here to do.
+///
+/// Managing the account itself happens in the browser, at the provider. The
+/// browser already has the session, the provider owns changing a password or
+/// an address, and a desktop application that collects a password is a place
+/// credentials can be taken with nothing gained. So there is nothing to edit
+/// here, on purpose.
+#[component]
+fn AccountCard() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let (account, device, working) = {
+        let s = state.read();
+        (s.account.clone(), s.device.clone(), s.working)
+    };
+    // Read off the session rather than off the settings: what matters here is
+    // which provider this sign in actually came from, which is not necessarily
+    // what the boxes above say today.
+    let signed_in_at = state.read().session_summary();
+    let manage = state.read().account_page_url();
+    let manage_offered = manage.is_some();
+    let cannot_sign_in = state.read().sign_in_blocked();
+    let issuer = state.read().idp_issuer.clone();
+
+    let Some(account) = account else {
+        return rsx! {
+            div { class: "acct-card",
+                div { class: "acct-avatar nobody", {icon("account", 22)} }
+                div { class: "acct-who",
+                    div { class: "acct-name", "Not signed in" }
+                    div { class: "acct-email",
+                        "Nothing leaves this machine until somebody signs in."
+                    }
+                }
+                div { class: "acct-actions",
+                    match (working, &cannot_sign_in) {
+                        // The wait is the whole reason this state is drawn: a
+                        // browser opens somewhere else and this window looks
+                        // asleep. A button that says nothing gets pressed
+                        // twice, and the second press is a second sign in.
+                        (Some(Working::SigningIn), _) => rsx! {
+                            button { class: "btn primary", disabled: true,
+                                "Waiting for your browser..."
+                            }
+                        },
+                        (_, Some(_)) => rsx! {
+                            button { class: "btn primary", disabled: true,
+                                "Sign in with your browser"
+                            }
+                        },
+                        (_, None) => rsx! {
+                            button {
+                                class: "btn primary",
+                                onclick: move |_| crate::collaborate::sign_in(state),
+                                "Sign in with your browser"
+                            }
+                        },
+                    }
+                }
+            }
+            match (working, &cannot_sign_in) {
+                (Some(Working::SigningIn), _) => rsx! {
+                    p { class: "opt-aside",
+                        "Your browser has opened. Finish signing in there and this window will \
+                         carry on by itself."
+                    }
+                },
+                (_, Some(why)) => rsx! { p { class: "opt-aside", "{why}" } },
+                (_, None) => rsx! {
+                    p { class: "opt-aside",
+                        "This opens your browser at {issuer}. Come back here when it says you \
+                         are done."
+                    }
+                },
+            }
+        };
+    };
+
+    rsx! {
+        div { class: "acct-card",
+            div { class: "acct-avatar",
+                match &account.picture {
+                    // Left to the webview, which fetches it the way it fetches
+                    // anything else on a page. Nothing here waits on it, and
+                    // the address was checked for a safe scheme where the
+                    // claim was read.
+                    Some(url) => rsx! { img { class: "acct-face", src: "{url}", alt: "" } },
+                    // The ordinary case today: the provider serves no picture,
+                    // so the initials are the picture rather than a placeholder
+                    // waiting for one.
+                    None => rsx! { span { class: "acct-initials", "{account.initials()}" } },
+                }
+            }
+            div { class: "acct-who",
+                div { class: "acct-name", "{account.name}" }
+                if !account.email.is_empty() {
+                    div { class: "acct-email", "{account.email}" }
+                }
+            }
+            div { class: "acct-actions",
+                if let Some(url) = manage {
+                    button {
+                        class: "btn primary",
+                        disabled: working.is_some(),
+                        onclick: move |_| {
+                            // Handing an address to the desktop is a spawn and
+                            // no more: nothing here goes near the network or
+                            // waits for the browser. The one thing that can go
+                            // wrong says so where the other cloud messages do.
+                            match crate::cloud::oauth::open_in_browser(&url) {
+                                // Remembered, so that coming back to this
+                                // window is taken as "they may have changed
+                                // something" and the details are read again.
+                                // Nothing else ever says that they did.
+                                Ok(()) => state.write().account_page_opened = true,
+                                Err(why) => {
+                                    state.write().cloud_message = Some(why.to_string())
+                                }
+                            }
+                        },
+                        "Manage account"
+                    }
+                }
+                // A way to ask, rather than wait to be told. Opening this
+                // page already refreshes, and returning to the window usually
+                // does, but "usually" is doing real work in that sentence: a
+                // compositor need not report focus, and somebody who has just
+                // changed their picture in a browser wants a button, not a
+                // rule about when it happens by itself.
+                button {
+                    class: "btn",
+                    disabled: working.is_some(),
+                    onclick: move |_| {
+                        // Stamped here so the automatic triggers do not
+                        // immediately ask again on top of this one.
+                        state.write().account_checked_at = Some(std::time::Instant::now());
+                        crate::collaborate::refresh_account(state);
+                    },
+                    "Refresh"
+                }
+                // Reachable, and deliberately quieter than managing the
+                // account: signing out is the rarer of the two and the one
+                // nobody wants to press by accident.
+                button {
+                    class: "btn",
+                    disabled: working.is_some(),
+                    onclick: move |_| crate::collaborate::sign_out(state),
+                    "Sign out"
+                }
+            }
+        }
+
+        if manage_offered {
+            p { class: "opt-aside",
+                "Your name, address and picture are changed on your account page, in your \
+                 browser. This application never asks for your password."
+            }
+        }
+
+        // Collapsed, because these are answers to questions nobody asks twice.
+        details { class: "acct-details",
+            summary { "Details" }
+            if let Some((at, until)) = &signed_in_at {
+                p { "Signed in at {at}. This pass lasts until {until}, and is renewed by itself before then." }
+            }
+            if let Some(device) = &device {
+                p {
+                    "Tied to this machine ({device}), so the stored sign in is no use on another \
+                     one. Replace the hardware and you simply sign in again."
+                }
+            }
+            p { "Where the sign in is kept: {crate::cloud::tokens::store().describe()}" }
         }
     }
 }
@@ -1392,18 +1991,65 @@ fn OptGeneral() -> Element {
         let s = state.read();
         (s.user_name.clone(), s.user_initials.clone(), s.default_view)
     };
+    let (update_check, patch_notes, support_page) = {
+        let s = state.read();
+        (s.update_check, s.patch_notes, s.support_page)
+    };
+    // The name on the account, while there is one. It is the name written
+    // against every change in a shared plan, so it is the name to show here:
+    // somebody who calls themselves one thing in this box and appears to their
+    // colleagues as another has no way of finding that out.
+    // Filtered the same way `display_name` filters it, so what is shown here
+    // is exactly what will be written against a change rather than nearly.
+    let from_server = {
+        let s = state.read();
+        s.account
+            .as_ref()
+            .map(|account| account.name.trim().to_string())
+            .filter(|name| !name.is_empty())
+    };
+    let collaborate = state.read().collaborate;
 
     rsx! {
         h2 { class: "opt-head", "Personalize your copy of Alterion Open Project" }
-        Setting { label: "User name".to_string(), hint: "Stored as the project author".to_string(),
-            input { class: "bs-input", value: "{name}",
-                oninput: move |event| {
-                    let value = event.value();
-                    let mut writer = state.write();
-                    writer.project.author = value.clone();
-                    writer.user_name = value;
-                },
-            }
+        match &from_server {
+            Some(server_name) => rsx! {
+                Setting {
+                    label: "User name".to_string(),
+                    hint: "From your Alterion account. Changed on your account page, in Options under Alterion Collaborate.".to_string(),
+                    input { class: "bs-input", value: "{server_name}", disabled: true }
+                }
+                p { class: "opt-aside",
+                    "This is the name other people see against your changes in a shared plan."
+                }
+                // Not thrown away, and said so. Somebody who typed a name here
+                // before signing in should be able to see that it is still
+                // there rather than wonder what happened to it.
+                if !name.trim().is_empty() && name.trim() != server_name {
+                    p { class: "opt-aside",
+                        "The name you typed here, {name}, is kept on this machine and used again \
+                         when you sign out."
+                    }
+                }
+            },
+            None => rsx! {
+                Setting { label: "User name".to_string(), hint: "Stored as the project author".to_string(),
+                    input { class: "bs-input", value: "{name}",
+                        oninput: move |event| {
+                            let value = event.value();
+                            let mut writer = state.write();
+                            writer.project.author = value.clone();
+                            writer.user_name = value;
+                        },
+                    }
+                }
+                if collaborate {
+                    p { class: "opt-aside",
+                        "Signing in shows your account name here instead, since that is the one \
+                         your colleagues see. This one is kept either way."
+                    }
+                }
+            },
         }
         Setting { label: "Initials".to_string(), hint: String::new(),
             input { class: "bs-input", style: "max-width: 110px;", value: "{initials}",
@@ -1446,6 +2092,17 @@ fn OptGeneral() -> Element {
                 },
             }
         }
+
+        h2 { class: "opt-head", "Updates" }
+        p { class: "opt-note",
+            "Nothing is downloaded or installed without being asked for. Turning the check off              stops it happening at all, including at start up."
+        }
+        OptCheck { label: "Check for a newer version".to_string(), on_state: update_check,
+            on: move |_| { let on = state.read().update_check; state.write().update_check = !on; } }
+        OptCheck { label: "Show what changed after an update".to_string(), on_state: patch_notes,
+            on: move |_| { let on = state.read().patch_notes; state.write().patch_notes = !on; } }
+        OptCheck { label: "Offer the support page after an update".to_string(), on_state: support_page,
+            on: move |_| { let on = state.read().support_page; state.write().support_page = !on; } }
     }
 }
 

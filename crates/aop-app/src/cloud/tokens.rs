@@ -69,14 +69,18 @@ use crate::cloud::device;
 /// hour these tokens last, so in practice nothing ever meets an expired one.
 pub const EARLY_REFRESH_SECONDS: i64 = 120;
 
-/// What the session is filed under, wherever it is filed.
+/// What the session is filed under in the Keychain.
 ///
-/// Named for the product rather than the crate, because on macOS this is what a
-/// person sees in Keychain Access when they go looking.
+/// Named for the product rather than the crate, because this is what a person
+/// sees in Keychain Access when they go looking. macOS only, because it is the
+/// only store that files things under a name: the others are a path and a
+/// registry value.
+#[cfg(target_os = "macos")]
 pub const SERVICE_NAME: &str = "Alterion Open Project";
 
 /// The one entry within it: one signed in account, which is what the
 /// application supports.
+#[cfg(target_os = "macos")]
 pub const ACCOUNT_NAME: &str = "cloud-session";
 
 /// Everything needed to pick a session back up, and nothing else.
@@ -98,6 +102,10 @@ pub struct Stored {
     pub name: String,
     #[serde(default)]
     pub email: String,
+    /// The account picture, when the provider serves one. Defaulted so a
+    /// record written by a build that knew nothing about it still reads.
+    #[serde(default)]
+    pub picture: Option<String>,
 }
 
 /// Written out by hand so a token cannot reach a log through a stray `{:?}`.
@@ -890,16 +898,7 @@ fn platform_store() -> Box<dyn TokenStore> {
 /// The store the application is using.
 static STORE: OnceLock<Box<dyn TokenStore>> = OnceLock::new();
 
-/// Choose where sessions are kept.
-///
-/// For tests and for anyone who has somewhere better. Called once at start up,
-/// before anything signs in; a second call is ignored rather than swapping the
-/// store out from under a live session, and says so.
-pub fn use_store(store: Box<dyn TokenStore>) -> bool {
-    STORE.set(store).is_ok()
-}
-
-/// The store, which is this platform's own unless one was chosen.
+/// The store this platform uses, made once and kept.
 pub fn store() -> &'static dyn TokenStore {
     STORE.get_or_init(platform_store).as_ref()
 }
@@ -982,7 +981,7 @@ mod tests {
 
     fn sample() -> Stored {
         Stored {
-            issuer: "https://auth.coraldune.cloud".into(),
+            issuer: "https://auth.example.org".into(),
             client_id: "alterion-open-project".into(),
             access_token: "an-access-token".into(),
             refresh_token: "a-refresh-token".into(),
@@ -990,6 +989,7 @@ mod tests {
             subject: "0198f0c2-0000-7000-8000-000000000000".into(),
             name: "Ada Lovelace".into(),
             email: "ada@example.org".into(),
+            picture: None,
         }
     }
 
@@ -1431,7 +1431,7 @@ mod tests {
 
     #[test]
     fn a_record_from_an_older_build_without_a_name_still_reads() {
-        let text = r#"{"issuer":"https://auth.coraldune.cloud","client_id":"app",
+        let text = r#"{"issuer":"https://auth.example.org","client_id":"app",
             "access_token":"a","expires_at":1,"subject":"s"}"#;
         let back: Stored = serde_json::from_str(text).expect("deserialise");
         assert!(back.refresh_token.is_empty());

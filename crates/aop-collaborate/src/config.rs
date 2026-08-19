@@ -26,9 +26,12 @@ bind_port = 8090
 url = postgres://aop:aop@localhost:5432/aop_sync
 
 [idp]
-# The Alterion identity provider. Point this at your own instance and every
-# other endpoint follows from its discovery document.
-issuer = https://auth.coraldune.cloud
+# The Alterion identity provider, which you host. There is no default: this
+# server sends bearer tokens here to have them introspected, so a default
+# would mean an unconfigured deployment handing its users' tokens to whoever
+# owns that address. Set it, and every other endpoint follows from its
+# discovery document.
+issuer =
 # Only needed if your IdP requires client authentication on introspection.
 client_id =
 client_secret =
@@ -46,7 +49,11 @@ allowed_origins = http://localhost:1420
 snapshot_every = 500
 
 [logging]
-level = info
+# `sqlx::query` is turned down on purpose. At info it logs every statement in
+# full, and those statements carry plan content, so the log becomes a second
+# copy of the data under different permissions and a different retention.
+# Raise it deliberately when debugging a query, not by default.
+level = info,sqlx::query=warn
 "#;
 
 /// Everything the server needs to start, already resolved.
@@ -122,7 +129,7 @@ impl Config {
             // Trailing slashes are stripped once, here, so nothing downstream
             // ever builds a URL with a double slash in it.
             issuer: read("idp", "issuer")
-                .unwrap_or_else(|| "https://auth.coraldune.cloud".into())
+                .unwrap_or_default()
                 .trim_end_matches('/')
                 .to_string(),
             idp_client_id: read("idp", "client_id"),
@@ -144,7 +151,38 @@ impl Config {
                 .and_then(|v| v.parse::<i64>().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(500),
-            log_level: read("logging", "level").unwrap_or_else(|| "info".into()),
+            log_level: read("logging", "level")
+                .unwrap_or_else(|| "info,sqlx::query=warn".into()),
         }
+    }
+
+    /// Refuse to start on a configuration that cannot work, rather than
+    /// serving requests that will all fail at introspection time.
+    ///
+    /// This is separate from `from_ini` so that parsing stays total: reading a
+    /// half filled file is fine, running on one is not.
+    pub fn validate(&self) -> Result<()> {
+        if self.issuer.is_empty() {
+            return Err(anyhow!(
+                "no identity provider configured. Set idp.issuer in config.cfg \
+                 (or AOP_COLLAB_IDP_ISSUER) to your own Alterion identity \
+                 provider, for example https://auth.example.com"
+            ));
+        }
+        // Introspection sends a bearer token to this address on every request
+        // that misses the cache. Over plain http that token is readable by
+        // anything on the path, so it is refused outright rather than warned
+        // about. Loopback is exempt because it never leaves the machine.
+        let loopback = self.issuer.starts_with("http://127.0.0.1")
+            || self.issuer.starts_with("http://[::1]")
+            || self.issuer.starts_with("http://localhost");
+        if !self.issuer.starts_with("https://") && !loopback {
+            return Err(anyhow!(
+                "idp.issuer must be https, since tokens are sent to it for \
+                 introspection. Got: {}",
+                self.issuer
+            ));
+        }
+        Ok(())
     }
 }

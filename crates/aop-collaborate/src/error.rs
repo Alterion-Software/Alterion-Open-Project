@@ -81,6 +81,15 @@ impl ResponseError for SyncError {
                 log::error!("internal error: {why}");
                 "internal error".to_string()
             }
+            // The reason an identity provider call failed is operational: an
+            // operator reading the log is exactly who needs it, and it names
+            // no secret. Returning it to the caller while logging nothing
+            // meant the server knew why and told only the one party that
+            // could do least about it.
+            Self::Idp(why) => {
+                log::warn!("identity provider: {why}");
+                self.to_string()
+            }
             other => other.to_string(),
         };
         HttpResponse::build(self.status_code()).json(json!({

@@ -3,6 +3,7 @@
 pub mod changes;
 pub mod health;
 pub mod live;
+pub mod members;
 pub mod projects;
 
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder};
@@ -24,7 +25,30 @@ pub fn routes(cfg: &mut actix_web::web::ServiceConfig) {
         .service(projects::put_snapshot)
         .service(changes::list)
         .service(changes::push)
+        .service(members::list)
+        .service(members::invite)
+        .service(members::cancel)
+        .service(members::remove)
+        .service(members::claim)
         .service(live::live);
+}
+
+/// This subject's role on this project, or nothing, without deciding what
+/// nothing means.
+///
+/// Almost every caller wants [`role_on`], which turns the absence into the
+/// answer a non-member gets. This exists for the sharing routes, where the
+/// absence and a role that is merely not the owner's are two different
+/// refusals and the choice between them is made in [`crate::sharing`].
+pub async fn held_by(
+    db: &impl ConnectionTrait,
+    project: Uuid,
+    subject: &str,
+) -> Result<Option<String>, SyncError> {
+    Ok(project_members::Entity::find_by_id((project, subject.to_string()))
+        .one(db)
+        .await?
+        .map(|member| member.role))
 }
 
 /// This subject's role on this project.
@@ -38,11 +62,7 @@ pub async fn role_on(
     project: Uuid,
     subject: &str,
 ) -> Result<String, SyncError> {
-    project_members::Entity::find_by_id((project, subject.to_string()))
-        .one(db)
-        .await?
-        .map(|member| member.role)
-        .ok_or(SyncError::NotFound)
+    held_by(db, project, subject).await?.ok_or(SyncError::NotFound)
 }
 
 /// The same, refusing a reader who is trying to write.

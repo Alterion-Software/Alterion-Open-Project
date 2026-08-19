@@ -10,7 +10,7 @@ name = "aop-collaborate"
 path = "src/main.rs"
 
 [dependencies]
-aop-core = { version = "1.0.0-beta", path = "../aop-core" }
+aop-core = { version = "1.0.1-beta", path = "../aop-core" }
 
 # Framework versions MUST match the Alterion identity provider, so a self-hoster
 # running both ends up with one copy of the actix and sea-orm trees.

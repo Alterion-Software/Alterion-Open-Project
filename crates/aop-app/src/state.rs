@@ -245,6 +245,17 @@ pub struct ColumnSpec {
 #[derive(Clone, Copy)]
 pub struct Hovered(pub dioxus::prelude::Signal<Option<usize>>);
 
+/// Where this planner's own pointer is, in plan coordinates, for the others.
+///
+/// Its own signal for the same reason `Hovered` is, and more so. A mouse
+/// produces events faster than anything should redraw for, and this is written
+/// on every one of them: putting it on `AppState` would redraw the window
+/// whenever the pointer moved a pixel. Nothing renders from it. The timer that
+/// already reads the live socket picks it up, which is also what throttles it
+/// to a few messages a second rather than one per movement.
+#[derive(Clone, Copy)]
+pub struct Pointing(pub dioxus::prelude::Signal<Option<crate::cloud::live::Pointer>>);
+
 impl ColumnSpec {
     pub fn new(field: Field) -> Self {
         Self {
@@ -289,10 +300,15 @@ pub enum QatCommand {
     ScrollToTask,
     ZoomIn,
     ZoomOut,
+    /// Open or close History and Sync, which is where everything to do with
+    /// the server is answered.
+    Cloud,
+    /// Start live editing and copy the link to this plan, in one press.
+    Collaborate,
 }
 
 impl QatCommand {
-    pub const ALL: [QatCommand; 16] = [
+    pub const ALL: [QatCommand; 18] = [
         QatCommand::New,
         QatCommand::Open,
         QatCommand::Save,
@@ -309,6 +325,8 @@ impl QatCommand {
         QatCommand::ScrollToTask,
         QatCommand::ZoomIn,
         QatCommand::ZoomOut,
+        QatCommand::Cloud,
+        QatCommand::Collaborate,
     ];
 
     pub fn label(self) -> &'static str {
@@ -329,6 +347,11 @@ impl QatCommand {
             QatCommand::ScrollToTask => "Scroll to Task",
             QatCommand::ZoomIn => "Zoom In",
             QatCommand::ZoomOut => "Zoom Out",
+            QatCommand::Cloud => "History and Sync",
+            // What it does rather than what it is about, because it does two
+            // things at once and a planner should not have to press it to find
+            // out which. The toolbar says which of the two it will do next.
+            QatCommand::Collaborate => "Collaborate: Start Live Editing and Copy the Link",
         }
     }
 
@@ -350,6 +373,8 @@ impl QatCommand {
             QatCommand::ScrollToTask => "scroll-to-task",
             QatCommand::ZoomIn => "zoom-in",
             QatCommand::ZoomOut => "zoom-out",
+            QatCommand::Cloud => "cloud",
+            QatCommand::Collaborate => "share",
         }
     }
 
@@ -371,6 +396,8 @@ impl QatCommand {
             QatCommand::ScrollToTask => "scroll",
             QatCommand::ZoomIn => "zoom-in",
             QatCommand::ZoomOut => "zoom-out",
+            QatCommand::Cloud => "cloud",
+            QatCommand::Collaborate => "collaborate",
         }
     }
 
@@ -576,6 +603,45 @@ pub enum Dialog {
     InsertColumn(usize),
     /// Who changed what, and when, newest first.
     History,
+    /// Somebody pushed first. What they did, and the choice about it.
+    SyncBehind {
+        /// The server's head, which is what this copy syncs to if it takes
+        /// the changes.
+        head: i64,
+        /// What their work did, in one sentence.
+        sentence: String,
+        /// The differences themselves, worked out before the question was
+        /// asked so the answer is against something real.
+        differences: Vec<aop_core::compare::Difference>,
+        /// The entries, for the plan's own log.
+        changes: Vec<aop_core::history::Change>,
+        /// How many of their commands could be replayed here, and how many
+        /// there were. Fewer replayed than came means the two sides have
+        /// already drifted, which is decided before anything is applied.
+        replayed: usize,
+        asked: usize,
+        /// Whether more is waiting beyond this page.
+        more: bool,
+    },
+    /// This copy's cursor is past the server's, so the two are not the same
+    /// log and pushing would interleave two histories.
+    SyncAhead { head: i64, cursor: i64 },
+    /// Replaying is no longer possible, so only a whole plan will do.
+    FreshCopy { why: String },
+    /// Put the plan back to one of its versions.
+    RestoreVersion(usize),
+    /// What the collaborate health check found.
+    HealthCheck,
+    /// A newer release, what this copy may do about it, and how to get it
+    /// where it may not.
+    UpdateAvailable,
+    /// A link somebody opened, and the server it says to go and ask.
+    ///
+    /// Always asked before anything is fetched. A link is an instruction from
+    /// a stranger to talk to a host of their choosing, and which host that is
+    /// belongs in front of the person before the request goes, not in a log
+    /// afterwards.
+    OpenLink(crate::cloud::share::Share),
     Message { title: String, body: String },
 }
 
@@ -665,11 +731,184 @@ pub enum Column {
     Resources,
 }
 
+/// How often the interface looks at the live socket.
+///
+/// The socket runs on a thread of its own and the plan may only be written
+/// where the interface does, so arrivals are collected rather than pushed.
+/// Fast enough that somebody else's typing appears while they are still doing
+/// it, slow enough that it is not a redraw loop.
+pub const LIVE_POLL_MILLIS: u64 = 350;
+
+/// What the network is doing, so a button can say so rather than looking
+/// broken.
+///
+/// A sign in waits on a person in a browser, which can be minutes. Anything
+/// that long has to say what it is waiting for, or it gets pressed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Working {
+    SigningIn,
+    SigningOut,
+    Syncing,
+    Fetching,
+    Publishing,
+    Checking,
+    RunningHealthCheck,
+    ReadingAccount,
+    ReadingSharing,
+    ChangingSharing,
+}
+
+impl Working {
+    /// What to show while it runs.
+    pub fn waiting(self) -> &'static str {
+        match self {
+            Working::SigningIn => {
+                "Your browser has opened. This window is waiting for you to finish signing in there."
+            }
+            Working::SigningOut => "Signing out...",
+            Working::Syncing => "Sending your changes and asking for anything new...",
+            Working::Fetching => "Fetching a fresh copy of the plan from the server...",
+            Working::Publishing => "Putting this plan on the server...",
+            Working::Checking => "Asking the server where this plan has got to...",
+            Working::RunningHealthCheck => "Checking the server and the sign in...",
+            Working::ReadingAccount => "Reading your account details again...",
+            Working::ReadingSharing => "Asking the server who this plan is shared with...",
+            Working::ChangingSharing => "Telling the server who this plan is shared with...",
+        }
+    }
+}
+
+/// What the server said when it was last asked, and when that was.
+///
+/// Kept rather than inferred, because "nothing has changed here since I last
+/// pushed" and "the server agrees this is the latest version" are different
+/// claims, and only the second one is worth a tick.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Checked {
+    pub at: NaiveDateTime,
+    pub outcome: CheckOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// Asked, and the server agreed this copy has everything.
+    Current,
+    /// The server holds work this copy has not read.
+    Behind { by: i64 },
+    /// The question could not be put.
+    Failed(String),
+}
+
+/// What happened when somebody else's work was brought in.
+///
+/// Two counts and a verdict, because a batch can go wrong in two ways: a
+/// command that will not replay here, and a difference that will not apply.
+/// Either means the two sides no longer agree about what the plan was.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BroughtIn {
+    pub applied: aop_core::compare::Applied,
+    /// How many of the incoming commands could be replayed here.
+    pub replayed: usize,
+    pub sent: usize,
+}
+
+impl BroughtIn {
+    /// Whether everything took. False means the honest next step is a whole
+    /// plan, not carrying on.
+    pub fn is_clean(&self) -> bool {
+        self.applied.is_clean() && self.replayed == self.sent
+    }
+
+    /// Why it is not clean, for a dialog that has to say.
+    pub fn why(&self) -> String {
+        let mut parts = Vec::new();
+        if self.replayed < self.sent {
+            parts.push(format!(
+                "{} of the {} commands that came in could not be replayed here",
+                self.sent - self.replayed,
+                self.sent
+            ));
+        }
+        if !self.applied.is_clean() {
+            parts.push(format!(
+                "{} of the changes they made do not fit this copy of the plan",
+                self.applied.rejected.len()
+            ));
+        }
+        parts.join(", and ")
+    }
+}
+
+/// Which machine a session is bound to, in a form worth showing.
+///
+/// Enough of the fingerprint to tell one of your machines from another, and no
+/// more: the whole value identifies a machine and has no business being copied
+/// about. A session is sealed to it, so a stolen file is no use elsewhere.
+fn describe_device() -> Option<String> {
+    let components = crate::cloud::device::components().ok()?;
+    let fingerprint = components.fingerprint_hex();
+    let short: String = fingerprint.chars().take(8).collect();
+    Some(format!("{} ({short})", components.platform))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecentEntry {
     pub name: String,
     pub path: PathBuf,
 }
+
+/// How stale the account details may get before something worth a request has
+/// happened. Long enough that alt-tabbing or reopening a page costs nothing,
+/// short enough that a picture uploaded a moment ago appears on the way back.
+/// Whether a file browser should offer this file.
+///
+/// One answer, because there were three and they disagreed: the Open page
+/// showed no workbook at all, the browser showed `.xlsx` but not `.xls`,
+/// `.xlsm` or `.ods`, and `open_any` opens all of them. A file the
+/// application can read but will not show is indistinguishable from one it
+/// cannot read.
+///
+/// `saving` narrows it to what Save As can write, which is the plan format
+/// alone: saving a plan as a workbook would lose most of it.
+pub fn offered_in_browser(path: &std::path::Path, saving: bool) -> bool {
+    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if extension.eq_ignore_ascii_case(aop_core::persist::FILE_EXTENSION) {
+        return true;
+    }
+    !saving
+        && aop_core::persist::IMPORTED_EXTENSIONS
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+}
+
+/// The places a browser can start from when there is nowhere above the
+/// current folder.
+///
+/// On Windows the parent of `C:\` is nothing, so walking up from a folder
+/// strands you on whichever drive you began on: a workbook on `D:` or a
+/// network share simply cannot be reached. Every other platform has one root
+/// that contains everything, so this is empty there and the Up button alone
+/// is enough.
+pub fn browser_roots() -> Vec<(String, std::path::PathBuf)> {
+    #[cfg(windows)]
+    {
+        // Probing letters is how this is done without pulling in a Windows
+        // API crate for one list; a drive that is not there simply fails.
+        (b'A'..=b'Z')
+            .map(|letter| format!("{}:\\", letter as char))
+            .filter(|root| std::path::Path::new(root).exists())
+            .map(|root| (root.clone(), std::path::PathBuf::from(root)))
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+pub const ACCOUNT_RECHECK: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub struct AppState {
     pub project: Project,
@@ -766,7 +1005,99 @@ pub struct AppState {
     /// would have to keep hidden on disk.
     pub idp_issuer: String,
     pub idp_client_id: String,
+    /// Where Manage account opens, when a deployment has moved that page off
+    /// its issuer. Empty is the ordinary case and means "under the issuer".
+    pub idp_account_url: String,
+    /// Where the sync server lives. A different machine from the provider, so
+    /// a different address.
+    pub collaborate_server: String,
     pub collaborate: bool,
+
+    // ---- the licence, what changed, and updates -------------------------
+    /// The start up pages this launch still owes, front first.
+    pub greetings: Vec<crate::welcome::Greeting>,
+    /// Which version's licence was acknowledged, and when. Empty until it has
+    /// been, and that emptiness is the only thing that shows it.
+    pub licence_acknowledged: String,
+    pub licence_acknowledged_at: String,
+    /// The version this copy last started as, written down at start up so
+    /// "once per update" survives being closed part way through.
+    pub last_version: String,
+    pub patch_notes: bool,
+    pub support_page: bool,
+    pub update_check: bool,
+    /// A newer release, once one has been found.
+    pub update_found: Option<crate::updates::Found>,
+    /// The last thing the updater had to say, for the page that asked. Never
+    /// raised on its own: failing to reach a release host is not news.
+    pub update_message: Option<String>,
+    /// Whether the updater is doing something at this moment.
+    pub updating: bool,
+    /// An installer that has been fetched and checked, waiting to be run.
+    pub update_ready: Option<crate::updates::Installed>,
+    /// Whoever is signed in.
+    ///
+    /// Taken out of here while a worker is using it and put back when it comes
+    /// home. There is deliberately no way to copy one: the server spends a
+    /// refresh token the moment it is used and treats a second use of the same
+    /// one as theft, so two sessions renewing from one stored record would
+    /// revoke the account they share.
+    pub session: Option<crate::cloud::Session>,
+    /// Who that is, kept beside the session so the page can still say who is
+    /// signed in while a worker has it.
+    pub account: Option<crate::cloud::Account>,
+    /// The machine this session is bound to, shown so a planner can tell one
+    /// of their machines from another.
+    pub device: Option<String>,
+    /// What the network is doing, if anything.
+    pub working: Option<Working>,
+    /// The last thing the collaborate machinery had to say, shown on the
+    /// Options page and in the sync view.
+    pub cloud_message: Option<String>,
+    /// Where this plan lives on a server, once it has been put on one.
+    pub link: Option<crate::cloud::link::Link>,
+    /// The live socket, while there is one.
+    pub live: Option<crate::cloud::live::Live>,
+    /// Whether live editing has been asked for. Separate from the socket,
+    /// because a socket that drops should not look like a choice being undone.
+    pub live_wanted: bool,
+    /// Who else has this plan open.
+    pub peers: Vec<crate::cloud::live::Peer>,
+    /// The row the others were last told this planner is on. Remembered so
+    /// only a move is sent: the socket is polled several times a second, and
+    /// saying "still on row 12" that often is a lot of frames to say nothing.
+    told_row: Option<i64>,
+    /// Where the others were last told this planner's pointer is. Remembered
+    /// for the same reason the row is: the timer asks several times a second,
+    /// and a pointer that has not moved anywhere new is not worth a frame.
+    told_at: Option<crate::cloud::live::Pointer>,
+    /// What the server said when it was last asked.
+    pub checked: Option<Checked>,
+    /// Who this plan is shared with, once somebody has asked. `None` means
+    /// nobody has asked, which is not the same as "nobody": this is read on
+    /// demand rather than kept up to date, because it changes when somebody
+    /// else changes it and there is nothing here that would hear about that.
+    pub sharing: Option<crate::cloud::collab::Sharing>,
+    /// Which plan the list above was asked about. Kept so that opening a
+    /// second plan does not leave the first one's members on screen, and so
+    /// that a read which failed is not retried on every render.
+    pub sharing_for: Option<String>,
+    /// The address being typed into the invite box, and the role beside it.
+    /// Kept here rather than in the component so that a failed invitation does
+    /// not also lose what was typed.
+    pub invite_email: String,
+    pub invite_role: String,
+    /// The last thing the sharing machinery had to say. Its own field rather
+    /// than `cloud_message`, because a sync failure and a refused invitation
+    /// are answers to different questions and one must not overwrite the
+    /// other under somebody's eyes.
+    pub sharing_message: Option<String>,
+    /// The versions this plan can be put back to.
+    pub versions: aop_core::versions::Versions,
+    /// Which version the History and Sync view is showing the difference for.
+    pub version_selected: Option<usize>,
+    /// What the health check found, once it has been run.
+    pub health: Vec<crate::cloud::health::Check>,
     /// The row currently being dragged, and where it would land.
     pub drag_row: Option<usize>,
     pub drop_target: Option<(usize, DropWhere)>,
@@ -784,6 +1115,27 @@ pub struct AppState {
     pub show_critical: bool,
     /// Words told to be left alone for this plan.
     pub ignored_words: std::collections::HashSet<String>,
+    /// Whether somebody has been sent to the provider's account page.
+    ///
+    /// Set when Manage account opens the browser and cleared when this window
+    /// gets the focus back, which is the round trip a change is made in. It is
+    /// the only signal there is: the page belongs to the provider, nothing
+    /// tells this application what happened on it, and the alternative is
+    /// asking on a timer for something that happens a handful of times in an
+    /// account's life.
+    pub account_page_opened: bool,
+    /// When the account details were last read back from the provider. The
+    /// flag above catches the trip through Manage account; this catches
+    /// everything else, including a second upload in a browser tab that was
+    /// already open, without polling for a thing that changes twice a year.
+    pub account_checked_at: Option<std::time::Instant>,
+    /// Whether History and Sync is open beside the plan.
+    ///
+    /// A panel rather than a view, and for the same reason the spelling one
+    /// is. Whether this copy is current, what came in and which version to go
+    /// back to are all things somebody asks *about the plan in front of them*,
+    /// and a view would take the plan off the screen to answer them.
+    pub sync_open: bool,
     /// Whether the spelling panel is open beside the plan.
     ///
     /// A panel rather than a view: correcting a word means seeing the row it is
@@ -863,6 +1215,9 @@ impl AppState {
             quit_requested: false,
             popup_at: (0.0, 0.0),
             editing_resource_field: None,
+            account_page_opened: false,
+            account_checked_at: None,
+            sync_open: false,
             tab: RibbonTab::Task,
             view: ViewKind::GanttChart,
             backstage: Some(BackstagePage::Home),
@@ -873,9 +1228,42 @@ impl AppState {
             selected_drawing: None,
             draw_drag: None,
             show_drawings: true,
-            idp_issuer: crate::settings::DEFAULT_IDP.to_string(),
-            idp_client_id: crate::settings::DEFAULT_CLIENT_ID.to_string(),
+            idp_issuer: String::new(),
+            idp_client_id: String::new(),
+            idp_account_url: String::new(),
+            collaborate_server: String::new(),
             collaborate: false,
+            greetings: Vec::new(),
+            licence_acknowledged: String::new(),
+            licence_acknowledged_at: String::new(),
+            last_version: String::new(),
+            patch_notes: true,
+            support_page: true,
+            update_check: true,
+            update_found: None,
+            update_message: None,
+            updating: false,
+            update_ready: None,
+            session: None,
+            account: None,
+            device: None,
+            working: None,
+            cloud_message: None,
+            link: None,
+            live: None,
+            live_wanted: false,
+            peers: Vec::new(),
+            told_row: None,
+            told_at: None,
+            checked: None,
+            sharing: None,
+            sharing_for: None,
+            invite_email: String::new(),
+            invite_role: "editor".into(),
+            sharing_message: None,
+            versions: aop_core::versions::Versions::new(),
+            version_selected: None,
+            health: Vec::new(),
             drag_row: None,
             drop_target: None,
             backstage_message: None,
@@ -1157,7 +1545,7 @@ impl AppState {
     pub(crate) fn write_change(&mut self, script: String, summary: String) {
         // A blank name is what a fresh install has. Saying so is better than
         // signing somebody else's work with a guess.
-        let author = match self.user_name.trim() {
+        let author = match self.display_name().as_str() {
             "" => "Unknown".to_string(),
             name => name.to_string(),
         };
@@ -1287,8 +1675,24 @@ impl AppState {
         } else {
             Zoom::Days
         };
+        self.plan_changed();
         self.reschedule();
         self.status = format!("Created {}", self.project.name);
+    }
+
+    /// Everything that belongs to the plan rather than to the application,
+    /// pointed at whichever plan is now on screen.
+    ///
+    /// One place for it, because a link left over from the last plan would
+    /// have this one syncing into somebody else's project, and versions left
+    /// over would offer the wrong plan back.
+    fn plan_changed(&mut self) {
+        self.restore_link();
+        self.versions = crate::versions::read(self.file_path.as_deref());
+        self.version_selected = None;
+        self.checked = None;
+        self.cloud_message = None;
+        self.stop_live(None);
     }
 
     pub fn open_path(&mut self, path: PathBuf) {
@@ -1308,6 +1712,7 @@ impl AppState {
                 self.push_recent(&path);
                 self.file_path = Some(path);
                 self.backstage = None;
+                self.plan_changed();
                 self.reschedule();
             }
             Err(error) => {
@@ -1419,7 +1824,15 @@ impl AppState {
         self.show_drawings = settings.show_drawings;
         self.idp_issuer = settings.idp_issuer.clone();
         self.idp_client_id = settings.idp_client_id.clone();
+        self.idp_account_url = settings.idp_account_url.clone();
+        self.collaborate_server = settings.collaborate_server.clone();
         self.collaborate = settings.collaborate;
+        self.licence_acknowledged = settings.licence_acknowledged.clone();
+        self.licence_acknowledged_at = settings.licence_acknowledged_at.clone();
+        self.last_version = settings.last_version.clone();
+        self.patch_notes = settings.patch_notes;
+        self.support_page = settings.support_page;
+        self.update_check = settings.update_check;
         self.keys = settings.keys;
     }
 
@@ -1443,8 +1856,1223 @@ impl AppState {
             show_drawings: self.show_drawings,
             idp_issuer: self.idp_issuer.clone(),
             idp_client_id: self.idp_client_id.clone(),
+            idp_account_url: self.idp_account_url.clone(),
+            collaborate_server: self.collaborate_server.clone(),
             collaborate: self.collaborate,
+            licence_acknowledged: self.licence_acknowledged.clone(),
+            licence_acknowledged_at: self.licence_acknowledged_at.clone(),
+            last_version: self.last_version.clone(),
+            patch_notes: self.patch_notes,
+            support_page: self.support_page,
+            update_check: self.update_check,
             keys: self.keys.clone(),
+        }
+    }
+
+    // ---- the licence, what changed, and the ask -------------------------
+
+    /// Work out which start up pages this launch owes, and record the version
+    /// it is running as.
+    ///
+    /// The version is written down here rather than when the last page is
+    /// dismissed, which is what makes it once per update rather than once per
+    /// start: somebody who closes the window part way through the notes has
+    /// still been shown them, and reopening does not begin again.
+    pub fn begin_greetings(&mut self) {
+        let settings = self.settings();
+        self.greetings = crate::welcome::on_start(&settings, crate::welcome::RUNNING);
+        self.last_version = crate::welcome::RUNNING.to_string();
+    }
+
+    /// The licence has been read. Recorded with the version it was shown for
+    /// and the moment, since a record with only one of those answers half the
+    /// question.
+    pub fn acknowledge_licence(&mut self) {
+        self.licence_acknowledged = crate::welcome::RUNNING.to_string();
+        self.licence_acknowledged_at = chrono::Utc::now().to_rfc3339();
+        self.greeting_answered();
+    }
+
+    /// Done with whichever page was in front.
+    pub fn greeting_answered(&mut self) {
+        if !self.greetings.is_empty() {
+            self.greetings.remove(0);
+        }
+    }
+
+    /// Open the support page because somebody went looking for it, rather than
+    /// because the version moved. Nothing showed it to them, so there is
+    /// nothing to silence and no checkbox is offered.
+    pub fn show_support(&mut self) {
+        self.backstage = None;
+        self.greetings.insert(
+            0,
+            crate::welcome::Greeting::Support {
+                after_update: false,
+            },
+        );
+    }
+
+    // ---- updates --------------------------------------------------------
+
+    /// What a check came back with.
+    ///
+    /// Not reaching a release host is kept for whichever page asked and is
+    /// never raised on its own. Somebody typing into a plan does not need to
+    /// hear that a server they were not thinking about did not answer.
+    pub fn update_landed(&mut self, outcome: Result<Option<crate::updates::Found>, String>) {
+        self.updating = false;
+        match outcome {
+            Ok(Some(found)) => {
+                self.note(format!("Version {} is available", found.version));
+                self.update_message = None;
+                self.update_found = Some(found);
+            }
+            Ok(None) => {
+                self.update_found = None;
+                self.update_message = Some(format!(
+                    "Version {} is the newest there is.",
+                    crate::welcome::RUNNING
+                ));
+            }
+            Err(why) => {
+                self.update_found = None;
+                self.update_message = Some(why);
+            }
+        }
+    }
+
+    /// Why an update cannot be installed at this moment, if it cannot.
+    ///
+    /// Unsaved work comes first: installing replaces the running program, and
+    /// a plan that only exists in this window would go with it.
+    pub fn update_blocked(&self) -> Option<String> {
+        if self.dirty {
+            return Some(
+                "This plan has unsaved changes. Save it first, because installing an update                  replaces the running program."
+                    .into(),
+            );
+        }
+        if self.updating {
+            return Some("An update is already being fetched.".into());
+        }
+        self.update_found.as_ref().and_then(|found| found.why_not())
+    }
+
+    /// What an install came back with.
+    pub fn install_landed(&mut self, outcome: Result<crate::updates::Installed, String>) {
+        self.updating = false;
+        match outcome {
+            Ok(installed) => {
+                self.update_message = Some(match &installed {
+                    crate::updates::Installed::Replaced { kept } => format!(
+                        "The new version is in place and starts the next time you open this                          application. The previous one has been kept at {}.",
+                        kept.display()
+                    ),
+                    crate::updates::Installed::Downloaded { .. } => {
+                        "The installer has been downloaded and checked against its published                          checksum. Running it closes this application."
+                            .into()
+                    }
+                });
+                self.update_ready = Some(installed);
+                self.update_found = None;
+            }
+            Err(why) => self.update_message = Some(why),
+        }
+    }
+
+
+    // ---- Alterion Collaborate -------------------------------------------
+
+    /// Pick up the last run's sign in.
+    ///
+    /// Reads the store and no more, so start up is never held up by a server
+    /// that is slow or absent. A session that has since been ended shows up on
+    /// the first thing that uses it, which is the right moment to hear about
+    /// it rather than during a splash screen.
+    pub fn restore_session(&mut self) {
+        let Some(session) = crate::cloud::restore() else {
+            return;
+        };
+        self.account = Some(session.account().clone());
+        self.device = describe_device();
+        self.session = Some(session);
+    }
+
+    /// The name other people see against this planner's work.
+    ///
+    /// The account's name while there is one, and what was typed in Options
+    /// otherwise. The shared log is written under whoever the server says this
+    /// is, and a local name that disagrees with it is a name only this machine
+    /// ever sees, which is how somebody ends up wondering who made a change
+    /// they made themselves.
+    ///
+    /// The typed name is read, never overwritten. That is what makes signing
+    /// out put it straight back rather than leaving somebody's colleagues'
+    /// idea of them behind on their own machine.
+    pub fn display_name(&self) -> String {
+        match self.account.as_ref() {
+            Some(account) if !account.name.trim().is_empty() => account.name.trim().to_string(),
+            _ => self.user_name.trim().to_string(),
+        }
+    }
+
+    /// Where Manage account opens, if there is anywhere to open.
+    ///
+    /// Off the live session's issuer first: the page belongs to the provider
+    /// this copy actually signed in against, which is not necessarily the
+    /// address in the box today. The settings key overrides both, for a
+    /// deployment that keeps its account page somewhere else.
+    pub fn account_page_url(&self) -> Option<String> {
+        let issuer = match self.session.as_ref() {
+            Some(session) => session.issuer().to_string(),
+            None => self.idp_issuer.clone(),
+        };
+        crate::cloud::account_page(&issuer, &self.idp_account_url)
+    }
+
+    /// Which provider this sign in came from, and how long the current pass
+    /// has left, for showing on the Options page.
+    ///
+    /// Both read off the live session rather than off the settings: what is in
+    /// the boxes is what the next sign in will use, which is not necessarily
+    /// what this one did.
+    pub fn session_summary(&self) -> Option<(String, String)> {
+        let session = self.session.as_ref()?;
+        Some((
+            session.issuer().to_string(),
+            session
+                .expires_at()
+                .naive_local()
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
+        ))
+    }
+
+    /// Forget which plan on the server this one is.
+    ///
+    /// Nothing is removed from either side. It is the answer to a plan that
+    /// turns out to be linked to the wrong project, which is what a cursor
+    /// past the server's head means, and to a copy that should stop syncing.
+    pub fn unlink_plan(&mut self) {
+        if let Some(path) = self.file_path.clone() {
+            crate::cloud::link::forget(&path);
+        }
+        self.link = None;
+        self.checked = None;
+        self.sharing = None;
+        self.sharing_for = None;
+        self.stop_live(None);
+        self.cloud_message = Some(
+            "This plan is no longer linked to a server. Nothing was removed from either side, \
+             and it can be put on a server again."
+                .into(),
+        );
+        self.status = "Unlinked from the server".into();
+    }
+
+    /// Read this plan's link to a server, if it has one.
+    ///
+    /// Keyed by where the plan lives on this machine, so a copy of a plan is a
+    /// separate client of the same project rather than a second copy of one
+    /// cursor.
+    pub fn restore_link(&mut self) {
+        self.link = self
+            .file_path
+            .as_deref()
+            .and_then(crate::cloud::link::load);
+        // Whoever the last plan was shared with has nothing to do with this
+        // one. Dropped rather than left to be replaced, so there is no render
+        // in which one plan's members are shown under another plan's name.
+        self.sharing = None;
+        self.sharing_for = None;
+    }
+
+    /// Take the session for a worker, and say what it is doing.
+    ///
+    /// The session is moved rather than shared. Two of them renewing from one
+    /// stored record would each spend the other's refresh token, and the
+    /// server treats a second use of a spent one as theft against the whole
+    /// account.
+    pub fn hand_over(&mut self, working: Working) -> Option<crate::cloud::Session> {
+        if self.working.is_some() {
+            return None;
+        }
+        let session = self.session.take()?;
+        self.working = Some(working);
+        self.cloud_message = None;
+        Some(session)
+    }
+
+    /// Take the session back when the work is done.
+    pub fn hand_back(&mut self, session: crate::cloud::Session) {
+        self.account = Some(session.account().clone());
+        self.session = Some(session);
+        self.working = None;
+    }
+
+    /// A worker that never came back.
+    ///
+    /// The session went with it, so what is left is whatever the store holds.
+    /// Reading that back is what stops a worker falling over from looking like
+    /// somebody being signed out.
+    pub fn worker_lost(&mut self, what: &str) {
+        self.working = None;
+        self.cloud_message = Some(format!("{what} stopped unexpectedly. Try it again."));
+        if self.session.is_none() {
+            self.restore_session();
+        }
+    }
+
+    /// What is missing before a sign in can be started, if anything.
+    ///
+    /// Named rather than counted, so a disabled button can say which field is
+    /// still needed instead of leaving somebody to guess.
+    pub fn sign_in_blocked(&self) -> Option<&'static str> {
+        if self.idp_issuer.trim().is_empty() {
+            return Some("Fill in the identity provider address first.");
+        }
+        if self.idp_client_id.trim().is_empty() {
+            return Some("Fill in the client ID first.");
+        }
+        if self.working.is_some() {
+            return Some("Something else is talking to the server. Wait for it to finish.");
+        }
+        None
+    }
+
+    /// Hand over what a sign in needs, and mark this copy as waiting.
+    pub fn start_sign_in(&mut self) -> Option<(String, String)> {
+        if self.sign_in_blocked().is_some() {
+            return None;
+        }
+        self.working = Some(Working::SigningIn);
+        self.cloud_message = None;
+        Some((
+            self.idp_issuer.trim().to_string(),
+            self.idp_client_id.trim().to_string(),
+        ))
+    }
+
+    pub fn sign_in_landed(
+        &mut self,
+        outcome: Result<crate::cloud::Session, crate::cloud::SignInError>,
+    ) {
+        self.working = None;
+        match outcome {
+            Ok(session) => {
+                let account = session.account().clone();
+                let who = if account.email.is_empty() {
+                    account.name.clone()
+                } else {
+                    account.email.clone()
+                };
+                self.device = describe_device();
+                self.account = Some(account);
+                self.session = Some(session);
+                self.cloud_message = Some(format!("Signed in as {who}."));
+                self.status = format!("Signed in as {who}");
+            }
+            // Every one of these already carries text a person can act on, so
+            // it is shown as it is rather than replaced by something general.
+            Err(error) => self.cloud_message = Some(error.to_string()),
+        }
+    }
+
+    pub fn sign_out_landed(&mut self, outcome: Result<(), String>) {
+        self.working = None;
+        self.session = None;
+        self.account = None;
+        self.device = None;
+        self.stop_live(None);
+        self.cloud_message = Some(match outcome {
+            Ok(()) => "Signed out. Nothing has been removed from this machine.".to_string(),
+            // Signed out here either way, because a person who pressed Sign
+            // out is signed out. What the message says is what did not happen.
+            Err(why) => why,
+        });
+        self.status = "Signed out".into();
+    }
+
+    /// Why the sync commands cannot be used, if they cannot.
+    ///
+    /// A reason rather than a bare disabled button. A greyed control with
+    /// nothing to read gets pressed again; one that says what is missing says
+    /// what to do next.
+    pub fn sync_blocked(&self) -> Option<String> {
+        if !self.collaborate {
+            return Some(
+                "Alterion Collaborate is turned off. Turn it on in Options to sync this plan."
+                    .into(),
+            );
+        }
+        if self.collaborate_server.trim().is_empty() {
+            return Some(
+                "No Collaborate server address is set. Fill it in in Options, under Alterion \
+                 Collaborate."
+                    .into(),
+            );
+        }
+        if self.account.is_none() {
+            return Some(
+                "Not signed in. Sign in from Options, under Alterion Collaborate.".into(),
+            );
+        }
+        if self.link.is_none() {
+            return Some(
+                "This plan is on this machine only. Put it on the server from Options, under \
+                 Alterion Collaborate."
+                    .into(),
+            );
+        }
+        if self.working.is_some() {
+            return Some("Something else is talking to the server. Wait for it to finish.".into());
+        }
+        None
+    }
+
+    /// Why this plan cannot be put on a server, if it cannot.
+    pub fn publish_blocked(&self) -> Option<String> {
+        if !self.collaborate {
+            return Some("Alterion Collaborate is turned off. Turn it on in Options.".into());
+        }
+        if self.collaborate_server.trim().is_empty() {
+            return Some("No Collaborate server address is set. Fill it in in Options.".into());
+        }
+        if self.account.is_none() {
+            return Some("Not signed in. Sign in first.".into());
+        }
+        if self.link.is_some() {
+            return Some("This plan is already on the server.".into());
+        }
+        // The link is remembered against the file, so a plan that has never
+        // been saved has nothing to remember it against.
+        if self.file_path.is_none() {
+            return Some("Save this plan to a file first, so the link to the server can be kept.".into());
+        }
+        if self.working.is_some() {
+            return Some("Something else is talking to the server. Wait for it to finish.".into());
+        }
+        None
+    }
+
+    /// Gather everything a sync needs, and hand the session over.
+    pub fn start_sync(&mut self) -> Option<(crate::cloud::Session, crate::cloud::work::Offer)> {
+        if self.sync_blocked().is_some() {
+            return None;
+        }
+        let link = self.link.clone()?;
+        let offer = crate::cloud::work::Offer {
+            server: self.collaborate_server.trim().to_string(),
+            project: link.project,
+            after: link.cursor,
+            changes: self.project.history.unsent().to_vec(),
+            plan: self.project.clone(),
+        };
+        let session = self.hand_over(Working::Syncing)?;
+        Some((session, offer))
+    }
+
+    /// What the server said about a push.
+    pub fn sync_landed(&mut self, outcome: Result<crate::cloud::collab::Pushed, String>) {
+        use crate::cloud::collab::Pushed;
+
+        self.working = None;
+        let now = Local::now().naive_local();
+        let pushed = match outcome {
+            Ok(pushed) => pushed,
+            Err(why) => {
+                self.checked = Some(Checked {
+                    at: now,
+                    outcome: CheckOutcome::Failed(why.clone()),
+                });
+                self.cloud_message = Some(why);
+                self.status = "Could not sync".into();
+                return;
+            }
+        };
+
+        match pushed {
+            Pushed::Applied { head, applied, .. } => {
+                // Marked by the local id the server acknowledged rather than
+                // by counting, because an answer that came back out of order
+                // must not mark work nobody has seen as sent.
+                if let Some(highest) = applied.iter().map(|(local, _)| *local).max() {
+                    self.project.history.mark_pushed(highest);
+                }
+                self.remember_cursor(head);
+                self.checked = Some(Checked {
+                    at: now,
+                    outcome: CheckOutcome::Current,
+                });
+                let said = match applied.len() {
+                    0 => "Already up to date. Nothing was waiting to go.".to_string(),
+                    1 => "1 change sent.".to_string(),
+                    many => format!("{many} changes sent."),
+                };
+                self.cloud_message = Some(said.clone());
+                self.status = said;
+            }
+
+            Pushed::Behind {
+                head,
+                changes,
+                more,
+                ..
+            } => {
+                let (differences, replayed, asked) = self.preview_incoming(&changes);
+                let sentence = aop_core::compare::summarise(&differences).sentence();
+                self.checked = Some(Checked {
+                    at: now,
+                    outcome: CheckOutcome::Behind {
+                        by: changes.len() as i64,
+                    },
+                });
+                self.status = "Somebody else changed this plan first".into();
+                self.cloud_message = Some(sentence.clone());
+                // A real question, not a message: taking somebody else's work
+                // is the one decision this whole design exists to offer, and
+                // it is not one to make on a planner's behalf.
+                self.dialog = Some(Dialog::SyncBehind {
+                    head,
+                    sentence,
+                    differences,
+                    changes,
+                    replayed,
+                    asked,
+                    more,
+                });
+            }
+
+            Pushed::Gap { head, oldest } => {
+                self.checked = Some(Checked {
+                    at: now,
+                    outcome: CheckOutcome::Failed("the log this copy needs has been trimmed".into()),
+                });
+                self.status = "This copy is too far behind to catch up".into();
+                let held = match oldest {
+                    Some(oldest) => format!("the oldest change it still keeps is {oldest}"),
+                    None => "it no longer keeps any of them".to_string(),
+                };
+                self.dialog = Some(Dialog::FreshCopy {
+                    why: format!(
+                        "The server's log has been trimmed past the point this copy had reached, \
+                         so there is nothing left to replay onto: {held}, and the head is now \
+                         {head}. Replaying what survives would look like a sync that worked and \
+                         would have lost the rest, so this copy needs a fresh whole plan instead."
+                    ),
+                });
+            }
+
+            Pushed::Ahead { head, cursor } => {
+                self.checked = Some(Checked {
+                    at: now,
+                    outcome: CheckOutcome::Failed("this copy is not on the same log".into()),
+                });
+                self.status = "This plan is not the one the server holds".into();
+                self.dialog = Some(Dialog::SyncAhead { head, cursor });
+            }
+        }
+    }
+
+    // ---- Who a plan is shared with ---------------------------------------
+
+    /// Why the sharing commands cannot be used, if they cannot.
+    ///
+    /// The same shape as [`Self::sync_blocked`] and for the same reason: a
+    /// greyed control with nothing to read gets pressed again, and one that
+    /// says what is missing says what to do next.
+    pub fn sharing_blocked(&self) -> Option<String> {
+        if !self.collaborate {
+            return Some("Alterion Collaborate is turned off. Turn it on in Options.".into());
+        }
+        if self.collaborate_server.trim().is_empty() {
+            return Some("No Collaborate server address is set. Fill it in above.".into());
+        }
+        if self.account.is_none() {
+            return Some("Not signed in. Sign in first.".into());
+        }
+        if self.link.is_none() {
+            return Some(
+                "This plan is on this machine only, so there is nobody to share it with yet. \
+                 Put it on the server first."
+                    .into(),
+            );
+        }
+        if self.working.is_some() {
+            return Some("Something else is talking to the server. Wait for it to finish.".into());
+        }
+        None
+    }
+
+    /// Hand over what reading the sharing needs.
+    ///
+    /// Read on demand rather than kept fresh. Membership changes when somebody
+    /// else changes it, and nothing here would hear about that, so a list that
+    /// looked live would be a list that was quietly wrong.
+    pub fn start_sharing(&mut self, working: Working) -> Option<(crate::cloud::Session, String, String)> {
+        if self.sharing_blocked().is_some() {
+            return None;
+        }
+        let project = self.link.as_ref()?.project.clone();
+        let server = self.collaborate_server.trim().to_string();
+        let session = self.hand_over(working)?;
+        // Marked as asked before the answer, not after. A read that fails
+        // otherwise leaves the page asking again on every render, which is a
+        // request per frame at whichever server is already having a bad time.
+        self.sharing_for = Some(project.clone());
+        self.sharing_message = None;
+        Some((session, server, project))
+    }
+
+    /// What the invite box currently amounts to, or why it does not.
+    ///
+    /// The address is checked here so that an obvious mistake is answered
+    /// without a round trip. It is checked on the server too, which is the
+    /// check that counts: this one is a courtesy and is written as one.
+    pub fn invite_ready(&self) -> Result<(String, String), String> {
+        let typed = self.invite_email.trim();
+        if typed.is_empty() {
+            return Err("Type the email address of whoever you want to invite.".into());
+        }
+        let (local, domain) = typed
+            .split_once('@')
+            .ok_or("That is not an email address. It needs an @ in it.")?;
+        if local.is_empty() || domain.is_empty() || typed.contains(char::is_whitespace) {
+            return Err("That is not an email address. One address, with no spaces.".into());
+        }
+        Ok((typed.to_string(), self.invite_role.clone()))
+    }
+
+    /// The list the server holds, or why it could not be had.
+    pub fn sharing_landed(&mut self, outcome: Result<crate::cloud::collab::Sharing, String>) {
+        self.working = None;
+        match outcome {
+            Ok(sharing) => {
+                self.sharing = Some(sharing);
+                self.sharing_message = None;
+            }
+            // The old list is left on screen. It is what the server last said,
+            // which is more use than an empty panel, and the message beside it
+            // says it could not be brought up to date.
+            Err(why) => self.sharing_message = Some(why),
+        }
+    }
+
+    /// The same, after a change that was asked for.
+    ///
+    /// The change and the read back are one job, so a list that arrives is a
+    /// list the server produced after the change rather than one this copy
+    /// assumed it would produce.
+    pub fn sharing_changed(
+        &mut self,
+        said: String,
+        outcome: Result<crate::cloud::collab::Sharing, String>,
+    ) {
+        let worked = outcome.is_ok();
+        self.sharing_landed(outcome);
+        if worked {
+            self.invite_email.clear();
+            self.sharing_message = Some(said.clone());
+            self.status = said;
+        }
+    }
+
+    /// What the server holds, asked rather than assumed.
+    pub fn standing_landed(&mut self, outcome: Result<crate::cloud::collab::Standing, String>) {
+        self.working = None;
+        let at = Local::now().naive_local();
+        match outcome {
+            Ok(standing) => {
+                let here = self.link.as_ref().map(|link| link.cursor).unwrap_or(0);
+                self.checked = Some(Checked {
+                    at,
+                    outcome: if standing.head > here {
+                        CheckOutcome::Behind {
+                            by: standing.head - here,
+                        }
+                    } else {
+                        CheckOutcome::Current
+                    },
+                });
+                // The server counts this copy's own socket among the
+                // connected, so the number shown is who else is there.
+                self.cloud_message = Some(format!(
+                    "{} is at change {} on the server, with {} connection(s) open.",
+                    standing.name, standing.head, standing.connected
+                ));
+            }
+            Err(why) => {
+                self.checked = Some(Checked {
+                    at,
+                    outcome: CheckOutcome::Failed(why.clone()),
+                });
+                self.cloud_message = Some(why);
+            }
+        }
+    }
+
+    /// This plan is now on the server.
+    pub fn publish_landed(&mut self, outcome: Result<crate::cloud::collab::Created, String>) {
+        self.working = None;
+        match outcome {
+            Ok(created) => {
+                let link = crate::cloud::link::Link {
+                    project: created.id,
+                    cursor: created.head,
+                };
+                if let Some(path) = self.file_path.clone() {
+                    crate::cloud::link::save(&path, &link);
+                }
+                // The plan went up whole, so everything in its log is already
+                // there and none of it is waiting to be sent again.
+                if let Some(newest) = self.project.history.changes().last().map(|c| c.id) {
+                    self.project.history.mark_pushed(newest);
+                }
+                self.link = Some(link);
+                self.checked = Some(Checked {
+                    at: Local::now().naive_local(),
+                    outcome: CheckOutcome::Current,
+                });
+                self.cloud_message = Some(
+                    "This plan is on the server. Other people you share it with will see it \
+                     the next time they sync."
+                        .into(),
+                );
+                self.status = "Plan put on the server".into();
+            }
+            Err(why) => self.cloud_message = Some(why),
+        }
+    }
+
+    /// Take a whole plan from the server, in place of this one.
+    pub fn fresh_copy_landed(&mut self, outcome: Result<crate::cloud::collab::Fetched, String>) {
+        self.working = None;
+        let fetched = match outcome {
+            Ok(fetched) => fetched,
+            Err(why) => {
+                self.cloud_message = Some(why);
+                return;
+            }
+        };
+
+        // Whatever is on screen is about to be replaced wholesale, so it is
+        // kept first. This is the same reason a rebase keeps one: it is the
+        // moment a planner will want to go back to if the answer is wrong.
+        self.keep_version(aop_core::versions::Taken::BeforeRebase);
+        self.checkpoint();
+
+        let mut plan = fetched.plan;
+        // The log comes down with the plan and then has the tail appended, so
+        // the two are the same story rather than a plan and a separate list.
+        plan.history.merge(fetched.changes.iter().cloned());
+        let head = fetched.head.max(fetched.seq);
+        self.project = plan;
+        if let Some(newest) = self.project.history.changes().last().map(|c| c.id) {
+            self.project.history.mark_pushed(newest);
+        }
+        self.remember_cursor(head);
+        self.checked = Some(Checked {
+            at: Local::now().naive_local(),
+            outcome: CheckOutcome::Current,
+        });
+        self.dialog = None;
+        self.clamp_selection();
+        self.reschedule();
+        self.status = "Took a fresh copy from the server".into();
+        self.cloud_message = Some(
+            "This plan has been replaced with the server's copy. The version you had is in \
+             History and Sync if you want it back."
+                .into(),
+        );
+    }
+
+    /// Somebody has opened a link. Ask about it before anything is fetched.
+    ///
+    /// Nothing is contacted here. The link arrived from a browser, a chat
+    /// message or a paste box, and the server it names is the sender's choice
+    /// rather than this planner's, so the choice is put in front of them.
+    pub fn open_link_asked(&mut self, link: &str) {
+        match crate::cloud::share::read(link) {
+            Some(share) => self.dialog = Some(Dialog::OpenLink(share)),
+            None => {
+                self.cloud_message = Some(format!(
+                    "That link could not be read: {link}. A plan link looks like \
+                     aop://your-server/plan/ and then the plan's id."
+                ))
+            }
+        }
+    }
+
+    /// A plan fetched by opening a link.
+    ///
+    /// Opened as a plan with no file behind it, which is what it is: it came
+    /// off a server and has never been saved here. Saving it is what gives the
+    /// cursor somewhere to live, since the link store is keyed by where a plan
+    /// sits on this machine.
+    pub fn open_link_landed(
+        &mut self,
+        server: String,
+        project: String,
+        outcome: Result<crate::cloud::collab::Fetched, String>,
+    ) {
+        self.working = None;
+        let fetched = match outcome {
+            Ok(fetched) => fetched,
+            Err(why) => {
+                self.cloud_message = Some(why);
+                return;
+            }
+        };
+
+        let mut plan = fetched.plan;
+        plan.history.merge(fetched.changes.iter().cloned());
+        let head = fetched.head.max(fetched.seq);
+        self.project = plan;
+        if let Some(newest) = self.project.history.changes().last().map(|c| c.id) {
+            self.project.history.mark_pushed(newest);
+        }
+        // A plan opened from a link has no file yet, so nothing here is a
+        // change to something on disk and there is nothing to recover.
+        self.file_path = None;
+        self.dirty = true;
+        self.undo.clear();
+        self.redo.clear();
+        // Adopted only now, and only once the server has actually answered
+        // with the plan: a link that turned out to name nothing never changes
+        // where this copy syncs.
+        self.collaborate_server = server;
+        self.link = Some(crate::cloud::link::Link {
+            project,
+            cursor: head,
+        });
+        self.checked = Some(Checked {
+            at: Local::now().naive_local(),
+            outcome: CheckOutcome::Current,
+        });
+        self.versions = aop_core::versions::Versions::new();
+        self.dialog = None;
+        self.clamp_selection();
+        self.reschedule();
+        self.status = "Opened from a link".into();
+        self.cloud_message = Some(
+            "This plan came from the server and has not been saved on this machine yet. \
+             Save it somewhere to keep it, and to remember how far down the server's log \
+             this copy has read."
+                .into(),
+        );
+    }
+
+    /// Take somebody else's work, keeping this planner's on top of it.
+    ///
+    /// A version is kept first, and that is the point of the feature: a rebase
+    /// is the only thing in the application that replays a planner's own work
+    /// against somebody else's, so it is the one they will want back if it
+    /// turns out wrong.
+    pub fn accept_incoming(
+        &mut self,
+        head: i64,
+        differences: &[aop_core::compare::Difference],
+        changes: Vec<aop_core::history::Change>,
+        replayed: usize,
+        asked: usize,
+    ) -> BroughtIn {
+        self.keep_version(aop_core::versions::Taken::BeforeRebase);
+
+        let before = self.project.clone();
+        let applied = aop_core::compare::apply(&mut self.project, differences);
+        let brought = BroughtIn {
+            applied,
+            replayed,
+            sent: asked,
+        };
+
+        if !brought.is_clean() {
+            // Nothing is left half changed. A batch that did not fit means the
+            // two sides no longer agree about what the plan was, and applying
+            // the part that happened to fit would make that permanent.
+            self.project = before;
+            self.dialog = Some(Dialog::FreshCopy {
+                why: format!(
+                    "Their changes could not be brought into this copy: {}. Nothing has been \
+                     changed here. That means the two copies have drifted apart, and the only \
+                     honest way back is a fresh whole plan from the server.",
+                    brought.why()
+                ),
+            });
+            return brought;
+        }
+
+        // The entries are the record of what was done, so they go in with the
+        // work rather than being left to a later sync to discover.
+        self.project.history.merge(changes);
+        self.undo.push(before);
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.dirty = true;
+        self.remember_cursor(head);
+        self.dialog = None;
+        self.clamp_selection();
+        self.reschedule();
+        self.status = "Took the other changes; yours are still here".into();
+        brought
+    }
+
+    /// What a run of somebody else's commands would do here, without doing it.
+    ///
+    /// Their commands are replayed onto a copy of the plan rather than onto
+    /// the plan itself, because the question is not "run these" but "what do
+    /// these do to what I have". A command means something different against a
+    /// different plan, and the difference is the part that can be put in front
+    /// of a person and checked before anything lands.
+    ///
+    /// Gives back the differences, how many commands could be replayed, and
+    /// how many there were. The last two are how drift shows up: a command
+    /// that will not run here is the two sides having already parted.
+    fn preview_incoming(
+        &mut self,
+        incoming: &[aop_core::history::Change],
+    ) -> (Vec<aop_core::compare::Difference>, usize, usize) {
+        let mine = self.project.clone();
+        let (replayed, asked) = self.replay(incoming);
+        let theirs = std::mem::replace(&mut self.project, mine);
+        (
+            aop_core::compare::compare(&self.project, &theirs),
+            replayed,
+            asked,
+        )
+    }
+
+    /// Run recorded commands without writing any of them down.
+    ///
+    /// They were written down when they were first done, by whoever did them,
+    /// and the entries come across on the wire. Recording them again would say
+    /// the work happened twice.
+    fn replay(&mut self, incoming: &[aop_core::history::Change]) -> (usize, usize) {
+        let mut commands: Vec<Cmd> = Vec::new();
+        // A script this build cannot read counts as one command that did not
+        // run, rather than as nothing: it is work that is not here.
+        let mut unreadable = 0usize;
+        for change in incoming {
+            match crate::macros::script::parse(&change.script) {
+                Ok(mut parsed) => commands.append(&mut parsed),
+                Err(_) => unreadable += 1,
+            }
+        }
+        let asked = commands.len() + unreadable;
+
+        let replayed = self.unrecorded(|state| {
+            state.as_one_step(|state| {
+                let mut done = 0usize;
+                for command in &commands {
+                    if command.apply(state).is_err() {
+                        break;
+                    }
+                    done += 1;
+                }
+                done
+            })
+        });
+        (replayed, asked)
+    }
+
+    /// Remember how far down the server's log this copy has read.
+    ///
+    /// Only ever forward. A cursor that went backwards would ask for changes
+    /// this copy already holds, and `merge` would drop them, which looks
+    /// exactly like a sync that worked.
+    fn remember_cursor(&mut self, head: i64) {
+        let Some(link) = self.link.as_mut() else {
+            return;
+        };
+        if head <= link.cursor {
+            return;
+        }
+        link.cursor = head;
+        let link = link.clone();
+        if let Some(path) = self.file_path.clone() {
+            crate::cloud::link::save(&path, &link);
+        }
+    }
+
+    // ---- live editing ----------------------------------------------------
+
+    /// Open the socket with a token a worker has just fetched.
+    pub fn start_live(&mut self, token: String) {
+        self.working = None;
+        let Some(link) = self.link.clone() else {
+            return;
+        };
+        let name = match self.display_name().as_str() {
+            "" => "Someone".to_string(),
+            name => name.to_string(),
+        };
+        match crate::cloud::live::Live::connect(
+            self.collaborate_server.trim(),
+            &token,
+            &link.project,
+            link.cursor,
+            &name,
+        ) {
+            Ok(live) => {
+                self.live = Some(live);
+                self.live_wanted = true;
+                self.status = "Live editing is on".into();
+            }
+            Err(error) => {
+                self.live_wanted = false;
+                self.cloud_message = Some(error.to_string());
+            }
+        }
+    }
+
+    /// Close the socket, and say why if there is anything to say.
+    pub fn stop_live(&mut self, why: Option<String>) {
+        self.live = None;
+        self.live_wanted = false;
+        self.peers.clear();
+        // Forgotten as well as cleared, so the next session says where this
+        // planner is rather than assuming the others already know.
+        self.told_row = None;
+        self.told_at = None;
+        if let Some(why) = why {
+            self.status = why.clone();
+            self.cloud_message = Some(why);
+        }
+    }
+
+    /// Take whatever has arrived on the live socket.
+    ///
+    /// Driven from a timer rather than by the socket, because the plan may
+    /// only be written where the interface runs and the socket is on a thread
+    /// of its own.
+    pub fn poll_live(&mut self) {
+        use crate::cloud::live::Incoming;
+
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let batch = live.drain();
+        if batch.is_empty() {
+            return;
+        }
+
+        let mut incoming = Vec::new();
+        let mut cursor = None;
+        let mut ended = None;
+        let mut gap = false;
+
+        for message in batch {
+            match message {
+                Incoming::Welcome { head, peers } => {
+                    self.peers = peers;
+                    cursor = Some(head.max(cursor.unwrap_or(head)));
+                }
+                // A catch-up comes before any live change on purpose, so the
+                // order things are applied in is the log's order.
+                Incoming::Catchup { head, changes } => {
+                    cursor = Some(head.max(cursor.unwrap_or(head)));
+                    incoming.extend(changes);
+                }
+                Incoming::Change { seq, change } => {
+                    cursor = Some(seq.max(cursor.unwrap_or(seq)));
+                    incoming.push(change);
+                }
+                Incoming::Gap { .. } => gap = true,
+                Incoming::Presence(peer) => {
+                    match self
+                        .peers
+                        .iter_mut()
+                        .find(|held| held.subject == peer.subject)
+                    {
+                        Some(held) => {
+                            held.row = peer.row;
+                            // Absent means unchanged. Copying it across
+                            // regardless would blank somebody's pointer every
+                            // time they moved their selection, which is the
+                            // one thing the protocol says not to do.
+                            if peer.at.is_some() {
+                                held.at = peer.at;
+                            }
+                        }
+                        None => self.peers.push(peer),
+                    }
+                }
+                Incoming::Joined { name } => self.status = format!("{name} joined this plan"),
+                Incoming::Left { subject } => self.peers.retain(|held| held.subject != subject),
+                Incoming::Closed(why) => ended = Some(why),
+            }
+        }
+
+        if gap {
+            self.stop_live(None);
+            self.dialog = Some(Dialog::FreshCopy {
+                why: "The server's log has been trimmed past the point this copy had reached, \
+                      so live editing has nothing to replay onto. Live editing has been turned \
+                      off, and this copy needs a fresh whole plan."
+                    .into(),
+            });
+            return;
+        }
+
+        if !incoming.is_empty() {
+            self.take_live_batch(&incoming, cursor);
+        }
+        if let Some(why) = ended {
+            self.stop_live(Some(why));
+        }
+    }
+
+    /// Tell the others where this planner is, when that has changed.
+    ///
+    /// Sent from the same timer that reads the socket rather than from
+    /// wherever the selection moves or the pointer goes, because those happen
+    /// in a dozen places and every one of them would have to remember to say
+    /// so. The timer is also the throttle: a mouse produces events far faster
+    /// than a socket should carry them, and one message per movement would
+    /// flood it to say almost nothing.
+    ///
+    /// `at` is where the pointer is now, which the interface keeps out of the
+    /// plan's state so that moving a mouse does not redraw a window. Nothing
+    /// is sent unless the row or the pointer has actually moved somewhere new.
+    pub fn announce(&mut self, at: Option<crate::cloud::live::Pointer>) {
+        let row = self.primary().map(|row| row as i64);
+        let moved = at.filter(|at| Some(*at) != self.told_at);
+        if row == self.told_row && moved.is_none() {
+            return;
+        }
+        if let Some(live) = self.live.as_ref() {
+            live.looking_at(row, moved);
+            self.told_row = row;
+            if let Some(at) = moved {
+                self.told_at = Some(at);
+            }
+        }
+    }
+
+    /// Bring one batch of live changes in.
+    fn take_live_batch(&mut self, incoming: &[aop_core::history::Change], head: Option<i64>) {
+        // A change already in the log is one that arrived twice, which the
+        // protocol allows: it can be in a catch-up and in the live stream
+        // both. Applying it again would count the work twice.
+        let fresh: Vec<aop_core::history::Change> = incoming
+            .iter()
+            .filter(|change| {
+                !self
+                    .project
+                    .history
+                    .changes()
+                    .iter()
+                    .any(|held| held.id == change.id)
+            })
+            .cloned()
+            .collect();
+        if fresh.is_empty() {
+            if let Some(head) = head {
+                self.remember_cursor(head);
+            }
+            return;
+        }
+
+        let (differences, replayed, asked) = self.preview_incoming(&fresh);
+        let before = self.project.clone();
+        let applied = aop_core::compare::apply(&mut self.project, &differences);
+        let brought = BroughtIn {
+            applied,
+            replayed,
+            sent: asked,
+        };
+
+        if !brought.is_clean() {
+            // Carrying on from here is exactly the failure this check exists
+            // to catch. The plan goes back as it was, the socket is closed,
+            // and a whole plan is offered instead of a quietly wrong one.
+            self.project = before;
+            self.stop_live(None);
+            self.dialog = Some(Dialog::FreshCopy {
+                why: format!(
+                    "A live change could not be brought into this copy: {}. Nothing has been \
+                     changed here and live editing has been turned off. The two copies have \
+                     drifted apart, and a fresh whole plan from the server is the way back.",
+                    brought.why()
+                ),
+            });
+            return;
+        }
+
+        self.project.history.merge(fresh.clone());
+        self.undo.push(before);
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.dirty = true;
+        if let Some(head) = head {
+            self.remember_cursor(head);
+        }
+        self.clamp_selection();
+        self.reschedule();
+        let who = fresh
+            .last()
+            .map(|change| change.author.clone())
+            .unwrap_or_else(|| "Somebody".into());
+        self.status = match fresh.len() {
+            1 => format!("{who} changed this plan"),
+            many => format!("{who} and others made {many} changes"),
+        };
+    }
+
+    // ---- versions --------------------------------------------------------
+
+    /// Keep the plan as it stands, so it can be returned to.
+    ///
+    /// Returns whether anything was kept: a plan identical to the newest
+    /// version is not kept twice, for the same reason a second Ctrl+S with no
+    /// edit between does not leave a second save marker.
+    pub fn keep_version(&mut self, taken: aop_core::versions::Taken) -> bool {
+        let author = match self.display_name().as_str() {
+            "" => "Unknown".to_string(),
+            name => name.to_string(),
+        };
+        let kept = self
+            .versions
+            .take(&self.project, author, Local::now().naive_local(), taken);
+        if kept {
+            crate::versions::write(self.file_path.as_deref(), &self.versions);
+        }
+        kept
+    }
+
+    /// Put the plan back to one of its versions.
+    ///
+    /// The log stays where it is. Going back to an older plan is one more
+    /// thing that was done, not a reason to forget the record of the rest, and
+    /// a trail that hides removals is not a trail.
+    pub fn restore_version(&mut self, index: usize) {
+        let Some(snapshot) = self.versions.get(index).cloned() else {
+            return;
+        };
+        self.checkpoint();
+        let log = std::mem::take(&mut self.project.history);
+        let when = snapshot.at.format("%Y-%m-%d %H:%M");
+        self.project = snapshot.plan;
+        self.project.history = log;
+        self.dialog = None;
+        self.clamp_selection();
+        self.reschedule();
+        self.status = format!("Went back to the version from {when}");
+        // A restore cannot be written as a command, so a shared plan cannot be
+        // told about it by replaying anything. Saying the check is no longer
+        // good is better than leaving a tick that now means nothing.
+        if self.link.is_some() {
+            self.checked = None;
+            self.cloud_message = Some(
+                "This copy has gone back to an older version. The server has not been told: \
+                 sync to see what it makes of it."
+                    .into(),
+            );
         }
     }
 
@@ -1718,15 +3346,46 @@ impl AppState {
         }
     }
 
+    /// Put a save marker in the log, and say which change it landed on.
+    ///
+    /// A save is the unit a sync offers somebody a decision about: without one
+    /// the log is a wall of single commands, and nobody decides about
+    /// `indent()`. A second save with nothing edited in between adds no such
+    /// unit, so it leaves one marker rather than two with nothing between
+    /// them, and says so by giving back nothing.
+    pub fn mark_save_point(&mut self) -> Option<u64> {
+        // A blank name is what a fresh install has. Saying so beats signing
+        // somebody else's work with a guess.
+        let author = match self.display_name().as_str() {
+            "" => "Unknown".to_string(),
+            name => name.to_string(),
+        };
+        self.project
+            .history
+            .mark_saved(author, Local::now().naive_local(), None)
+    }
+
     pub fn save_to(&mut self, path: PathBuf) {
+        // Marked before the write, so what lands on disk carries the marker.
+        self.mark_save_point();
+
         match persist::save(&path, &self.project) {
             Ok(written) => {
                 self.status = format!("Saved to {}", written.display());
                 self.backstage_message = Some(format!("Saved {}", written.display()));
                 self.dirty = false;
                 self.push_recent(&written);
+                let first_save = self.file_path.as_ref() != Some(&written);
                 self.file_path = Some(written);
                 self.backstage = None;
+
+                // A plan saved somewhere new takes its versions with it: they
+                // are keyed by where the plan lives, and Save As is the plan
+                // moving rather than a different plan.
+                if first_save {
+                    self.restore_link();
+                }
+                self.keep_version(aop_core::versions::Taken::Save);
 
                 // The plan is on disk now, so the snapshot has nothing left to
                 // give back and would only turn up as a false alarm later.
@@ -3176,6 +4835,51 @@ impl AppState {
         }
     }
 
+    /// What a point in the table is over, said the way the wire says it.
+    ///
+    /// The row is a task index rather than a line number, and that is the
+    /// whole reason this is worth converting at all: two copies can have
+    /// different rows collapsed, different filters and different grouping, so
+    /// line seven is a different task on each of them. The column is an index
+    /// for the same reason, since column widths are a local matter.
+    pub fn table_pointer(&self, row: usize, x: f64) -> crate::cloud::live::Pointer {
+        let mut edge = 0.0;
+        let mut column = self.columns.len().saturating_sub(1);
+        for (index, spec) in self.columns.iter().enumerate() {
+            edge += spec.width;
+            if x < edge {
+                column = index;
+                break;
+            }
+        }
+        crate::cloud::live::Pointer::Table {
+            row: row as i64,
+            column: column as u16,
+        }
+    }
+
+    /// What a point on the chart is over, said the way the wire says it.
+    ///
+    /// Nothing over a band or above the first row: there is no task there to
+    /// be pointing at, and naming one anyway would put somebody's pointer on a
+    /// row they are not on.
+    pub fn chart_pointer(&self, x: f64, y: f64) -> Option<crate::cloud::live::Pointer> {
+        if y < 0.0 {
+            return None;
+        }
+        let line = (y / ROW_H).floor() as usize;
+        let Some(&GroupRow::Task(index)) = self.layout_rows().get(line) else {
+            return None;
+        };
+        // Minutes rather than pixels, so it means the same thing to somebody
+        // reading it at a different zoom.
+        let minutes = (x / self.chart_scale().px_per_day * 1440.0).round() as i64;
+        Some(crate::cloud::live::Pointer::Chart {
+            row: index as i64,
+            minutes,
+        })
+    }
+
     /// What a point on the chart is about: the bar under it, or the date it
     /// sits at when it is over bare canvas.
     ///
@@ -3695,11 +5399,33 @@ impl Default for AppState {
 pub fn from_command_line() -> AppState {
     let mut state = AppState::new();
     state.apply_settings(crate::settings::Settings::load());
-    if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from)
-        && path.is_file() {
+    // Reads the token store and nothing else, so start up is never held up by
+    // a server that is slow or absent. A session that has since been ended
+    // shows up on the first thing that uses it, which is a better moment to
+    // hear about it than during a splash screen.
+    if state.collaborate {
+        state.restore_session();
+    }
+    // Worked out before anything else can write a preference, since the answer
+    // depends on the version this copy last ran as and that is recorded here.
+    state.begin_greetings();
+    // One argument, and what it is decides what happens to it. A link is told
+    // from a path by its scheme rather than by guessing, because a guess about
+    // this is a guess about whether a network request is made.
+    match std::env::args().nth(1) {
+        Some(argument) if crate::cloud::share::looks_like_a_link(&argument) => {
             state.splash = false;
-            state.open_any(path);
+            state.open_link_asked(&argument);
         }
+        Some(argument) => {
+            let path = PathBuf::from(argument);
+            if path.is_file() {
+                state.splash = false;
+                state.open_any(path);
+            }
+        }
+        None => {}
+    }
     state
 }
 
@@ -4362,6 +6088,69 @@ mod tests {
         assert!(entry.script.contains("indent();"), "{}", entry.script);
     }
 
+    /// Somebody signed in, without a session: the account is kept beside the
+    /// session precisely so the interface can still say who this is while a
+    /// worker has the session, and that is the state to test against.
+    fn signed_in_as(name: &str) -> crate::cloud::Account {
+        crate::cloud::Account {
+            subject: "0198f0c2-0000-7000-8000-000000000000".into(),
+            name: name.into(),
+            email: "ada@example.org".into(),
+            picture: None,
+        }
+    }
+
+    #[test]
+    fn the_name_other_people_see_is_the_one_the_server_knows() {
+        // The shared log is the point. A local name that disagrees with the
+        // account is a name only this machine ever sees.
+        let mut state = worked_on_by("ada-laptop");
+        state.account = Some(signed_in_as("Ada Lovelace"));
+        assert_eq!(state.display_name(), "Ada Lovelace");
+
+        state.select(1);
+        state.indent_selected();
+        let entry = state
+            .project
+            .history
+            .changes()
+            .last()
+            .expect("the edit just recorded one");
+        assert_eq!(entry.author, "Ada Lovelace");
+    }
+
+    #[test]
+    fn signing_out_leaves_no_trace_of_the_account_name() {
+        // What was typed here is read, never overwritten, which is the whole
+        // reason signing out can put it straight back.
+        let mut state = worked_on_by("ada-laptop");
+        state.account = Some(signed_in_as("Ada Lovelace"));
+        assert_eq!(state.display_name(), "Ada Lovelace");
+
+        state.sign_out_landed(Ok(()));
+        assert_eq!(state.user_name, "ada-laptop");
+        assert_eq!(state.display_name(), "ada-laptop");
+
+        state.select(1);
+        state.indent_selected();
+        let entry = state
+            .project
+            .history
+            .changes()
+            .last()
+            .expect("the edit just recorded one");
+        assert_eq!(entry.author, "ada-laptop");
+    }
+
+    #[test]
+    fn an_account_with_nothing_to_show_falls_back_to_what_was_typed() {
+        // A name is never empty coming from the server, but nothing about the
+        // interface should depend on that being true.
+        let mut state = worked_on_by("ada-laptop");
+        state.account = Some(signed_in_as("   "));
+        assert_eq!(state.display_name(), "ada-laptop");
+    }
+
     #[test]
     fn work_done_before_anybody_says_who_they_are_is_signed_honestly() {
         // A fresh install has no name in it. "Unknown" is true; putting the
@@ -4635,6 +6424,92 @@ mod tests {
         );
     }
 
+    // ---- the licence, what changed, and the ask -------------------------
+
+    #[test]
+    fn acknowledging_the_licence_records_the_version_and_the_moment() {
+        // Both, because a record holding only one of them answers half the
+        // question, and the record is the only thing that suppresses it.
+        let mut state = AppState::new();
+        state.greetings = vec![crate::welcome::Greeting::Licence];
+        assert!(state.licence_acknowledged.is_empty());
+
+        state.acknowledge_licence();
+
+        assert_eq!(state.licence_acknowledged, crate::welcome::RUNNING);
+        assert!(state.licence_acknowledged_at.contains('T'), "an RFC 3339 moment");
+        assert!(state.greetings.is_empty(), "and the page is done with");
+        // And with the record in place, a later start owes nothing.
+        assert!(crate::welcome::on_start(&state.settings(), crate::welcome::RUNNING).is_empty());
+    }
+
+    #[test]
+    fn the_version_is_recorded_before_the_pages_are_answered() {
+        // This is what makes it once per update rather than once per start.
+        // Somebody who closes the window during the notes has been shown them.
+        let mut state = AppState::new();
+        state.licence_acknowledged = crate::welcome::RUNNING.into();
+        state.last_version = "0.0.1-nonesuch".into();
+
+        state.begin_greetings();
+
+        assert!(!state.greetings.is_empty(), "an update owes both pages");
+        assert_eq!(state.last_version, crate::welcome::RUNNING);
+        // The very next start, with nothing dismissed, owes nothing.
+        let mut again = AppState::new();
+        again.apply_settings(state.settings());
+        again.begin_greetings();
+        assert!(again.greetings.is_empty());
+    }
+
+    #[test]
+    fn the_support_page_asked_for_offers_nothing_to_silence() {
+        // Nothing showed it to them, so there is nothing to turn off.
+        let mut state = AppState::new();
+        state.show_support();
+        assert_eq!(
+            state.greetings.first(),
+            Some(&crate::welcome::Greeting::Support { after_update: false })
+        );
+        assert!(state.backstage.is_none(), "the File menu gets out of the way");
+    }
+
+    #[test]
+    fn an_update_will_not_install_over_unsaved_work() {
+        // Installing replaces the running program, and a plan that exists only
+        // in this window would go with it.
+        let mut state = AppState::new();
+        state.update_found = Some(crate::updates::Found {
+            version: "9.9.9".into(),
+            install: crate::updates::Install::SelfManaged,
+            artefact: Some(crate::updates::Artefact {
+                name: "alterion-open-project-9.9.9-x86_64-linux.tar.gz".into(),
+                digest: "0".repeat(64),
+            }),
+            page: "https://example.test/releases/v9.9.9".into(),
+        });
+        state.dirty = true;
+
+        let why = state.update_blocked().expect("unsaved work stops it");
+        assert!(why.contains("unsaved changes"), "got {why}");
+
+        state.dirty = false;
+        assert!(state.update_blocked().is_none());
+    }
+
+    #[test]
+    fn failing_to_reach_a_release_host_is_kept_quiet() {
+        // Nothing was waiting on the answer, so nothing is interrupted by it
+        // not arriving.
+        let mut state = AppState::new();
+        let before = state.status.clone();
+        state.update_landed(Err("nothing is answering at that address".into()));
+
+        assert!(state.update_found.is_none());
+        assert_eq!(state.status, before, "the status bar says nothing new");
+        assert!(state.dialog.is_none(), "and nothing is put in front of anybody");
+    }
+
     #[test]
     fn a_bar_will_not_drag_while_a_drawing_tool_is_armed() {
         // Otherwise marking a plan up quietly reschedules it.
@@ -4896,5 +6771,307 @@ mod tests {
         assert!(!state.quit_requested, "the work was never written");
         assert!(state.after_save.is_none());
         assert!(state.dirty, "and it is still unsaved");
+    }
+
+    // ---- collaborating --------------------------------------------------
+
+    use crate::cloud::collab::Pushed;
+    use crate::cloud::link::Link;
+    use aop_core::compare::{compare, Difference};
+    use aop_core::history::Change;
+    use aop_core::versions::Taken;
+
+    /// A plan that knows where it lives on a server, which is the state every
+    /// answer to a push is judged against.
+    fn linked() -> AppState {
+        let mut state = AppState::new();
+        state.project.tasks.clear();
+        state.project.links.clear();
+        state.user_name = "Ada".into();
+        state.collaborate = true;
+        state.collaborate_server = "https://sync.example.test".into();
+        state.link = Some(Link {
+            project: "a-project".into(),
+            cursor: 4,
+        });
+        state
+    }
+
+    /// One entry of somebody else's work, as it arrives on the wire.
+    fn theirs(id: u64, script: &str, summary: &str) -> Change {
+        Change {
+            id,
+            at: Local::now().naive_local(),
+            author: "Grace".into(),
+            script: script.into(),
+            summary: summary.into(),
+        }
+    }
+
+    #[test]
+    fn work_the_server_took_is_marked_as_sent_and_counted() {
+        let mut state = linked();
+        let first = state.project.history.record(
+            "Ada",
+            "append_task(\"A\");",
+            "Added A",
+            Local::now().naive_local(),
+        );
+        let second = state.project.history.record(
+            "Ada",
+            "append_task(\"B\");",
+            "Added B",
+            Local::now().naive_local(),
+        );
+        assert_eq!(state.project.history.unsent().len(), 2);
+
+        state.sync_landed(Ok(Pushed::Applied {
+            head: 9,
+            applied: vec![(first, 8), (second, 9)],
+            snapshot_wanted: false,
+        }));
+
+        assert!(state.project.history.unsent().is_empty(), "both went");
+        assert_eq!(state.link.as_ref().map(|link| link.cursor), Some(9));
+        assert_eq!(
+            state.checked.as_ref().map(|checked| &checked.outcome),
+            Some(&CheckOutcome::Current),
+            "the server was asked and agreed, so the tick is earned"
+        );
+        assert!(
+            state.status.contains("2 changes sent"),
+            "it says how many, got {:?}",
+            state.status
+        );
+        assert!(state.dialog.is_none(), "nothing to decide");
+    }
+
+    #[test]
+    fn being_behind_asks_the_planner_rather_than_deciding_for_them() {
+        // The one decision this whole design exists to offer, so it is a
+        // dialog with the difference in it and not a message.
+        let mut state = linked();
+        state.project.history.record(
+            "Ada",
+            "append_task(\"Mine\");",
+            "Added Mine",
+            Local::now().naive_local(),
+        );
+        let rows = state.project.tasks.len();
+
+        state.sync_landed(Ok(Pushed::Behind {
+            head: 12,
+            after: 4,
+            changes: vec![theirs(90, "append_task(\"Theirs\");", "Added Theirs")],
+            more: false,
+        }));
+
+        match &state.dialog {
+            Some(Dialog::SyncBehind {
+                head, differences, ..
+            }) => {
+                assert_eq!(*head, 12);
+                assert!(!differences.is_empty(), "there is something to show");
+            }
+            other => panic!("expected the question, got {other:?}"),
+        }
+        assert_eq!(
+            state.project.tasks.len(),
+            rows,
+            "nothing lands before the answer"
+        );
+        assert_eq!(
+            state.project.history.unsent().len(),
+            1,
+            "and nothing was marked as sent"
+        );
+        assert_eq!(
+            state.link.as_ref().map(|link| link.cursor),
+            Some(4),
+            "the cursor stays where it was"
+        );
+    }
+
+    #[test]
+    fn a_trimmed_log_offers_a_whole_plan_and_says_why() {
+        let mut state = linked();
+        state.sync_landed(Ok(Pushed::Gap {
+            head: 40,
+            oldest: Some(30),
+        }));
+
+        match &state.dialog {
+            Some(Dialog::FreshCopy { why }) => {
+                assert!(why.contains("30"), "it says what is left, got {why:?}");
+            }
+            other => panic!("expected the offer of a fresh copy, got {other:?}"),
+        }
+        assert!(matches!(
+            state.checked.as_ref().map(|checked| &checked.outcome),
+            Some(CheckOutcome::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn a_cursor_past_the_servers_head_is_refused_rather_than_reconciled() {
+        // A copy cannot have read further than there is to read, so this is
+        // not the plan it thinks it is and pushing would interleave two logs.
+        let mut state = linked();
+        state.project.history.record(
+            "Ada",
+            "append_task(\"Mine\");",
+            "Added Mine",
+            Local::now().naive_local(),
+        );
+
+        state.sync_landed(Ok(Pushed::Ahead { head: 3, cursor: 7 }));
+
+        assert!(matches!(
+            state.dialog,
+            Some(Dialog::SyncAhead { head: 3, cursor: 7 })
+        ));
+        assert_eq!(
+            state.project.history.unsent().len(),
+            1,
+            "nothing was sent, so nothing is marked as sent"
+        );
+        assert_eq!(state.link.as_ref().map(|link| link.cursor), Some(4));
+    }
+
+    #[test]
+    fn a_rejected_change_leaves_the_plan_as_it_was() {
+        // Half of a batch landing is the failure this check exists for: the
+        // two copies no longer agree about what the plan was, and writing the
+        // part that happened to fit would make that permanent.
+        let mut state = linked();
+        state.append_task("Bridge");
+        let before: Vec<String> = state
+            .project
+            .tasks
+            .iter()
+            .map(|task| task.name.clone())
+            .collect();
+
+        let mut moved = state.project.clone();
+        moved.push_task("Theirs", MINUTES_PER_DAY);
+        let mut differences = compare(&state.project, &moved);
+        // A row this copy has never had. Their side taking away something that
+        // was never here is what drift looks like on the wire.
+        differences.push(Difference::TaskRemoved {
+            id: 9999,
+            name: "A row this copy never had".into(),
+        });
+
+        let brought = state.accept_incoming(20, &differences, Vec::new(), 0, 0);
+
+        assert!(!brought.is_clean(), "one of them did not fit");
+        let after: Vec<String> = state
+            .project
+            .tasks
+            .iter()
+            .map(|task| task.name.clone())
+            .collect();
+        assert_eq!(after, before, "so none of them landed");
+        assert!(
+            matches!(state.dialog, Some(Dialog::FreshCopy { .. })),
+            "and a whole plan is offered instead of a half changed one"
+        );
+    }
+
+    #[test]
+    fn a_version_is_kept_before_a_rebase_and_can_be_returned_to() {
+        // The reason the store exists: a rebase is the only thing that replays
+        // a planner's own work on top of somebody else's.
+        let mut state = linked();
+        state.append_task("Mine");
+        assert!(state.versions.is_empty(), "nothing kept yet");
+
+        let mut moved = state.project.clone();
+        moved.push_task("Theirs", MINUTES_PER_DAY);
+        let differences = compare(&state.project, &moved);
+
+        let brought = state.accept_incoming(
+            20,
+            &differences,
+            vec![theirs(90, "append_task(\"Theirs\");", "Added Theirs")],
+            0,
+            0,
+        );
+        assert!(brought.is_clean());
+        assert_eq!(state.versions.len(), 1, "the moment before it is kept");
+        assert_eq!(
+            state.versions.newest().map(|snapshot| snapshot.taken),
+            Some(Taken::BeforeRebase)
+        );
+        assert!(
+            state.project.tasks.iter().any(|task| task.name == "Theirs"),
+            "their work is here"
+        );
+
+        state.restore_version(0);
+        assert!(
+            !state.project.tasks.iter().any(|task| task.name == "Theirs"),
+            "and the version before it can be returned to"
+        );
+        assert!(
+            state.project.tasks.iter().any(|task| task.name == "Mine"),
+            "with this planner's own work still in it"
+        );
+        assert!(
+            !state.project.history.changes().is_empty(),
+            "the log is kept: going back is one more thing that was done"
+        );
+    }
+
+    #[test]
+    fn saving_twice_with_nothing_edited_between_leaves_one_marker() {
+        // A save is the unit a sync offers a decision about. Two of them with
+        // nothing in between offer a decision about nothing.
+        let mut state = AppState::new();
+        state.user_name = "Ada".into();
+        state.append_task("Bridge");
+
+        assert!(state.mark_save_point().is_some(), "the first one counts");
+        assert!(
+            state.mark_save_point().is_none(),
+            "the second has nothing under it"
+        );
+        assert_eq!(state.project.history.saves().len(), 1);
+
+        state.append_task("Tunnel");
+        assert!(
+            state.mark_save_point().is_some(),
+            "an edit in between earns another"
+        );
+        assert_eq!(state.project.history.saves().len(), 2);
+    }
+
+    #[test]
+    fn a_browser_offers_everything_the_opener_can_read() {
+        // The bug this pins: three copies of "which files can we open" that
+        // disagreed. The Open page listed no workbook at all, so an .xlsx was
+        // invisible on every platform while `open_any` would happily import
+        // it. A file the application can read but will not show is
+        // indistinguishable, to the person looking for it, from one it cannot.
+        for extension in aop_core::persist::IMPORTED_EXTENSIONS {
+            let path = std::path::PathBuf::from(format!("plan.{extension}"));
+            assert!(
+                offered_in_browser(&path, false),
+                ".{extension} is importable but would not be listed"
+            );
+            // Upper case too: Windows names are commonly shouted.
+            let shouted = std::path::PathBuf::from(format!("PLAN.{}", extension.to_uppercase()));
+            assert!(offered_in_browser(&shouted, false), ".{extension} uppercase");
+        }
+
+        let plan = std::path::PathBuf::from(format!("a.{}", aop_core::persist::FILE_EXTENSION));
+        assert!(offered_in_browser(&plan, false));
+        // Saving narrows to the plan format: writing a schedule out as a
+        // workbook would lose most of what is in it.
+        assert!(offered_in_browser(&plan, true));
+        assert!(!offered_in_browser(&std::path::PathBuf::from("book.xlsx"), true));
+
+        assert!(!offered_in_browser(&std::path::PathBuf::from("notes.txt"), false));
+        assert!(!offered_in_browser(&std::path::PathBuf::from("noextension"), false));
     }
 }

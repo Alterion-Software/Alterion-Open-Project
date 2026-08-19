@@ -11,7 +11,6 @@ use aop_core::{
 use std::path::PathBuf;
 
 use aop_core::leveling::{LevelOrder, LevelScope};
-use aop_core::persist;
 use aop_core::textstyle::{StyleTarget, TextStyle};
 use aop_core::update::UpdateOptions;
 
@@ -55,9 +54,128 @@ pub fn DialogHost(dialog: Dialog) -> Element {
                     Dialog::History => rsx! { HistoryDialog {} },
                     Dialog::UnsavedChanges(action) => rsx! { UnsavedChanges { action } },
                     Dialog::Recover(found) => rsx! { Recover { found } },
+                    Dialog::SyncBehind {
+                        head, sentence, differences, changes, replayed, asked, more,
+                    } => rsx! {
+                        SyncBehind { head, sentence, differences, changes, replayed, asked, more }
+                    },
+                    Dialog::SyncAhead { head, cursor } => rsx! { SyncAhead { head, cursor } },
+                    Dialog::FreshCopy { why } => rsx! { FreshCopy { why } },
+                    Dialog::OpenLink(share) => rsx! { OpenLink { share } },
+                    Dialog::RestoreVersion(index) => rsx! { RestoreVersion { index } },
+                    Dialog::HealthCheck => rsx! { HealthCheck {} },
+                    Dialog::UpdateAvailable => rsx! { UpdateAvailable {} },
                     Dialog::Message { title, body } => rsx! { MessageBox { title, body } },
                 }
             }
+        }
+    }
+}
+
+/// A newer release, and what this copy is allowed to do about it.
+///
+/// The refusals are the interesting part. A copy a package manager installed
+/// is told the new version exists and told the command that fetches it, rather
+/// than being given a button that would write over files pacman owns and leave
+/// the next system upgrade to clean up after it. A plan with unsaved changes
+/// stops the install too: it replaces the running program, and work that only
+/// exists in this window would go with it.
+#[component]
+fn UpdateAvailable() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let (found, message, working, ready) = {
+        let s = state.read();
+        (
+            s.update_found.clone(),
+            s.update_message.clone(),
+            s.updating,
+            s.update_ready.clone(),
+        )
+    };
+    let blocked = state.read().update_blocked();
+
+    rsx! {
+        Head { title: "Update".to_string() }
+        div { class: "dlg-body", style: "min-width: 460px;",
+            match (&found, &ready) {
+                (_, Some(crate::updates::Installed::Downloaded { installer })) => rsx! {
+                    p { class: "hint", style: "margin-top: 0;",
+                        "The installer has been downloaded and checked against the checksum                          published with it. Running it closes this application."
+                    }
+                    div { class: "sync-row",
+                        span { class: "sync-key", "Installer" }
+                        span { class: "sync-value mono", "{installer.display()}" }
+                    }
+                },
+                (Some(found), _) => rsx! {
+                    div { class: "sync-row",
+                        span { class: "sync-key", "Installed" }
+                        span { class: "sync-value", "{crate::welcome::RUNNING}" }
+                    }
+                    div { class: "sync-row",
+                        span { class: "sync-key", "Available" }
+                        span { class: "sync-value good", "{found.version}" }
+                    }
+                    if let Some(artefact) = &found.artefact {
+                        div { class: "sync-row",
+                            span { class: "sync-key", "Download" }
+                            span { class: "sync-value mono", "{artefact.name}" }
+                        }
+                    }
+                    div { class: "sync-row",
+                        span { class: "sync-key", "Release page" }
+                        span { class: "sync-value mono", "{found.page}" }
+                    }
+                    if let Some(why) = &blocked {
+                        p { class: "sync-why", style: "margin-top: 12px;", "{why}" }
+                    } else {
+                        p { class: "hint",
+                            "The download is checked against the checksum published beside it, and                              refused if it does not match. The current version is kept, so a new                              one that will not start can be put back."
+                        }
+                    }
+                },
+                (None, _) => rsx! {
+                    p { class: "hint", style: "margin-top: 0;",
+                        {message.clone().unwrap_or_else(|| {
+                            format!("Version {} is the newest there is.", crate::welcome::RUNNING)
+                        })}
+                    }
+                },
+            }
+
+            if working {
+                p { class: "hint", "Fetching and checking the new version..." }
+            } else if let Some(message) = message.clone().filter(|_| found.is_some()) {
+                p { class: "sync-why", style: "margin-top: 12px;", "{message}" }
+            }
+        }
+        div { class: "dlg-foot",
+            button {
+                class: "btn",
+                onclick: move |_| crate::updates::ask_in_background(state),
+                disabled: working,
+                "Check again"
+            }
+            div { class: "grow" }
+            if let Some(crate::updates::Installed::Downloaded { installer }) = ready {
+                button {
+                    class: "btn primary",
+                    onclick: move |_| {
+                        if crate::updates::run_installer(&installer).is_ok() {
+                            state.write().quit_requested = true;
+                        }
+                    },
+                    "Run the installer"
+                }
+            } else if found.as_ref().is_some_and(|found| found.installable()) {
+                button {
+                    class: "btn primary",
+                    disabled: blocked.is_some() || working,
+                    onclick: move |_| crate::updates::install_in_background(state),
+                    "Install it"
+                }
+            }
+            button { class: "btn", onclick: move |_| state.write().dialog = None, "Close" }
         }
     }
 }
@@ -1011,12 +1129,7 @@ fn InsertSubproject() -> Element {
                 }
                 if path.is_dir() {
                     folders.push((name, path));
-                } else if path.extension().is_some_and(|e| {
-                    e.eq_ignore_ascii_case(persist::FILE_EXTENSION)
-                        || e.eq_ignore_ascii_case("xml")
-                        || e.eq_ignore_ascii_case("mpp")
-                        || e.eq_ignore_ascii_case("xlsx")
-                }) {
+                } else if crate::state::offered_in_browser(&path, false) {
                     files.push((name, path));
                 }
             }
@@ -1051,6 +1164,15 @@ fn InsertSubproject() -> Element {
                         if let Some(parent) = parent { dir.set(parent); }
                     },
                     "Up"
+                }
+                // Empty on every platform with a single root. On Windows the
+                // parent of `C:\` is nothing, so without these a workbook on
+                // another drive can never be navigated to.
+                for (label, root) in crate::state::browser_roots() {
+                    button { class: "btn",
+                        onclick: move |_| dir.set(root.clone()),
+                        "{label}"
+                    }
                 }
             }
 
@@ -2663,5 +2785,504 @@ fn ExternalDependenciesDialog() -> Element {
         div { class: "dlg-foot",
             button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Done" }
         }
+    }
+}
+
+// ------------------------------------------------------------ collaborating
+
+/// One difference as a line, with the task named once by the group above it.
+///
+/// Written here rather than on `Difference` because the wording belongs to
+/// this dialog: the same difference reads differently in a change log, where
+/// it is something that was done, and in this question, where it is something
+/// somebody is being asked to accept.
+fn difference_line(difference: &aop_core::compare::Difference) -> String {
+    use aop_core::compare::Difference as D;
+    match difference {
+        D::TaskAdded { .. } => "added".to_string(),
+        D::TaskRemoved { .. } => "removed".to_string(),
+        D::TaskMoved { from, to, .. } => format!("moved from row {} to row {}", from + 1, to + 1),
+        D::FieldChanged {
+            field,
+            before,
+            after,
+            ..
+        } => format!("{}: {before} to {after}", field.label()),
+        D::LinkAdded { kind, .. } => format!("now waits on another task ({})", kind.code()),
+        D::LinkRemoved { kind, .. } => {
+            format!("no longer waits on another task ({})", kind.code())
+        }
+        D::LinkChanged {
+            before_kind,
+            after_kind,
+            ..
+        } => format!(
+            "the task it waits on changed from {} to {}",
+            before_kind.code(),
+            after_kind.code()
+        ),
+        D::ResourceAdded { name, .. } => format!("{name} added to the resource sheet"),
+        D::ResourceRemoved { name, .. } => format!("{name} taken off the resource sheet"),
+        D::ResourceChanged {
+            field,
+            before,
+            after,
+            ..
+        } => format!("{}: {before} to {after}", field.label()),
+        D::AssignmentAdded {
+            resource_name,
+            units,
+            ..
+        } => format!("{resource_name} assigned at {:.0}%", units * 100.0),
+        D::AssignmentRemoved { resource_name, .. } => format!("{resource_name} taken off it"),
+        D::AssignmentChanged {
+            resource_name,
+            before_units,
+            after_units,
+            ..
+        } => format!(
+            "{resource_name} from {:.0}% to {:.0}%",
+            before_units * 100.0,
+            after_units * 100.0
+        ),
+    }
+}
+
+/// Somebody pushed first. What they did, and the choice about it.
+///
+/// The decision this whole design exists to offer, so it is a dialog with the
+/// difference in it rather than a message saying a sync failed. Both answers
+/// are real: taking their work replays this planner's on top of it, and
+/// keeping this copy for now leaves everything exactly where it is.
+#[component]
+fn SyncBehind(
+    head: i64,
+    sentence: String,
+    differences: Vec<aop_core::compare::Difference>,
+    changes: Vec<aop_core::history::Change>,
+    replayed: usize,
+    asked: usize,
+    more: bool,
+) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    // How much of the difference the panel will list. A first sync against a
+    // busy plan runs to hundreds, and the sentence above already says how big
+    // it is; the list is for recognising the work, not for reading all of it.
+    const SHOWN: usize = 60;
+
+    let grouped = aop_core::compare::group_by_task(&differences);
+    let listed: usize = grouped.tasks.len() + grouped.plan.len();
+    let who: Vec<String> = {
+        let mut names: Vec<String> = changes.iter().map(|change| change.author.clone()).collect();
+        names.sort();
+        names.dedup();
+        names.retain(|name| !name.trim().is_empty());
+        names
+    };
+    let by = match who.len() {
+        0 => "Somebody else".to_string(),
+        1 => who[0].clone(),
+        _ => format!("{} and {} other(s)", who[0], who.len() - 1),
+    };
+
+    // Worked out before the question is asked, so the answer is against
+    // something real: a command that will not replay here means the two copies
+    // have already parted, and accepting would leave the plan half theirs.
+    let drifted = replayed < asked;
+
+    // Each button outlives this render, so it takes its own copy.
+    let for_accept = (differences.clone(), changes.clone());
+
+    rsx! {
+        Head { title: "Somebody else changed this plan first".to_string() }
+        div { class: "dlg-body", style: "min-width: 720px; max-height: 62vh; overflow-y: auto;",
+            p { style: "line-height: 1.6;",
+                "{by} pushed work to the server before this copy did. The server is at change \
+                 {head}. Their work: {sentence}"
+            }
+
+            if drifted {
+                div { class: "sync-drift",
+                    {icon("warning", 16)}
+                    span {
+                        "{asked - replayed} of the {asked} commands that came in will not run \
+                         against this copy of the plan. Bringing them in would leave it part \
+                         theirs and part yours, so it will be refused and a fresh whole plan \
+                         offered instead."
+                    }
+                }
+            }
+
+            if listed == 0 {
+                p { class: "hint", "Their changes do not alter anything this copy can see." }
+            } else {
+                div { class: "diff-list",
+                    for group in grouped.tasks.iter().take(SHOWN) {
+                        div { key: "t{group.id}", class: "diff-group",
+                            div { class: "diff-subject", "{group.name}" }
+                            for (index, difference) in group.differences.iter().enumerate() {
+                                div { key: "d{index}", class: "diff-line",
+                                    "{difference_line(difference)}"
+                                }
+                            }
+                        }
+                    }
+                    if !grouped.plan.is_empty() {
+                        div { class: "diff-group",
+                            div { class: "diff-subject", "Resource sheet" }
+                            for (index, difference) in grouped.plan.iter().enumerate() {
+                                div { key: "r{index}", class: "diff-line",
+                                    "{difference_line(difference)}"
+                                }
+                            }
+                        }
+                    }
+                }
+                if grouped.tasks.len() > SHOWN {
+                    p { class: "hint",
+                        "Showing {SHOWN} of the {grouped.tasks.len()} tasks they touched."
+                    }
+                }
+            }
+
+            if more {
+                p { class: "hint",
+                    "There is more waiting beyond this batch. Taking these and syncing again \
+                     brings the rest."
+                }
+            }
+
+            p { class: "hint",
+                "Nothing here has been changed yet. Taking their work keeps yours: it is put \
+                 back on top afterwards and sent in the same step. Whichever you choose, the \
+                 plan as it stands now is kept in History and Sync first."
+            }
+        }
+        div { class: "dlg-foot",
+            button {
+                class: "btn",
+                onclick: move |_| {
+                    let mut writer = state.write();
+                    writer.dialog = None;
+                    writer.cloud_message = Some(
+                        "Their changes were left on the server. Nothing here has been sent or \
+                         changed. Sync again when you are ready to take them."
+                            .into(),
+                    );
+                },
+                "Keep mine for now"
+            }
+            button {
+                class: "btn primary",
+                onclick: move |_| {
+                    let (differences, changes) = for_accept.clone();
+                    crate::collaborate::accept_incoming(
+                        state, head, differences, changes, replayed, asked,
+                    );
+                },
+                "Take theirs and put mine on top"
+            }
+        }
+    }
+}
+
+/// This copy's cursor is past the server's, so it is not the plan it thinks.
+///
+/// Refused rather than reconciled. Pushing would interleave two histories that
+/// only look alike, and there is no answer to offer here that is not a guess
+/// about which of two plans somebody meant.
+#[component]
+fn SyncAhead(head: i64, cursor: i64) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    rsx! {
+        Head { title: "This is not the plan the server holds".to_string() }
+        div { class: "dlg-body", style: "min-width: 560px;",
+            div { style: "display: flex; gap: 14px; align-items: flex-start;",
+                span { style: "color: var(--danger); flex: none;", {icon("warning", 28)} }
+                div { style: "line-height: 1.6;",
+                    p {
+                        "This copy has read up to change {cursor}, but the server's log only \
+                         reaches {head}. A copy cannot have read further than there is to read, \
+                         so these are two different logs that share an address."
+                    }
+                    p { style: "margin-top: 10px;",
+                        "Nothing has been sent. Pushing would lay this plan's history into \
+                         somebody else's and leave both wrong."
+                    }
+                    p { style: "margin-top: 10px;",
+                        "This usually means the project on the server was rebuilt, or this file \
+                         was linked to a different project of the same name. Unlink it and put \
+                         it on the server again, or take a fresh copy of the plan the server \
+                         does hold."
+                    }
+                }
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Close" }
+        }
+    }
+}
+
+/// A link somebody opened, and what opening it would do.
+///
+/// The server is the first thing on the page and the largest, because it is
+/// the part that is not this planner's choice. A link is an instruction from
+/// whoever sent it to go and talk to a host they picked, and the difference
+/// between opening a plan and being pointed at somebody else's server is
+/// whether that host was shown before the request went.
+///
+/// It is also honest about what a link is and is not. It admits nobody by
+/// itself: it says where a plan is, and the server says who may have it. What
+/// lets somebody in is an invitation the owner sent to their email address,
+/// which opening the link claims on their behalf. Saying that here is better
+/// than a refusal from the server that reads like the plan is missing.
+#[component]
+fn OpenLink(share: crate::cloud::share::Share) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let (waiting, dirty, configured) = {
+        let s = state.read();
+        (
+            s.working.is_some(),
+            s.dirty,
+            s.collaborate_server.trim().to_string(),
+        )
+    };
+    // Named only when it differs, since agreeing with the setting is the
+    // ordinary case and saying so every time would bury the case that matters.
+    let elsewhere = (!configured.is_empty() && configured != share.server).then_some(configured);
+    let asked = share.clone();
+
+    rsx! {
+        Head { title: "Open a plan from a link".to_string() }
+        div { class: "dlg-body", style: "min-width: 600px;",
+            div { class: "sync-row",
+                span { class: "sync-key", "This link points at" }
+                span { class: "sync-value mono", "{share.server}" }
+            }
+            div { class: "sync-row",
+                span { class: "sync-key", "and asks for the plan" }
+                span { class: "sync-value mono", "{share.project}" }
+            }
+            p { style: "margin-top: 12px; line-height: 1.6;",
+                "Opening it asks that server for the plan and shows what comes back.                  If you are not in this plan yet, it also presents this account, in case                  whoever owns the plan has invited the address you sign in with. The link                  by itself grants nothing: without an invitation the server will say the                  plan is not yours to open."
+            }
+            if let Some(configured) = elsewhere {
+                div { class: "sync-drift",
+                    span { {icon("warning", 16)} }
+                    div {
+                        "This is not the server this copy is set to, which is "
+                        b { "{configured}" }
+                        ". Opening the link will use the address in the link for this plan                          from now on. Only carry on if you know that server."
+                    }
+                }
+            }
+            if dirty {
+                div { class: "sync-drift",
+                    span { {icon("warning", 16)} }
+                    div {
+                        "The plan on screen has changes that are not saved, and opening this                          one replaces it. Save it first if you want to keep them."
+                    }
+                }
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn", onclick: move |_| state.write().dialog = None, "Cancel" }
+            if waiting {
+                button { class: "btn primary", disabled: true, "Fetching..." }
+            } else {
+                button {
+                    class: "btn primary",
+                    onclick: move |_| crate::collaborate::open_link(state, asked.clone()),
+                    "Open the plan"
+                }
+            }
+        }
+    }
+}
+
+/// Replaying is no longer possible, so only a whole plan will do.
+///
+/// The offer is deliberate rather than automatic: fetching replaces everything
+/// on screen, and doing that without asking is how a planner loses an
+/// afternoon to a button they pressed for a different reason.
+#[component]
+fn FreshCopy(why: String) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let waiting = state.read().working.is_some();
+
+    rsx! {
+        Head { title: "This copy needs a fresh plan".to_string() }
+        div { class: "dlg-body", style: "min-width: 600px;",
+            div { style: "display: flex; gap: 14px; align-items: flex-start;",
+                span { style: "color: var(--warn); flex: none;", {icon("warning", 28)} }
+                div { style: "line-height: 1.6;",
+                    p { "{why}" }
+                    p { style: "margin-top: 10px;",
+                        "Fetching one replaces what is on screen with the server's copy. The \
+                         plan as it stands now is kept first, and is in History and Sync if you \
+                         want it back."
+                    }
+                }
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn", onclick: move |_| state.write().dialog = None, "Not now" }
+            if waiting {
+                button { class: "btn primary", disabled: true, "Fetching..." }
+            } else {
+                button {
+                    class: "btn primary",
+                    onclick: move |_| crate::collaborate::fresh_copy(state),
+                    "Fetch a fresh copy"
+                }
+            }
+        }
+    }
+}
+
+/// Put the plan back to one of its versions.
+///
+/// Named for what it does and confirmed on its own, because it is the one
+/// action in History and Sync that changes the plan. A restore that happened
+/// on a single click of a row would be a list somebody could not browse.
+#[component]
+fn RestoreVersion(index: usize) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+
+    let found = {
+        let s = state.read();
+        s.versions.get(index).map(|snapshot| {
+            (
+                snapshot.at.format("%Y-%m-%d %H:%M").to_string(),
+                snapshot.author.clone(),
+                snapshot.taken.label(),
+                snapshot.plan.tasks.len(),
+            )
+        })
+    };
+    let Some((when, author, label, tasks)) = found else {
+        return rsx! {
+            MessageBox {
+                title: "Go back to a version".to_string(),
+                body: "That version is no longer kept.".to_string(),
+            }
+        };
+    };
+
+    let sentence = {
+        let s = state.read();
+        aop_core::compare::summarise(&s.versions.changed_after(index, &s.project)).sentence()
+    };
+    let against = state.read().versions.compared_with(index);
+    let shared = state.read().link.is_some();
+
+    rsx! {
+        Head { title: "Go back to a version".to_string() }
+        div { class: "dlg-body", style: "min-width: 560px;",
+            p { style: "line-height: 1.6;",
+                "This replaces the plan on screen with the one kept at {when} by {author} \
+                 ({label}), which has {tasks} task(s)."
+            }
+            div { class: "ver-diff", style: "margin-top: 12px;",
+                div { class: "ver-diff-head",
+                    {icon("compare", 15)}
+                    span { "Compared with {against}" }
+                }
+                p { "{sentence}" }
+            }
+            p { class: "hint",
+                "The change log is kept as it is. Going back is one more thing that was done, \
+                 not a reason to forget the record of the rest, and it can be undone."
+            }
+            if shared {
+                p { class: "hint",
+                    "This plan is on a server. Going back cannot be sent as a command, so the \
+                     server is not told: sync afterwards to see what it makes of it."
+                }
+            }
+        }
+        div { class: "dlg-foot",
+            button { class: "btn", onclick: move |_| state.write().dialog = None, "Cancel" }
+            button {
+                class: "btn danger",
+                onclick: move |_| state.write().restore_version(index),
+                "Go back to this version"
+            }
+        }
+    }
+}
+
+/// What the health check found, one question at a time.
+///
+/// A list with a result each rather than one verdict, because which question
+/// failed is the diagnosis: "server reachable, identity provider unreachable"
+/// points at a name or a firewall, and "could not connect" points at nothing.
+#[component]
+fn HealthCheck() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let (checks, running) = {
+        let s = state.read();
+        (s.health.clone(), s.working.is_some())
+    };
+
+    rsx! {
+        Head { title: "Check Collaborate".to_string() }
+        div { class: "dlg-body", style: "min-width: 640px;",
+            p { class: "hint", style: "margin-top: 0;",
+                "Each question is asked and answered on its own. The server's own check needs \
+                 no sign in, so it still answers when signing in is the thing that is broken."
+            }
+
+            if running && checks.is_empty() {
+                p { style: "margin-top: 14px;", "Asking..." }
+            } else if checks.is_empty() {
+                p { style: "margin-top: 14px;", "Nothing has been checked yet." }
+            } else {
+                div { class: "health-list",
+                    for check in checks.iter() {
+                        div { key: "{check.asked}", class: "health-row",
+                            span { class: "health-badge {health_class(check.outcome)}",
+                                "{check.outcome.label()}"
+                            }
+                            div { class: "health-text",
+                                div { class: "health-asked", "{check.asked}" }
+                                div { class: "health-detail", "{check.detail}" }
+                            }
+                        }
+                    }
+                }
+                p { class: "hint",
+                    "Worth quoting in a bug report: the server's name and version above, and \
+                     which of these lines failed. No part of any sign in token is shown here, \
+                     or written anywhere this application logs."
+                }
+            }
+        }
+        div { class: "dlg-foot",
+            if running {
+                button { class: "btn", disabled: true, "Checking..." }
+            } else {
+                button {
+                    class: "btn",
+                    onclick: move |_| crate::collaborate::health(state),
+                    "Check again"
+                }
+            }
+            button { class: "btn primary", onclick: move |_| state.write().dialog = None, "Close" }
+        }
+    }
+}
+
+/// Which colour a result gets. Not checked is its own thing rather than a
+/// pale pass: a check that did not run has not said anything.
+fn health_class(outcome: crate::cloud::health::Outcome) -> &'static str {
+    use crate::cloud::health::Outcome;
+    match outcome {
+        Outcome::Good => "good",
+        Outcome::Warning => "warn",
+        Outcome::Bad => "bad",
+        Outcome::NotChecked => "idle",
     }
 }

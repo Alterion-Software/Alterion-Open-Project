@@ -555,23 +555,25 @@ dependencies = [
 
 [[package]]
 name = "aop-app"
-version = "1.0.0-beta"
+version = "1.0.1-beta"
 dependencies = [
  "aop-core",
  "chrono",
  "dioxus",
  "dioxus-native",
+ "flate2",
  "gtk",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
+ "tungstenite",
  "ureq",
 ]
 
 [[package]]
 name = "aop-collaborate"
-version = "1.0.0-beta"
+version = "1.0.1-beta"
 dependencies = [
  "actix-cors",
  "actix-web",
@@ -596,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "aop-core"
-version = "1.0.0-beta"
+version = "1.0.1-beta"
 dependencies = [
  "alterion-mpp-parser",
  "calamine",
@@ -612,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "aop-procname"
-version = "1.0.0-beta"
+version = "1.0.1-beta"
 
 [[package]]
 name = "app_units"
@@ -9338,9 +9340,11 @@ dependencies = [
  "native-tls",
  "rand 0.9.5",
  "rustls",
+ "rustls-pki-types",
  "sha1 0.10.7",
  "thiserror 2.0.20",
  "utf-8",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

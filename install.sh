@@ -13,7 +13,7 @@
 set -euo pipefail
 
 repo="Alterion-Software/Alterion-Open-Project"
-version="v1.0.0-beta"
+version="v1.0.1-beta"
 name="alterion-open-project"
 pretty="Alterion Open Project"
 
@@ -149,33 +149,72 @@ if [ "$from_source" -eq 1 ]; then
   ( cd "$here" && cargo build --release --package aop-app )
   place 755 "$here/target/release/$name" "$bindir/$name"
 else
-  step "Downloading the binary"
+  step "Downloading"
   arch="$(uname -m)"
   [ "$arch" = "x86_64" ] || die "no prebuilt binary for $arch; rerun with --build to compile it"
-  url="https://github.com/$repo/releases/download/$version/$name-x86_64-linux"
+
+  # The name has to match what packaging/release.sh publishes, exactly. It is
+  # a versioned tarball carrying the binary and the desktop files together,
+  # not a bare binary.
+  bare="${version#v}"
+  archive="$name-$bare-x86_64-linux.tar.gz"
+  base="https://github.com/$repo/releases/download/$version"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
-  if command -v curl >/dev/null; then
-    curl -fL --progress-bar -o "$tmp/$name" "$url"
-  elif command -v wget >/dev/null; then
-    wget -q --show-progress -O "$tmp/$name" "$url"
+
+  fetch() {
+    if command -v curl >/dev/null; then
+      curl -fL --progress-bar -o "$2" "$1"
+    elif command -v wget >/dev/null; then
+      wget -q --show-progress -O "$2" "$1"
+    else
+      die "neither curl nor wget is installed"
+    fi
+  }
+
+  fetch "$base/$archive" "$tmp/$archive"
+  [ -s "$tmp/$archive" ] || die "the download was empty"
+
+  # Verify before unpacking, not after. SHA256SUMS is published beside the
+  # artefacts; this proves the download matches what was published. It does
+  # not prove who published it, which is what HTTPS to github.com is for.
+  step "Verifying the download"
+  if fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null && [ -s "$tmp/SHA256SUMS" ]; then
+    if command -v sha256sum >/dev/null; then
+      ( cd "$tmp" && grep " $archive\$" SHA256SUMS | sha256sum -c - ) \
+        || die "checksum mismatch; the download is corrupt or has been tampered with"
+      echo "  checksum matches the published SHA256SUMS"
+    else
+      warn "sha256sum is not installed, so the download could not be verified"
+    fi
   else
-    die "neither curl nor wget is installed"
+    warn "SHA256SUMS could not be fetched, so the download could not be verified"
   fi
-  # A truncated download would otherwise be installed and fail confusingly.
-  [ -s "$tmp/$name" ] || die "the download was empty"
+
+  step "Unpacking"
+  tar -xzf "$tmp/$archive" -C "$tmp"
+  [ -f "$tmp/$name" ] || die "the archive did not contain $name"
   head -c 4 "$tmp/$name" | grep -q "ELF" || die "that is not a Linux binary; the download may have failed"
   place 755 "$tmp/$name" "$bindir/$name"
+  # The tarball carries the desktop files too, which matters when this script
+  # was downloaded on its own rather than as part of a checkout.
+  downloaded="$tmp"
 fi
 echo "  installed $bindir/$name"
 
 # ------------------------------------------------------- desktop integration
 
 step "Registering with the desktop"
-if [ -d "$here/packaging/linux" ]; then
-  place 644 "$here/packaging/linux/$name.desktop" "$sharedir/applications/$name.desktop"
-  place 644 "$here/packaging/linux/$name.svg"     "$sharedir/icons/hicolor/scalable/apps/$name.svg"
-  place 644 "$here/packaging/linux/$name.xml"     "$sharedir/mime/packages/$name.xml"
+# A checkout has these beside the script; a plain download has them only
+# because the tarball carried them.
+assets=""
+[ -d "$here/packaging/linux" ] && assets="$here/packaging/linux"
+[ -z "$assets" ] && [ -n "${downloaded:-}" ] && [ -f "$downloaded/$name.desktop" ] && assets="$downloaded"
+
+if [ -n "$assets" ]; then
+  place 644 "$assets/$name.desktop" "$sharedir/applications/$name.desktop"
+  place 644 "$assets/$name.svg"     "$sharedir/icons/hicolor/scalable/apps/$name.svg"
+  place 644 "$assets/$name.xml"     "$sharedir/mime/packages/$name.xml"
   echo "  desktop entry, icon and .aprj association installed"
 else
   warn "packaging/linux was not found beside this script, so only the binary was installed"

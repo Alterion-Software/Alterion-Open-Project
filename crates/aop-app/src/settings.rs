@@ -16,13 +16,6 @@ use std::path::PathBuf;
 use crate::theme::ThemeChoice;
 
 /// Everything remembered between sessions.
-/// Where Alterion's own identity provider lives. Only a default: the whole
-/// point of the setting is that it can point somewhere else.
-pub const DEFAULT_IDP: &str = "https://auth.coraldune.cloud";
-
-/// What this application calls itself when signing in.
-pub const DEFAULT_CLIENT_ID: &str = "alterion-open-project";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub user_name: String,
@@ -54,13 +47,53 @@ pub struct Settings {
     /// Where the identity provider lives. Everything else about it is read
     /// from its own discovery document, so somebody running their own only
     /// changes this one line.
+    ///
+    /// Empty until somebody fills it in, and deliberately so. The provider is
+    /// self hosted and self deployable, so any address shipped here would be
+    /// somebody else's server signing in every planner who never looked at the
+    /// setting. There is no address that is right for everyone, so there is
+    /// none.
     pub idp_issuer: String,
     /// How this application identifies itself to that provider. Not a secret:
     /// a desktop application is a public client and proves itself with PKCE
-    /// rather than with something it would have to hide on disk.
+    /// rather than with something it would have to hide on disk. Issued by
+    /// whoever runs the provider, so it is empty until they say what it is.
     pub idp_client_id: String,
+    /// The page a person manages their own account on, at the provider.
+    ///
+    /// Empty means "under the issuer", which is what nearly every deployment
+    /// wants and what nobody should have to fill in. It is here at all because
+    /// the provider is self hosted: whoever runs one can put its account page
+    /// wherever they like, and nothing in the discovery document says where.
+    pub idp_account_url: String,
+    /// Where the sync server lives. A different address from the provider:
+    /// one signs people in, the other keeps plans, and a deployment can put
+    /// them on different machines.
+    pub collaborate_server: String,
     /// Whether to offer signing in and syncing at all.
     pub collaborate: bool,
+
+    // ---- the licence, and what changed ----------------------------------
+    /// The version whose licence was acknowledged. Empty until somebody has,
+    /// and that emptiness is the whole record: absent means show it, present
+    /// means never again.
+    pub licence_acknowledged: String,
+    /// When that happened, as RFC 3339. Kept beside the version rather than
+    /// instead of it, since "which licence" and "when" are two different facts
+    /// and a record holding one of them answers half the question.
+    pub licence_acknowledged_at: String,
+    /// The version this copy last finished starting as. Empty on a first run,
+    /// which is how a first run is told from an update: nothing changed for
+    /// somebody who never had the previous one.
+    pub last_version: String,
+    /// Whether what changed is shown after an update.
+    pub patch_notes: bool,
+    /// Whether the support page is offered after an update. Its own key, and
+    /// deliberately so: silencing one must never silence the other.
+    pub support_page: bool,
+    /// Whether to look for a newer release at all. Honoured everywhere,
+    /// including the check made at start up.
+    pub update_check: bool,
     /// Only the bindings the user has changed. Defaults are left out so a later
     /// release can improve one and have it reach anyone who never touched it.
     pub keys: crate::keymap::Keymap,
@@ -83,11 +116,22 @@ impl Default for Settings {
             show_links: true,
             bar_text: true,
             show_drawings: true,
-            idp_issuer: DEFAULT_IDP.to_string(),
-            idp_client_id: DEFAULT_CLIENT_ID.to_string(),
+            idp_issuer: String::new(),
+            idp_client_id: String::new(),
+            idp_account_url: String::new(),
+            collaborate_server: String::new(),
             // Off until somebody asks for it. A planner who never signs in
             // should never be shown a sign in button.
             collaborate: false,
+            licence_acknowledged: String::new(),
+            licence_acknowledged_at: String::new(),
+            last_version: String::new(),
+            // Both on, and both refusable. What changed is worth reading once
+            // per release; the ask for help is worth making once and then
+            // never again if the answer was no.
+            patch_notes: true,
+            support_page: true,
+            update_check: true,
             // Marking the critical path everywhere by default turns the whole
             // plan red, which says nothing about which parts matter.
             show_critical: false,
@@ -143,10 +187,35 @@ impl Settings {
              [collaborate]\n\
              # The identity provider to sign in against. Self hosted providers\n\
              # work by changing this alone: everything else is read from its\n\
-             # own discovery document.\n\
+             # own discovery document. There is no default, because there is no\n\
+             # address that would be right for everybody.\n\
              collaborate = {}\n\
              idp_issuer = {}\n\
              idp_client_id = {}\n\
+             # Where Manage account opens. Left empty it is the issuer's own\n\
+             # account page, which is where it lives unless a deployment has\n\
+             # moved it.\n\
+             idp_account_url = {}\n\
+             # The sync server that keeps the plans. Its own address, since it\n\
+             # need not live on the same machine as the provider.\n\
+             collaborate_server = {}\n\
+             \n\
+             [licence]\n\
+             # Which version's licence was acknowledged, and when. Delete both\n\
+             # lines to be shown it again on the next start.\n\
+             acknowledged = {}\n\
+             acknowledged_at = {}\n\
+             \n\
+             [updates]\n\
+             # The version this copy last started as. What changed is shown\n\
+             # when this and the running version differ, and only then.\n\
+             last_version = {}\n\
+             patch_notes = {}\n\
+             # Whether to offer the support page after an update. Separate\n\
+             # from patch_notes on purpose: turning one off leaves the other.\n\
+             support_page = {}\n\
+             # Whether to look for a newer release at all.\n\
+             update_check = {}\n\
              {}",
             self.user_name,
             self.user_initials,
@@ -166,6 +235,14 @@ impl Settings {
             self.collaborate,
             self.idp_issuer,
             self.idp_client_id,
+            self.idp_account_url,
+            self.collaborate_server,
+            self.licence_acknowledged,
+            self.licence_acknowledged_at,
+            self.last_version,
+            self.patch_notes,
+            self.support_page,
+            self.update_check,
             self.keyboard_section(),
         )
     }
@@ -259,6 +336,28 @@ impl Settings {
         if let Some(value) = text_of("idp_client_id").filter(|v| !v.trim().is_empty()) {
             settings.idp_client_id = value;
         }
+        if let Some(value) = text_of("idp_account_url").filter(|v| !v.trim().is_empty()) {
+            settings.idp_account_url = value;
+        }
+        if let Some(value) = text_of("collaborate_server").filter(|v| !v.trim().is_empty()) {
+            settings.collaborate_server = value;
+        }
+
+        // Read whole rather than filtered for emptiness: an empty
+        // acknowledgement is the same as none, and writing one back empty is
+        // how somebody asks to be shown the licence again.
+        if let Some(value) = text_of("acknowledged") {
+            settings.licence_acknowledged = value;
+        }
+        if let Some(value) = text_of("acknowledged_at") {
+            settings.licence_acknowledged_at = value;
+        }
+        if let Some(value) = text_of("last_version") {
+            settings.last_version = value;
+        }
+        settings.patch_notes = flag("patch_notes", settings.patch_notes);
+        settings.support_page = flag("support_page", settings.support_page);
+        settings.update_check = flag("update_check", settings.update_check);
 
         settings
     }
@@ -323,7 +422,15 @@ mod tests {
             show_drawings: false,
             idp_issuer: "https://auth.example.test".into(),
             idp_client_id: "a-client".into(),
+            idp_account_url: "https://auth.example.test/account".into(),
+            collaborate_server: "https://sync.example.test".into(),
             collaborate: true,
+            licence_acknowledged: "1.0.0-beta".into(),
+            licence_acknowledged_at: "2026-08-18T09:14:00Z".into(),
+            last_version: "1.0.0-beta".into(),
+            patch_notes: false,
+            support_page: false,
+            update_check: false,
             keys: {
                 let mut keys = crate::keymap::Keymap::default();
                 keys.bind(crate::keymap::Action::SetBaseline, "Ctrl+B");
@@ -373,6 +480,49 @@ mod tests {
     #[test]
     fn an_unrecognised_theme_falls_back_to_following_the_desktop() {
         assert_eq!(Settings::from_text("theme = puce").theme, ThemeChoice::System);
+    }
+
+    #[test]
+    fn silencing_one_popup_leaves_the_other_alone() {
+        // Two keys rather than one, because "stop telling me what changed" and
+        // "stop asking me for money" are different requests.
+        let quiet_notes = Settings::from_text("patch_notes = false");
+        assert!(!quiet_notes.patch_notes);
+        assert!(quiet_notes.support_page);
+
+        let quiet_support = Settings::from_text("support_page = false");
+        assert!(quiet_support.patch_notes);
+        assert!(!quiet_support.support_page);
+    }
+
+    #[test]
+    fn deleting_the_acknowledgement_asks_for_the_licence_again() {
+        // The record is the only thing suppressing it, so a settings file
+        // without one has to read as never acknowledged.
+        assert!(Settings::from_text("").licence_acknowledged.is_empty());
+        assert_eq!(
+            Settings::from_text("acknowledged = 1.0.0-beta").licence_acknowledged,
+            "1.0.0-beta"
+        );
+    }
+
+    #[test]
+    fn the_account_page_is_left_to_the_issuer_until_a_deployment_names_one() {
+        // Empty is the answer, not a field waiting to be filled in: nearly
+        // every provider keeps its account page under its own issuer, and
+        // deriving it means nobody has to know that.
+        assert!(Settings::default().idp_account_url.is_empty());
+        assert_eq!(
+            Settings::from_text("idp_account_url = https://id.example.test/profile")
+                .idp_account_url,
+            "https://id.example.test/profile"
+        );
+    }
+
+    #[test]
+    fn update_checks_are_on_until_they_are_turned_off() {
+        assert!(Settings::default().update_check);
+        assert!(!Settings::from_text("update_check = false").update_check);
     }
 
     #[test]

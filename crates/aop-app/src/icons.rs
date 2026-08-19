@@ -57,7 +57,7 @@ fn tint_for(name: &str) -> &'static str {
         }
         // People.
         "assign-resources" | "team-planner" | "resource-pool" | "resource-sheet"
-        | "resource-usage" | "add-resource" | "account" => "var(--accent)",
+        | "resource-usage" | "add-resource" | "account" | "share" => "var(--accent)",
         // Confirms something.
         "mark-on-track" | "deliverable" | "respect-links" => "var(--bar-progress)",
         // Everything else takes the colour of what it sits in.
@@ -521,6 +521,14 @@ fn body_for(name: &str) -> String {
         // lucide: layers
         "switch-windows" => String::from(
             "<path d='M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z' /><path d='M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12' /><path d='M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17' />",
+        ),
+        // lucide: cloud
+        "cloud" => String::from(
+            "<path d='M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z' />",
+        ),
+        // lucide: share-2
+        "share" => String::from(
+            "<circle cx='18' cy='5' r='3' /><circle cx='6' cy='12' r='3' /><circle cx='18' cy='19' r='3' /><path d='M8.59 13.51l6.83 3.98' /><path d='M15.41 6.51l-6.82 3.98' />",
         ),
         // lucide: refresh-cw
         "sync" => String::from(

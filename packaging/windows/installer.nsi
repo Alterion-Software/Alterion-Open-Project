@@ -160,6 +160,19 @@ Section "Desktop shortcut" SecDesktop
   CreateShortcut "$DESKTOP\${APPNAME}.lnk" "$INSTDIR\${EXENAME}" "" "$INSTDIR\app.ico"
 SectionEnd
 
+Section "Open aop:// links with ${APPNAME}" SecScheme
+  ; A shared plan is passed around as an aop:// link. Without this the link
+  ; opens in a browser, which cannot do anything with it.
+  ;
+  ; The empty "URL Protocol" value is the marker Windows looks for; a key
+  ; without it is treated as a file type and the scheme is never routed here.
+  WriteRegStr HKCR "aop" "" "URL:Alterion Open Project"
+  WriteRegStr HKCR "aop" "URL Protocol" ""
+  WriteRegStr HKCR "aop\DefaultIcon" "" "$INSTDIR\app.ico,0"
+  WriteRegStr HKCR "aop\shell\open\command" "" '"$INSTDIR\${EXENAME}" "%1"'
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
+SectionEnd
+
 Section "Open .aprj files with ${APPNAME}" SecAssoc
   WriteRegStr HKCR "${EXTENSION}" "" "${PROGID}"
   WriteRegStr HKCR "${PROGID}" "" "Alterion Project"
@@ -172,12 +185,14 @@ LangString DESC_SecCore      ${LANG_ENGLISH} "The application itself."
 LangString DESC_SecStartMenu ${LANG_ENGLISH} "Add ${APPNAME} to the Start menu."
 LangString DESC_SecDesktop   ${LANG_ENGLISH} "Put a shortcut on the desktop."
 LangString DESC_SecAssoc     ${LANG_ENGLISH} "Double-clicking a .aprj plan opens it here."
+LangString DESC_SecScheme    ${LANG_ENGLISH} "Clicking a shared aop:// plan link opens it here."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecCore}      $(DESC_SecCore)
   !insertmacro MUI_DESCRIPTION_TEXT ${SecStartMenu} $(DESC_SecStartMenu)
   !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop}   $(DESC_SecDesktop)
   !insertmacro MUI_DESCRIPTION_TEXT ${SecAssoc}     $(DESC_SecAssoc)
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecScheme}    $(DESC_SecScheme)
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"
@@ -194,6 +209,8 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\${COMPANY}\${APPNAME}.lnk"
   RMDir "$SMPROGRAMS\${COMPANY}"
   Delete "$DESKTOP\${APPNAME}.lnk"
+
+  DeleteRegKey HKCR "aop"
 
   DeleteRegKey HKLM "${REGKEY}"
   DeleteRegKey HKLM "Software\${COMPANY}\${APPNAME}"

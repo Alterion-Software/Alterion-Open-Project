@@ -9,11 +9,15 @@
 use sea_orm_migration::prelude::*;
 
 mod m20260818_000001_init_sync;
+mod m20260819_000002_sharing;
 
 /// Ordered migration list, for a host that wants to splice these into a
 /// Migrator of its own.
 pub fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-    vec![Box::new(m20260818_000001_init_sync::Migration)]
+    vec![
+        Box::new(m20260818_000001_init_sync::Migration),
+        Box::new(m20260819_000002_sharing::Migration),
+    ]
 }
 
 /// What the binary runs on startup.

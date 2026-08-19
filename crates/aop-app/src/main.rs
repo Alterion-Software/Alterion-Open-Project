@@ -8,12 +8,16 @@
 
 mod backstage;
 mod brand;
+mod cloud;
+mod collaborate;
 mod contextmenu;
+mod cursors;
 mod controls;
 mod dictionary;
 mod dialogs;
 mod gantt;
 mod grid;
+mod handoff;
 mod keymap;
 mod icons;
 mod macros;
@@ -25,8 +29,11 @@ mod ribbon;
 mod recovery;
 mod state;
 mod theme;
+mod updates;
+mod versions;
 mod views;
 mod viewport;
+mod welcome;
 
 #[cfg(feature = "desktop")]
 use dioxus::desktop::tao::dpi::LogicalSize;
@@ -90,6 +97,15 @@ fn close_behaviour() -> WindowCloseBehaviour {
 fn main() {
     steady_rendering();
 
+    // A link clicked while this application is already open belongs in the
+    // window that is already open. Two copies of one plan, each with its own
+    // change log and its own sync cursor, is the drift the sync protocol has a
+    // whole case for detecting, and starting one on purpose would be making it
+    // happen.
+    if handoff::claim(link_argument().as_deref()) == handoff::Claim::HandedOver {
+        return;
+    }
+
     let window = WindowBuilder::new()
         .with_title(APP_NAME)
         // The title bar, window controls and dragging are all drawn in-app.
@@ -113,7 +129,21 @@ fn main() {
 /// so this build keeps the operating system's decorations.
 #[cfg(all(feature = "native", not(feature = "desktop")))]
 fn main() {
+    if handoff::claim(link_argument().as_deref()) == handoff::Claim::HandedOver {
+        return;
+    }
     dioxus_native::launch(App);
+}
+
+/// The link this launch was asked to open, if it was asked to open one.
+///
+/// Told from a file path by its scheme and by nothing else. Guessing would be
+/// guessing about whether a network request gets made, and the desktop hands
+/// over a URL and a path through the same argument.
+fn link_argument() -> Option<String> {
+    std::env::args()
+        .nth(1)
+        .filter(|argument| cloud::share::looks_like_a_link(argument))
 }
 
 /// The stylesheet, in a component of its own so it is written once.
@@ -223,6 +253,10 @@ fn App() -> Element {
     // the plan's state, so moving the pointer over the chart does not
     // invalidate the layout memo and rebuild every tick to move a highlight.
     use_context_provider(|| crate::state::Hovered(Signal::new(None)));
+    // Where this planner's own pointer is, for the others to draw. Its own
+    // signal so that moving a mouse never redraws a window: the live timer
+    // below is the only thing that reads it, and it reads it with `peek`.
+    let pointing = use_context_provider(|| crate::state::Pointing(Signal::new(None))).0;
     let mut viewport = use_context_provider(|| Signal::new(crate::state::Viewport::default()));
 
     // Snapshot the plan on a timer so that a crash, a kill, or a power cut
@@ -236,10 +270,38 @@ fn App() -> Element {
         }
     });
 
+    // The live socket runs on a thread of its own and the plan may only be
+    // written where the interface does, so what arrives is collected here
+    // rather than pushed from the socket. Cheap when nothing is connected:
+    // `poll_live` returns at once when there is no socket.
+    use_future(move || async move {
+        let interval = std::time::Duration::from_millis(crate::state::LIVE_POLL_MILLIS);
+        loop {
+            tokio::time::sleep(interval).await;
+            // Asked before the write, because taking a write handle is what
+            // marks the state dirty. Doing that every tick would redraw the
+            // whole window three times a second for a socket nobody opened.
+            if state.read().live.is_some() {
+                // Peeked rather than read: a future that subscribed to the
+                // pointer would be torn down and started again every time the
+                // mouse moved.
+                let at = *pointing.peek();
+                let mut writer = state.write();
+                writer.poll_live();
+                writer.announce(at);
+            }
+        }
+    });
+
     // Preferences are written whenever they actually differ from what is on
     // disk, rather than by each control that changes one remembering to ask.
     // Scattering the call is how a new setting silently fails to persist.
-    let mut written = use_signal(|| state.read().settings());
+    // Seeded from the file rather than from the state, because start up
+    // already changes one preference: the version this copy last ran as is
+    // recorded before the first frame. Seeding from the state would make that
+    // record equal to what is "on disk" without ever writing it, and the notes
+    // for an update would then reappear on every launch.
+    let mut written = use_signal(crate::settings::Settings::load);
     use_effect(move || {
         let current = state.read().settings();
         if written() != current {
@@ -247,6 +309,43 @@ fn App() -> Element {
             written.set(current);
         }
     });
+
+    // Look for a newer release once, quietly, and only if that has been asked
+    // for. Nothing waits on the answer and nothing is installed by it: a check
+    // that found something sets a chip in the status bar, and a check that
+    // could not reach anybody says nothing at all.
+    use_future(move || async move {
+        // After the splash, so a slow name resolution cannot be the first
+        // thing a start up does.
+        tokio::time::sleep(std::time::Duration::from_secs(updates::STARTUP_DELAY_SECONDS)).await;
+        updates::ask_in_background(state);
+    });
+
+    // Links handed over by later launches. Looked for on a timer because they
+    // arrive on a thread of its own and the plan may only be written where the
+    // interface runs, which is the same arrangement the live socket uses.
+    // Nothing is written unless something actually arrived, so an application
+    // nobody is sending links to is not redrawn by this.
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(HANDOFF_POLL_MILLIS)).await;
+            // The last one, because they are all a request to open a plan and
+            // only one plan is open at a time. Asking about three in a row
+            // would be three dialogs for one intention.
+            if let Some(link) = handoff::arrivals().pop() {
+                state.write().open_link_asked(&link);
+                come_forward();
+            }
+        }
+    });
+
+    // The account page belongs to the provider, so a name, an address or a
+    // picture changed there is a change nothing here is told about. Coming
+    // back to this window after being sent to that page is the round trip in
+    // which one is made, so it is the moment to read the details again. Only
+    // then: this happens a handful of times in an account's life, and asking
+    // on a timer would be a network call and a wake up for nothing.
+    watch_for_account_changes(state);
 
     // Work left behind by a session that never finished is offered back once,
     // at the start, rather than silently loaded over whatever was opened.
@@ -257,7 +356,11 @@ fn App() -> Element {
     });
 
     let splash = state.read().splash;
-    let (backstage, dialog, show_timeline, view, error, menu, editing, spelling_open) = {
+    // Only the front of the queue: the pages are shown one at a time, and
+    // whichever is in front is the only one that exists as far as this is
+    // concerned.
+    let greeting = state.read().greetings.first().copied();
+    let (backstage, dialog, show_timeline, view, error, menu, editing, spelling_open, sync_open) = {
         let s = state.read();
         (
             s.backstage,
@@ -268,6 +371,7 @@ fn App() -> Element {
             s.context_menu,
             s.editing,
             s.spelling_open,
+            s.sync_open,
         )
     };
 
@@ -346,6 +450,10 @@ fn App() -> Element {
             }
         }
 
+        if sync_open {
+            versions::HistoryAndSync {}
+        }
+
         if spelling_open {
             views::SpellingPanel {}
         }
@@ -361,8 +469,87 @@ fn App() -> Element {
         if splash {
             Splash {}
         }
+
+        // Last, so it sits over the splash as well. On a first run the licence
+        // is the only thing on screen and nothing behind it is reachable until
+        // it has been answered.
+        if let Some(greeting) = greeting {
+            welcome::Welcome { greeting }
+        }
     }
 }
+
+/// How often to look for a link handed over by another launch.
+///
+/// Slow enough to cost nothing, quick enough that clicking a link and having
+/// the window answer feels like one action.
+const HANDOFF_POLL_MILLIS: u64 = 250;
+
+/// Bring this window to the front, for when something outside it asked for
+/// something to happen in it.
+#[cfg(feature = "desktop")]
+fn come_forward() {
+    let window = dioxus::desktop::window();
+    window.set_minimized(false);
+    window.set_focus();
+}
+
+/// The webview-free build has no window handle to raise.
+#[cfg(not(feature = "desktop"))]
+fn come_forward() {}
+
+/// Read the account's details again when this window comes back to the front.
+///
+/// Only when somebody was sent to the provider's account page, which is what
+/// the flag records. The window gets and loses the focus for a dozen reasons
+/// and none of the others is worth a request.
+#[cfg(feature = "desktop")]
+fn watch_for_account_changes(mut state: Signal<AppState>) {
+    use dioxus::desktop::tao::event::{Event, WindowEvent};
+    use dioxus::desktop::use_wry_event_handler;
+
+    use_wry_event_handler(move |event, _| {
+        if !matches!(
+            event,
+            Event::WindowEvent {
+                event: WindowEvent::Focused(true),
+                ..
+            }
+        ) {
+            return;
+        }
+        // Read before the write, so a window regaining focus for any of the
+        // ordinary reasons does not mark the state dirty and redraw.
+        let due = {
+            let read = state.read();
+            // Nothing to refresh when nobody is signed in.
+            read.session.is_some()
+                && (read.account_page_opened
+                    // Coming back from Manage account is the obvious moment,
+                    // but it is not the only one: a browser tab left open can
+                    // be used again without touching that button, and a second
+                    // upload would otherwise never show. A floor keeps focus
+                    // changes from turning into a stream of requests.
+                    || read
+                        .account_checked_at
+                        .is_none_or(|at| at.elapsed() >= crate::state::ACCOUNT_RECHECK))
+        };
+        if !due {
+            return;
+        }
+        {
+            let mut write = state.write();
+            write.account_page_opened = false;
+            write.account_checked_at = Some(std::time::Instant::now());
+        }
+        collaborate::refresh_account(state);
+    });
+}
+
+/// The webview-free build has no window events to hang this off, so the card
+/// says what it last read until the next sign in.
+#[cfg(not(feature = "desktop"))]
+fn watch_for_account_changes(_state: Signal<AppState>) {}
 
 /// Keeps the table and the chart scrolled to the same row.
 ///
@@ -704,6 +891,7 @@ fn StatusBar() -> Element {
     let currency = s.project.currency_symbol.clone();
     let zoom = s.zoom;
     let status = s.status.clone();
+    let available = s.update_found.as_ref().map(|found| found.version.clone());
 
     let (finish, cost, work, critical, overallocated) = match &s.report {
         Ok(report) => (
@@ -742,6 +930,16 @@ fn StatusBar() -> Element {
             if overallocated > 0 {
                 span { class: "chip warn", "\u{26a0} {overallocated} overallocated" }
             }
+            // Quiet, and out of the way. A new version is worth knowing about
+            // and is not worth a modal in front of somebody's work.
+            if let Some(version) = available {
+                button {
+                    class: "chip link",
+                    title: "A newer version is available",
+                    onclick: move |_| state.write().dialog = Some(crate::state::Dialog::UpdateAvailable),
+                    "Version {version} available"
+                }
+            }
             div { class: "zoom-slider",
                 button { class: "zoom-btn", title: "Zoom Out",
                     onclick: move |_| { let z = state.read().zoom.zoom_out(); state.write().zoom = z; },
@@ -763,13 +961,16 @@ fn StatusBar() -> Element {
 /// looked up in the map, rather than matched against a fixed list here. That is
 /// what lets the same table be listed in the settings, rebound, and saved.
 fn handle_shortcut(state: &mut Signal<AppState>, event: Event<KeyboardData>) {
-    // Never steal keys while a cell editor, a dialog or a menu has focus.
+    // Never steal keys while a cell editor, a dialog or a menu has focus, or
+    // while a start up page is waiting to be answered: nothing behind one of
+    // those is meant to be reachable, and a shortcut would reach it.
     {
         let s = state.read();
         if s.editing.is_some()
             || s.dialog.is_some()
             || s.backstage.is_some()
             || s.context_menu.is_some()
+            || !s.greetings.is_empty()
         {
             return;
         }

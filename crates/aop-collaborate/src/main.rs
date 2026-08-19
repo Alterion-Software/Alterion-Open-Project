@@ -23,6 +23,7 @@ async fn main() -> Result<()> {
     let path = config_path();
     Config::create_if_missing(&path)?;
     let config = Config::load(&path)?;
+    config.validate()?;
 
     env_logger::Builder::new()
         .parse_filters(&config.log_level)

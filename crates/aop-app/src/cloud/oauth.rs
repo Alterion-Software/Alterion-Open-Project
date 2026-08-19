@@ -26,9 +26,6 @@ use serde::Deserialize;
 
 use crate::cloud::SignInError;
 
-/// The Alterion account service, for anyone who has not been given another.
-pub const DEFAULT_ISSUER: &str = "https://auth.coraldune.cloud";
-
 /// What is asked for. Only what the application actually reads: the subject to
 /// tell accounts apart, and a name and address to show whose account it is.
 pub const SCOPE: &str = "openid profile email";
@@ -100,7 +97,11 @@ pub fn discovery_url(issuer: &str) -> String {
 /// leaves the machine. Someone self hosting can develop against
 /// `http://127.0.0.1:8080` and still not be able to point the application at a
 /// public server that would put an access token on the wire in the clear.
-fn transport_is_safe(url: &str) -> bool {
+///
+/// Public within the crate because the same question is asked of anything else
+/// this application hands to the desktop or to the webview on the provider's
+/// say so, and there should be one answer to it rather than two.
+pub fn transport_is_safe(url: &str) -> bool {
     url.starts_with("https://")
         || url.starts_with("http://127.0.0.1")
         || url.starts_with("http://[::1]")
@@ -201,7 +202,7 @@ pub fn discover(issuer: &str) -> Result<Endpoints, SignInError> {
 }
 
 /// Put a request failure into words that mean something to a person.
-fn describe(error: &ureq::Error) -> String {
+pub(crate) fn describe(error: &ureq::Error) -> String {
     match error {
         ureq::Error::HostNotFound => "the address does not resolve".into(),
         ureq::Error::ConnectionFailed => "nothing is answering at that address".into(),
@@ -779,6 +780,11 @@ pub struct Claims {
     pub preferred_username: Option<String>,
     #[serde(default)]
     pub email: Option<String>,
+    /// Where the account's picture is, if the provider serves one. Standard
+    /// OIDC, and absent from every reply until the provider starts sending it,
+    /// which is why nothing downstream may assume there is one.
+    #[serde(default)]
+    pub picture: Option<String>,
 }
 
 /// Ask who the access token belongs to.
@@ -871,12 +877,12 @@ mod tests {
     // ---------------------------------------------------------- discovery
 
     const LIVE: &str = r#"{
-        "issuer":"https://auth.coraldune.cloud",
-        "authorization_endpoint":"https://auth.coraldune.cloud/api/oauth/authorize",
-        "token_endpoint":"https://auth.coraldune.cloud/api/oauth/token",
-        "userinfo_endpoint":"https://auth.coraldune.cloud/api/oauth/userinfo",
-        "introspection_endpoint":"https://auth.coraldune.cloud/api/oauth/introspect",
-        "revocation_endpoint":"https://auth.coraldune.cloud/api/oauth/revoke",
+        "issuer":"https://auth.example.org",
+        "authorization_endpoint":"https://auth.example.org/api/oauth/authorize",
+        "token_endpoint":"https://auth.example.org/api/oauth/token",
+        "userinfo_endpoint":"https://auth.example.org/api/oauth/userinfo",
+        "introspection_endpoint":"https://auth.example.org/api/oauth/introspect",
+        "revocation_endpoint":"https://auth.example.org/api/oauth/revoke",
         "response_types_supported":["code"],
         "grant_types_supported":["authorization_code","refresh_token"],
         "code_challenge_methods_supported":["S256"],
@@ -887,19 +893,19 @@ mod tests {
     #[test]
     fn a_discovery_document_names_every_endpoint_the_flow_uses() {
         let endpoints =
-            parse_discovery("https://auth.coraldune.cloud", LIVE).expect("a valid document");
+            parse_discovery("https://auth.example.org", LIVE).expect("a valid document");
         assert_eq!(
             endpoints.authorize,
-            "https://auth.coraldune.cloud/api/oauth/authorize"
+            "https://auth.example.org/api/oauth/authorize"
         );
-        assert_eq!(endpoints.token, "https://auth.coraldune.cloud/api/oauth/token");
+        assert_eq!(endpoints.token, "https://auth.example.org/api/oauth/token");
         assert_eq!(
             endpoints.userinfo,
-            "https://auth.coraldune.cloud/api/oauth/userinfo"
+            "https://auth.example.org/api/oauth/userinfo"
         );
         assert_eq!(
             endpoints.revoke.as_deref(),
-            Some("https://auth.coraldune.cloud/api/oauth/revoke")
+            Some("https://auth.example.org/api/oauth/revoke")
         );
     }
 
@@ -907,14 +913,14 @@ mod tests {
     fn a_trailing_slash_on_the_issuer_is_not_a_different_server() {
         // Someone typing the address into Options will put one there sooner or
         // later, and it must not read as a mix-up.
-        assert!(parse_discovery("https://auth.coraldune.cloud/", LIVE).is_ok());
+        assert!(parse_discovery("https://auth.example.org/", LIVE).is_ok());
     }
 
     #[test]
     fn nothing_is_hardcoded_about_where_the_endpoints_live() {
         // The whole point of discovery: another deployment, different paths.
         let elsewhere = LIVE
-            .replace("https://auth.coraldune.cloud", "https://id.example.org")
+            .replace("https://auth.example.org", "https://id.example.org")
             .replace("/api/oauth/", "/oidc/v1/");
         let endpoints = parse_discovery("https://id.example.org", &elsewhere).expect("valid");
         assert_eq!(endpoints.token, "https://id.example.org/oidc/v1/token");
@@ -930,14 +936,14 @@ mod tests {
     #[test]
     fn a_server_without_s256_is_refused() {
         let plain = LIVE.replace(r#"["S256"]"#, r#"["plain"]"#);
-        let outcome = parse_discovery("https://auth.coraldune.cloud", &plain);
+        let outcome = parse_discovery("https://auth.example.org", &plain);
         assert!(matches!(outcome, Err(SignInError::NoDiscovery { .. })));
     }
 
     #[test]
     fn a_missing_endpoint_is_refused_rather_than_guessed_at() {
         let without = LIVE.replace("token_endpoint", "was_token_endpoint");
-        assert!(parse_discovery("https://auth.coraldune.cloud", &without).is_err());
+        assert!(parse_discovery("https://auth.example.org", &without).is_err());
     }
 
     #[test]
@@ -949,35 +955,47 @@ mod tests {
                 "\"token_endpoint\":\"https://",
                 "\"token_endpoint\":\"http://",
             )
-            .replace("http://auth.coraldune.cloud/api/oauth/token", "http://tokens.example.org/t");
-        let outcome = parse_discovery("https://auth.coraldune.cloud", &plain);
+            .replace("http://auth.example.org/api/oauth/token", "http://tokens.example.org/t");
+        let outcome = parse_discovery("https://auth.example.org", &plain);
         assert!(matches!(outcome, Err(SignInError::NoDiscovery { .. })));
     }
 
     #[test]
     fn a_self_hosted_deployment_on_loopback_is_allowed_over_plain_http() {
         // Developing against your own copy should not require a certificate.
-        let local = LIVE.replace("https://auth.coraldune.cloud", "http://127.0.0.1:8080");
+        let local = LIVE.replace("https://auth.example.org", "http://127.0.0.1:8080");
         let endpoints = parse_discovery("http://127.0.0.1:8080", &local).expect("valid");
         assert_eq!(endpoints.token, "http://127.0.0.1:8080/api/oauth/token");
     }
 
     #[test]
     fn a_reply_that_is_not_a_discovery_document_says_so() {
-        let outcome = parse_discovery("https://auth.coraldune.cloud", "<html>not found</html>");
+        let outcome = parse_discovery("https://auth.example.org", "<html>not found</html>");
         assert!(matches!(outcome, Err(SignInError::NoDiscovery { .. })));
     }
 
+    /// The issuer to reach in the tests that use a network.
+    ///
+    /// From the environment, because there is no address compiled into this
+    /// application any more: the provider is self hosted, so whose copy to
+    /// test against is the tester's answer to give.
+    fn issuer_under_test() -> Option<String> {
+        std::env::var("AOP_TEST_ISSUER").ok().filter(|v| !v.trim().is_empty())
+    }
+
     /// Actually reaches the network, so it only runs when asked for:
-    /// `cargo test -p aop-app -- --ignored discovers`.
+    /// `AOP_TEST_ISSUER=https://auth.example.org cargo test -p aop-app -- --ignored discovers`.
     #[test]
     #[ignore = "reaches the network"]
     fn discovers_the_real_server() {
         // The one thing the offline tests cannot check: that the document this
         // parser was written against is the document the server sends.
-        let endpoints = discover(DEFAULT_ISSUER).expect("the default issuer");
-        assert_eq!(endpoints.issuer, DEFAULT_ISSUER);
-        assert!(endpoints.authorize.starts_with(DEFAULT_ISSUER));
+        let Some(issuer) = issuer_under_test() else {
+            return;
+        };
+        let endpoints = discover(&issuer).expect("the issuer under test");
+        assert_eq!(endpoints.issuer, issuer);
+        assert!(endpoints.authorize.starts_with(&issuer));
         assert!(endpoints.token.starts_with("https://"));
         assert!(endpoints.revoke.is_some(), "signing out needs this");
     }
@@ -987,7 +1005,10 @@ mod tests {
     fn a_token_request_with_nothing_behind_it_is_refused_rather_than_accepted() {
         // Proves the request is shaped the way the server expects: a wrongly
         // encoded one comes back as an unsupported media type, not a refusal.
-        let endpoints = discover(DEFAULT_ISSUER).expect("the default issuer");
+        let Some(issuer) = issuer_under_test() else {
+            return;
+        };
+        let endpoints = discover(&issuer).expect("the issuer under test");
         let outcome = exchange_code(
             &endpoints,
             "not-a-real-client",
@@ -1155,7 +1176,7 @@ mod tests {
     // ------------------------------------------------------ authorize url
 
     fn sample_endpoints() -> Endpoints {
-        parse_discovery("https://auth.coraldune.cloud", LIVE).expect("valid")
+        parse_discovery("https://auth.example.org", LIVE).expect("valid")
     }
 
     #[test]
@@ -1167,7 +1188,7 @@ mod tests {
             "the-state",
             "the-challenge",
         );
-        assert!(url.starts_with("https://auth.coraldune.cloud/api/oauth/authorize?"));
+        assert!(url.starts_with("https://auth.example.org/api/oauth/authorize?"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=alterion-open-project"));
         assert!(url.contains("code_challenge=the-challenge"));

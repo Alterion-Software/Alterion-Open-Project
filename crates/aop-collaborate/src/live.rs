@@ -41,6 +41,10 @@ pub enum ClientMessage {
     Presence {
         #[serde(default)]
         row: Option<i64>,
+        /// Where the pointer is. Absent means unchanged, so a client sending
+        /// only a row selection does not blank everybody else's view of it.
+        #[serde(default)]
+        at: Option<Pointer>,
     },
     /// Keepalive, for clients that would rather not use websocket pings.
     Ping,
@@ -81,18 +85,39 @@ impl ServerMessage {
     }
 }
 
+/// Where a planner's pointer is, expressed in the plan rather than on a
+/// screen. A pixel position is meaningless to anybody else: they have a
+/// different window size, a different zoom and a different scroll offset, so
+/// the only thing that survives the trip is what the pointer is *over*.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "pane", rename_all = "snake_case")]
+pub enum Pointer {
+    /// Over the table: a row, and which column it is in.
+    Table { row: i64, column: u16 },
+    /// Over the chart: a row, and how far along the timescale in minutes from
+    /// the plan's start. Minutes rather than a date so it is cheap to send,
+    /// and relative to the plan so it survives a reschedule.
+    Chart { row: i64, minutes: i64 },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Presence {
     pub subject: String,
     pub name: String,
     /// The row this planner has selected, if the client bothered to say.
     pub row: Option<i64>,
+    /// Where their pointer is. `None` means they have not moved it, or their
+    /// client does not send one: an older client stays a peer, it simply has
+    /// no pointer drawn for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<Pointer>,
 }
 
 struct Peer {
     subject: String,
     name: String,
     row: Option<i64>,
+    at: Option<Pointer>,
     outbox: UnboundedSender<String>,
 }
 
@@ -121,7 +146,7 @@ impl Hub {
         rooms
             .entry(project)
             .or_default()
-            .insert(id, Peer { subject, name, row: None, outbox });
+            .insert(id, Peer { subject, name, row: None, at: None, outbox });
         id
     }
 
@@ -157,6 +182,17 @@ impl Hub {
             .unwrap_or_default()
     }
 
+    /// Record where a pointer is. Pointer moves are frequent, so this is
+    /// deliberately in-memory only and never written to the database: losing
+    /// them on a restart costs nothing, and persisting them would turn a
+    /// mouse into write traffic.
+    pub fn set_pointer(&self, project: Uuid, id: ConnId, at: Option<Pointer>) {
+        let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(peer) = rooms.get_mut(&project).and_then(|room| room.get_mut(&id)) {
+            peer.at = at;
+        }
+    }
+
     pub fn set_row(&self, project: Uuid, id: ConnId, row: Option<i64>) {
         let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(peer) = rooms.get_mut(&project).and_then(|room| room.get_mut(&id)) {
@@ -176,6 +212,7 @@ impl Hub {
                         subject: peer.subject.clone(),
                         name: peer.name.clone(),
                         row: peer.row,
+                        at: peer.at,
                     })
                     .collect()
             })

@@ -1,0 +1,67 @@
+# Build the Windows installer. Run by hand from the Actions tab.
+#
+# Unlike macOS, this genuinely cross-builds from Linux, which is how it is
+# built locally too. Running it on a Linux runner therefore exercises the same
+# path as `packaging/windows/build-installer.sh` on a workstation, rather than
+# a second, differently-broken one on a Windows runner.
+#
+# Deliberately manual, for the same reason as the macOS build.
+name: Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Attach the setup.exe to this release (leave blank to just keep the artifact)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write        # only used when release_tag is filled in
+
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the cross toolchain
+        # mingw-w64 for the compiler and objdump the script uses to work out
+        # which runtime DLLs have to travel with the exe; nsis to wrap it;
+        # imagemagick to turn the scalable icon into an .ico.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64 nsis imagemagick
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-gnu
+
+      - name: Build the installer
+        run: packaging/windows/build-installer.sh
+
+      - name: Name what was built
+        id: found
+        run: |
+          exe="$(ls packaging/windows/dist/*.exe | head -1)"
+          echo "exe=$exe" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$exe")" >> "$GITHUB_OUTPUT"
+          sha256sum "$exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.found.outputs.name }}
+          path: ${{ steps.found.outputs.exe }}
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.found.outputs.exe }}" --clobber

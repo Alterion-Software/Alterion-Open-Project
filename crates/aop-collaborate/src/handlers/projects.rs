@@ -116,6 +116,10 @@ pub async fn create(
         subject: Set(who.subject.clone()),
         role: Set(role::OWNER.to_string()),
         added_at: Set(now),
+        // Nobody invited them, so there is no address this server was given.
+        // Filling it in from their sign in would mean keeping an identity that
+        // nothing here has been asked to keep.
+        email: Set(None),
     }
     .insert(&txn)
     .await?;
