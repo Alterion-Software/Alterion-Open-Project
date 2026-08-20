@@ -324,7 +324,36 @@ pub fn use_palette() -> Palette {
 /// Built once and kept. It goes into a `<style>` element that never re-renders,
 /// so there is no reason to assemble a hundred kilobytes of text twice.
 pub static CSS: LazyLock<String> =
-    LazyLock::new(|| format!("{}{}{RULES}", face(), root_block(Palette::Dark)));
+    LazyLock::new(|| format!("{}{}{}", face(), root_block(Palette::Dark), rules()));
+
+/// The rules, with anything the running renderer cannot do said another way.
+///
+/// **`position: fixed` on the webview-free build.** Taffy has two positions,
+/// relative and absolute, and no fixed at all, so a panel asking to be fixed
+/// is laid out in the flow instead of being taken out of it. A menu that
+/// should hang over the window pushes everything around it aside instead,
+/// which is what "clicking a dropdown shifts the interface" turns out to mean.
+///
+/// Nothing in this application scrolls: `html`, `body`, `#main` and `.app` are
+/// all `overflow: hidden`. Where there is no scrolling and no positioned
+/// ancestor, absolute and fixed resolve against the same box, so the swap is
+/// exact rather than approximate.
+///
+/// It is done here rather than in the rules themselves so the webview build
+/// keeps the property it was written with, and so this reads as what it is: a
+/// renderer's gap, worked around in one place, rather than eleven rules
+/// quietly rewritten to suit it.
+///
+/// The one thing that would break it is a positioned ancestor between a panel
+/// and the window, which would give absolute a nearer box to measure from.
+/// There is no such ancestor today and the test below says so.
+fn rules() -> String {
+    if cfg!(feature = "native") {
+        RULES.replace("position: fixed", "position: absolute")
+    } else {
+        RULES.to_string()
+    }
+}
 
 /// The bundled font, declared so the webview can use the same one the native
 /// build registers directly.
@@ -4334,7 +4363,25 @@ mod tests {
     /// for the cell underneath: both ways into a Predecessors or Resources
     /// cell dead, and nothing on screen to say why.
     #[test]
+    fn nothing_scrolls_which_is_what_makes_the_swap_exact() {
+        // The whole argument for turning fixed into absolute on the build that
+        // has no fixed. If any of these ever gains a scrollbar, a menu will
+        // start drifting with the content underneath it and this will be the
+        // reason.
+        for selector in ["html, body, #main {", ".app {"] {
+            let at = RULES.find(selector).expect(selector);
+            let block = &RULES[at..at + RULES[at..].find('}').expect("a closing brace")];
+            assert!(
+                block.contains("overflow: hidden"),
+                "{selector} has to stay unscrollable"
+            );
+        }
+    }
+
+    #[test]
     fn a_panel_placed_by_hand_is_taken_out_of_the_flow() {
+        // The rules are checked as written. What the webview-free build does
+        // with them is a separate question, answered by the test after this.
         for (classes, how) in [
             // Against the window: the predecessor and resource pickers, a
             // context menu with its mini toolbar, and the lists a dropdown
