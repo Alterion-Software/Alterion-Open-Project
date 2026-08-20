@@ -282,12 +282,13 @@ pub fn Welcome(greeting: Greeting) -> Element {
 #[component]
 fn WelcomeHead(title: String, subtitle: String) -> Element {
     let (logo_w, logo_h) = crate::brand::LOGO_VIEWBOX;
+    let palette = use_context::<Signal<AppState>>().read().theme.palette();
     rsx! {
         div { class: "welcome-head",
             div {
                 class: "welcome-mark",
                 style: "width: 148px; height: {148.0 * logo_h / logo_w}px;",
-                dangerous_inner_html: crate::brand::LOGO_SVG,
+                dangerous_inner_html: crate::brand::logo(148.0, palette.paint("--ink")),
             }
             div { class: "welcome-heading",
                 div { class: "welcome-title", "{title}" }

@@ -1750,7 +1750,7 @@ fn AboutPage() -> Element {
                 div {
                     class: "about-logo",
                     style: "width: 260px; height: {logo_height * 260.0 / 210.0}px;",
-                    dangerous_inner_html: crate::brand::LOGO_SVG,
+                    dangerous_inner_html: crate::brand::logo(260.0, state.read().theme.palette().paint("--ink")),
                 }
                 div { class: "about-name", "Open Project" }
                 div { class: "about-pills",

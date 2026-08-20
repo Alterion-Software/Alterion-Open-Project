@@ -199,7 +199,7 @@ fn Splash() -> Element {
                 div {
                     class: "splash-logo",
                     style: "width: 300px; height: {300.0 * logo_h / logo_w}px;",
-                    dangerous_inner_html: crate::brand::LOGO_SVG,
+                    dangerous_inner_html: crate::brand::logo(300.0, state.read().theme.palette().paint("--ink")),
                 }
                 div { class: "splash-product", "Open Project" }
                 div { class: "splash-version", "Version {env!(\"CARGO_PKG_VERSION\")}" }

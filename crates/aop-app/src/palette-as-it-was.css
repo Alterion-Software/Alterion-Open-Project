@@ -1,0 +1,121 @@
+/* The palette exactly as the stylesheet carried it before it became Rust
+   data, recovered from theme.rs at commit 5411ff0. This file is a fixture:
+   the test beside it generates the stylesheet from the table and compares
+   the result against what is here. Nothing should ever edit it. */
+
+:root {
+  /* Alterion palette */
+  --bg: #0d0f10;
+  --surface: #131718;
+  --surface-2: #0d1a1a;
+  --surface-3: #171d1e;
+  --surface-4: #1b2223;
+
+  --accent: #81b5b5;
+  --accent-bright: #a5d3d3;
+  /* Ink for text sitting on the accent or the contextual colour. Those are the
+     pale elements on this palette, so it is the dark one. It flips with the
+     palette; anything hardcoding a colour here is a bug waiting for a theme. */
+  --on-accent: #0b1414;
+  /* Ink for text sitting on a chart bar. The bars are a mid tone in both
+     palettes, so unlike --on-accent this does not flip. */
+  --on-bar: #f2f7f7;
+  --accent-dim: rgba(129, 181, 181, 0.14);
+  --accent-line: rgba(129, 181, 181, 0.42);
+  --contextual: #8aa2c4;
+
+  --line: #27302f;
+  --line-soft: #1d2425;
+  --ink: #d8e7e8;
+  --ink-soft: #8fafaf;
+  --ink-faint: #5f7676;
+
+  --hover: rgba(216, 231, 232, 0.065);
+  --pressed: rgba(216, 231, 232, 0.12);
+  --selection: rgba(129, 181, 181, 0.17);
+  --selection-line: rgba(129, 181, 181, 0.55);
+  --focus: var(--accent);
+
+  --grid-line: #222a2b;
+  --grid-header: #171d1e;
+  --nonworking: rgba(216, 231, 232, 0.032);
+
+  /* chart */
+  --bar: #3f7d7d;
+  --bar-edge: #6aadad;
+  --bar-progress: #a5d3d3;
+  --bar-critical: #9d474d;
+  --bar-critical-edge: #d9636a;
+  --bar-progress-critical: #e79aa0;
+  --bar-summary: #cfe3e3;
+  --bar-inactive: #414c4c;
+  --baseline: #6b7f7f;
+  --slack: #4d6060;
+  --today: #d9636a;
+  --link-arrow: #7e9a9a;
+
+  --danger: #d9636a;
+  --danger-bg: rgba(217, 99, 106, 0.12);
+  --warn: #d9b06a;
+
+  --shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+
+  /* Families are listed most-wanted first, but every name here must be one
+     that actually exists somewhere, because a matcher that falls back by
+     substring can land on an unrelated font whose name merely contains the
+     word. "Inter" matching a symbol font called CustomTkinter_shapes_font is
+     exactly that, and it renders text as arbitrary shapes. */
+  --font: "Inter", "InterVariable", "Segoe UI", "Noto Sans", "DejaVu Sans", "Liberation Sans", sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+}
+
+:root {
+  --bg: #eaefef;
+  --surface: #ffffff;
+  --surface-2: #f2f7f7;
+  --surface-3: #f7fafa;
+  --surface-4: #ffffff;
+
+  --accent: #2f5f5e;
+  --accent-bright: #1e4746;
+  --on-accent: #f4f8f8;
+  --accent-dim: rgba(47, 95, 94, 0.10);
+  --accent-line: rgba(47, 95, 94, 0.38);
+  --contextual: #45699b;
+
+  --line: #d2dedd;
+  --line-soft: #e6eded;
+  --ink: #10201f;
+  --ink-soft: #4a6362;
+  --ink-faint: #7b9291;
+
+  --hover: rgba(16, 32, 31, 0.055);
+  --pressed: rgba(16, 32, 31, 0.10);
+  --selection: rgba(47, 95, 94, 0.13);
+  --selection-line: rgba(47, 95, 94, 0.5);
+  --focus: var(--accent);
+
+  --grid-line: #e3ebeb;
+  --grid-header: #f2f7f7;
+  --nonworking: rgba(16, 32, 31, 0.038);
+
+  /* chart */
+  --bar: #4b8b8b;
+  --bar-edge: #2f5f5e;
+  --bar-progress: #1e4746;
+  --bar-critical: #b3565c;
+  --bar-critical-edge: #8b393f;
+  --bar-progress-critical: #7a2f34;
+  --bar-summary: #20403f;
+  --bar-inactive: #b9c6c6;
+  --baseline: #8aa3a2;
+  --slack: #a9bdbc;
+  --today: #b3565c;
+  --link-arrow: #6d8786;
+
+  --danger: #ac5157;
+  --danger-bg: rgba(172, 81, 87, 0.10);
+  --warn: #9d6f16;
+
+  --shadow: 0 12px 30px rgba(16, 32, 31, 0.18);
+}
