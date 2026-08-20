@@ -15,11 +15,20 @@
 //! stops, and a log of successes cannot show that.
 //!
 //! ```text
-//!   <config root>/log.log      truncated at start up, one session per file
+//!   <config root>/log.log      this run
+//!   <config root>/log.log.1    the run before it
 //! ```
 //!
-//! Truncated rather than appended so it cannot grow without bound and so the
-//! session being asked about is the only one in it.
+//! One session per file rather than one long file, so it cannot grow without
+//! bound and so the session being asked about is the only one in it.
+//!
+//! **The previous run is kept, and that is the whole point of two files.** A
+//! fault that happens while the application is closing is written in the last
+//! lines this file ever gets, and the next start up is what erases them. That
+//! is not hypothetical: a session that vanishes between runs can only be
+//! explained by what happened at the end of the run before, and a log cut open
+//! at start up destroys exactly that evidence, having been added to capture
+//! it. Keeping one behind costs a rename.
 //!
 //! Three rules hold everywhere in here:
 //!
@@ -36,6 +45,7 @@
 
 use std::fmt::Write as _;
 use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -110,7 +120,30 @@ fn open() -> Option<Mutex<File>> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    rotate(&path);
     File::create(&path).ok().map(Mutex::new)
+}
+
+/// What the run before this one wrote.
+///
+/// The suffix goes after the whole name rather than replacing the extension,
+/// so the two files sort together and neither is mistaken for something a
+/// person is meant to open by double clicking.
+fn previous(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".1");
+    path.with_file_name(name)
+}
+
+/// Move the finished run's log aside before this one starts writing.
+///
+/// A rename rather than a copy: the previous process is gone, nothing holds
+/// the file, and a rename either happens or does not, where a copy can stop
+/// half way and leave two partial logs and no whole one. Failure is ignored
+/// like everything else here. There being no previous log is the ordinary case
+/// on a first run, and it is not worth a word.
+fn rotate(path: &Path) {
+    let _ = std::fs::rename(path, previous(path));
 }
 
 /// Write one line, with the seconds since start up in front of it.
@@ -214,3 +247,82 @@ impl Tally {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aop-applog-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory to work in");
+        dir
+    }
+
+    #[test]
+    fn the_previous_log_sits_beside_the_current_one() {
+        // The suffix goes after the whole name, so the pair sort together and
+        // the older one is still recognisably a log rather than a `.1` file.
+        assert_eq!(
+            previous(Path::new("/somewhere/log.log")),
+            PathBuf::from("/somewhere/log.log.1")
+        );
+    }
+
+    #[test]
+    fn a_finished_run_is_kept_rather_than_overwritten() {
+        let dir = scratch("kept");
+        let log = dir.join("log.log");
+
+        std::fs::write(&log, "the run that ended").expect("write");
+        rotate(&log);
+
+        assert!(!log.exists(), "the current name is free for the new run");
+        assert_eq!(
+            std::fs::read_to_string(previous(&log)).expect("the previous run"),
+            "the run that ended",
+            "what the last run wrote has to survive the next start up, because \
+             a fault while closing is written in its final lines"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_one_run_is_kept_behind() {
+        let dir = scratch("one");
+        let log = dir.join("log.log");
+
+        std::fs::write(&log, "oldest").expect("write");
+        rotate(&log);
+        std::fs::write(&log, "newest").expect("write");
+        rotate(&log);
+
+        // Two files, never three. The run before last is not worth unbounded
+        // disk, and the question is always about the run that just ended.
+        assert_eq!(
+            std::fs::read_to_string(previous(&log)).expect("the previous run"),
+            "newest"
+        );
+        assert!(!dir.join("log.log.1.1").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_first_run_with_nothing_to_keep_is_not_a_failure() {
+        let dir = scratch("first");
+        let log = dir.join("log.log");
+
+        // Nothing there yet. Rotating must be silent, not an error, or the
+        // first start on a new machine would report a fault about a file that
+        // has never existed.
+        rotate(&log);
+        assert!(!previous(&log).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
