@@ -181,4 +181,21 @@ pub fn launch_cfg_with_props<P: Clone + 'static, M: 'static>(
 
     // Run event loop
     event_loop.run_app(&mut application).unwrap();
+
+    // The loop is finished and the window is gone. Everything past this point
+    // is destructors, and that is where this crashed: wgpu's GLES backend
+    // tears down its EGL context, EGL marshals a Wayland request on a
+    // connection that has already gone, and the process dies with a
+    // segmentation fault rather than an exit code. It happened on every close,
+    // which made it look like a random crash during use until a core file said
+    // otherwise. Forcing the Vulkan backend avoids it, and not every machine
+    // has Vulkan.
+    //
+    // Nothing is lost by not running them. The operating system reclaims every
+    // resource these would release, and an application that persists its state
+    // as it changes rather than on the way out has nothing waiting to be
+    // written. Leaving deliberately turns a crash on every close into an
+    // ordinary exit, on every backend instead of only the ones that survive
+    // their own teardown.
+    std::process::exit(0);
 }

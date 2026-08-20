@@ -355,6 +355,11 @@ fn face() -> String {
 /// Everything in the sheet that is not the palette.
 const RULES: &str = r##"
 * { box-sizing: border-box; }
+/* The text cursor was never given a colour, so it took whatever the renderer
+   picked, which is not required to be anything you can see against the surface
+   it sits on. Stating it costs nothing and is one less thing that differs
+   between one renderer and another. */
+input, textarea, [contenteditable] { caret-color: var(--accent-bright); }
 
 html, body, #main {
   height: 100%;
@@ -1034,12 +1039,14 @@ button { font: inherit; color: inherit; }
 }
 
 .stat-row {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   max-width: 740px;
   margin-bottom: 20px;
-}
+}/* Flex has no track list, so the basis lives on the children. */
+.stat-row > * { flex: 1 1 112px; }
+
 
 .stat-tile {
   background: var(--surface-2);
@@ -1076,11 +1083,13 @@ button { font: inherit; color: inherit; }
 }
 
 .info-cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   gap: 14px;
   max-width: 740px;
-}
+}/* Flex has no track list, so the basis lives on the children. */
+.info-cards > * { flex: 1 1 300px; }
+
 
 .info-card {
   background: var(--surface-2);
@@ -1151,13 +1160,13 @@ button { font: inherit; color: inherit; }
 
 /* template gallery */
 .tpl-grid {
-  display: grid;
-  /* auto-fill so the cards spread across whatever width there is, rather than
-     huddling on the left of a wide window. */
-  grid-template-columns: repeat(auto-fill, minmax(212px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   gap: 16px;
   width: 100%;
-}
+}/* Flex has no track list, so the basis lives on the children. */
+.tpl-grid > * { flex: 1 1 212px; }
+
 
 .tpl-card {
   border: 1px solid var(--line);
@@ -1327,11 +1336,13 @@ button { font: inherit; color: inherit; }
 /* One card per column of the sheet. Wide enough for a date and a dropdown,
    narrow enough that a dozen columns fit on a screen. */
 .imp-cols {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   max-width: 1100px;
-}
+}/* Flex has no track list, so the basis lives on the children. */
+.imp-cols > * { flex: 1 1 210px; }
+
 
 .imp-col {
   border: 1px solid var(--line);
