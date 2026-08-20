@@ -150,7 +150,7 @@ static PALETTE: [Token; 43] = [
     // exactly that, and it renders text as arbitrary shapes.
     Token::other_either_way(
         "--font",
-        "\"Inter\", \"InterVariable\", \"Segoe UI\", \"Noto Sans\", \"DejaVu Sans\", \"Liberation Sans\", sans-serif",
+        "\"InterVariable\", \"Segoe UI\", \"Noto Sans\", \"DejaVu Sans\", \"Liberation Sans\", sans-serif",
     ),
     Token::other_either_way(
         "--mono",
@@ -324,7 +324,33 @@ pub fn use_palette() -> Palette {
 /// Built once and kept. It goes into a `<style>` element that never re-renders,
 /// so there is no reason to assemble a hundred kilobytes of text twice.
 pub static CSS: LazyLock<String> =
-    LazyLock::new(|| format!("{}{RULES}", root_block(Palette::Dark)));
+    LazyLock::new(|| format!("{}{}{RULES}", face(), root_block(Palette::Dark)));
+
+/// The bundled font, declared so the webview can use the same one the native
+/// build registers directly.
+///
+/// Handed over as bytes in the sheet rather than fetched, because a webview
+/// pointed at a custom protocol is not a place where an ordinary URL can be
+/// relied on, and the font has to be there before the first text is laid out
+/// rather than a moment after. The cost is one copy of the file encoded once
+/// per run.
+///
+/// `font-weight` spans the whole range because this is a variable font: one
+/// file answers for every weight the interface asks for, which is why there is
+/// one of these and not four.
+fn face() -> String {
+    format!(
+        "@font-face {{\n  \
+           font-family: \"{}\";\n  \
+           font-style: normal;\n  \
+           font-weight: 100 900;\n  \
+           font-display: block;\n  \
+           src: url(data:font/ttf;base64,{}) format(\"truetype\");\n\
+         }}\n",
+        crate::fonts::UI_FAMILY,
+        crate::spooler::base64(crate::fonts::UI),
+    )
+}
 
 /// Everything in the sheet that is not the palette.
 const RULES: &str = r##"
@@ -4028,12 +4054,57 @@ mod tests {
             .collect()
     }
 
+    /// Tokens whose value has deliberately changed since the capture, and why.
+    ///
+    /// The fixture is a historical record and is never edited, so a value that
+    /// is meant to change has to be declared here instead. Naming them one at a
+    /// time keeps the comparison useful: it still catches every change nobody
+    /// intended, which is the only kind worth a failing test.
+    ///
+    /// A test below checks each name here really does differ, so an entry
+    /// cannot outlive the change it was written for and quietly become a
+    /// blanket exemption.
+    const CHANGED_SINCE: &[(&str, &str)] = &[(
+        "--font",
+        "The stack led with \"Inter\", which almost no machine has. A name that \
+         matches nothing is answered by whatever the matcher thinks is nearest, \
+         and on one machine that was a shapes font: the chart drew its dates in \
+         Greek letters. The program now carries InterVariable and asks for it \
+         by the name inside the file.",
+    )];
+
+    /// Every token in the block, minus the ones deliberately changed since.
+    fn comparable(block: &[(String, String)]) -> Vec<(String, String)> {
+        block
+            .iter()
+            .filter(|(name, _)| !CHANGED_SINCE.iter().any(|(changed, _)| changed == name))
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn the_generated_dark_palette_says_what_the_sheet_used_to_say() {
         let was = without_comments(AS_IT_WAS);
         let was = root_blocks(&was);
         let now = root_blocks(&root_block(Palette::Dark));
-        assert_eq!(now[0], was[0]);
+        assert_eq!(comparable(&now[0]), comparable(&was[0]));
+    }
+
+    #[test]
+    fn every_token_said_to_have_changed_really_has() {
+        let was = without_comments(AS_IT_WAS);
+        let was = root_blocks(&was).remove(0);
+        let now = root_blocks(&root_block(Palette::Dark)).remove(0);
+        for (name, why) in CHANGED_SINCE {
+            let before = was.iter().find(|(token, _)| token == name);
+            let after = now.iter().find(|(token, _)| token == name);
+            assert!(before.is_some(), "{name} was never in the sheet to change");
+            assert_ne!(
+                before.map(|(_, v)| v),
+                after.map(|(_, v)| v),
+                "{name} is listed as changed and is not. Take it out: {why}"
+            );
+        }
     }
 
     #[test]
@@ -4061,10 +4132,30 @@ mod tests {
     }
 
     #[test]
-    fn the_sheet_is_the_palette_followed_by_the_rules_written_against_it() {
-        assert!(CSS.starts_with(":root {"));
+    fn the_sheet_is_the_font_then_the_palette_then_the_rules() {
+        // The face comes first because a rule that names the family is worth
+        // nothing until the family exists, and the palette comes before the
+        // rules written against it for the same reason.
+        assert!(CSS.starts_with("@font-face {"));
+        assert!(CSS.contains(&format!("font-family: \"{}\";", crate::fonts::UI_FAMILY)));
+        assert!(CSS.contains(":root {"));
         assert!(CSS.contains("--grid-header: #171d1e;"));
         assert!(CSS.contains("* { box-sizing: border-box; }"));
+        assert!(
+            CSS.find("@font-face").unwrap() < CSS.find(":root {").unwrap(),
+            "the face has to be declared before anything asks for it"
+        );
+    }
+
+    #[test]
+    fn the_bundled_font_is_carried_whole_and_not_merely_named() {
+        // The point of bundling is that the bytes travel. A stack naming a
+        // family the machine does not have is exactly the failure this
+        // replaced, so naming it here without shipping it would be the same
+        // bug wearing the fix's clothes.
+        assert!(crate::fonts::UI.len() > 100_000, "that is not a font file");
+        assert_eq!(&crate::fonts::UI[..4], b"\x00\x01\x00\x00", "not TrueType");
+        assert!(Palette::Dark.font().starts_with(&format!("\"{}\"", crate::fonts::UI_FAMILY)));
     }
 
     #[test]

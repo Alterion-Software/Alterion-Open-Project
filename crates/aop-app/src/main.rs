@@ -18,6 +18,7 @@ mod dictionary;
 mod dialogs;
 mod gantt;
 mod grid;
+mod fonts;
 mod handoff;
 mod keymap;
 mod icons;
@@ -44,7 +45,6 @@ use dioxus::desktop::{Config, WindowBuilder, WindowCloseBehaviour};
 use dioxus::prelude::*;
 
 use aop_core::{format_duration, format_work, TaskMode};
-#[cfg(feature = "desktop")]
 use aop_core::APP_NAME;
 
 use crate::icons::icon;
@@ -142,7 +142,18 @@ fn main() {
     }
     // After the handoff, for the reason given in the webview build's `main`.
     applog::start(env!("CARGO_PKG_VERSION"));
-    dioxus_native::launch(App);
+    dioxus_native::launch_cfg(
+        App,
+        Vec::new(),
+        vec![Box::new(
+            dioxus_native::Config::new()
+                .with_window_attributes(
+                    dioxus_native::WindowAttributes::default().with_title(APP_NAME),
+                )
+                // Carried rather than hoped for. See `fonts::UI`.
+                .with_fonts(vec![crate::fonts::UI]),
+        )],
+    );
 }
 
 /// The plan this launch was asked to open, if it was asked to open one.

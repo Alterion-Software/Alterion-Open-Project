@@ -22,3 +22,6 @@ serde_json = "1"
 # framework, so this stands in until that is released.
 [patch.crates-io]
 dioxus-native-dom = { path = "vendor/dioxus-native-dom" }
+# And the crate above it, so a font can be carried with the program rather
+# than hoped for on the machine it runs on. See vendor/dioxus-native/src/config.rs.
+dioxus-native = { path = "vendor/dioxus-native" }
