@@ -29,19 +29,11 @@ fn Anchored(width: f64, children: Element) -> Element {
     let (x, y) = state.read().popup_at;
     let (view_w, view_h) = use_context::<Signal<crate::state::Viewport>>()();
 
-    // Kept inside the window. A cell near the right edge would otherwise
-    // anchor the panel past it, and a panel nobody can see is the same thing
-    // to the planner as no panel at all.
-    let left = x.min(view_w - width - 6.0).max(6.0);
-
-    // Low on the screen the panel hangs upward from the cell instead of
-    // running off the bottom. Anchoring it by its bottom edge does that
-    // without anything having to know how tall the list turned out.
-    let vertical = if y > view_h * 0.55 {
-        format!("bottom: {}px;", (view_h - y).max(6.0))
-    } else {
-        format!("top: {}px;", (y + 4.0).max(6.0))
-    };
+    // Kept inside the window when the window's size is known, and placed
+    // where it was asked for when it is not. See `crate::placement` for why
+    // that distinction is the whole point.
+    let horizontal = crate::placement::horizontal(x, width, (view_w, view_h));
+    let vertical = crate::placement::vertical(y, (view_w, view_h));
 
     rsx! {
         div {
@@ -56,7 +48,7 @@ fn Anchored(width: f64, children: Element) -> Element {
         }
         div {
             class: "{ANCHORED_CLASS}",
-            style: "left: {left}px; {vertical} width: {width}px; max-height: 70vh; overflow-y: auto; padding: 10px;",
+            style: "{horizontal} {vertical} width: {width}px; max-height: 70vh; overflow-y: auto; padding: 10px;",
             onclick: move |event| event.stop_propagation(),
             // Keeps the caret in the cell's own text box while boxes are
             // ticked, so typing and picking are one continuous edit.

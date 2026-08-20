@@ -23,6 +23,7 @@ mod handoff;
 mod keymap;
 mod icons;
 mod macros;
+mod placement;
 mod popups;
 mod preview;
 mod quiet;

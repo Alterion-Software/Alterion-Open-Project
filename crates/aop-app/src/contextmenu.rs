@@ -155,34 +155,22 @@ pub fn ContextMenuHost(menu: ContextMenu) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let (x, y) = menu.position();
     let (view_w, view_h) = use_context::<Signal<crate::state::Viewport>>()();
-    let left = x.max(4.0);
-    let top = y.max(4.0);
     let task_row = match menu {
         ContextMenu::Task { row, .. } => Some(row),
         _ => None,
     };
 
-    // Near the bottom of the window the menu opens upward instead of running
-    // off the screen. Anchoring it by its bottom edge rather than its top does
-    // that without having to measure how tall the menu turns out to be.
-    let flip_up = y > view_h * 0.55;
-    let flip_left = x > view_w - MENU_WIDTH;
-
-    let horizontal = if flip_left {
-        format!("right: {}px;", (view_w - x).max(4.0))
-    } else {
-        format!("left: {left}px;")
-    };
-
+    // Placed against the window when its size is known and where it was asked
+    // for when it is not. See `crate::placement`: a viewport of zero means
+    // nobody has said yet, not that the window has no room, and reading it the
+    // other way put every menu in the same corner.
+    //
     // The toolbar and the menu are anchored together as one stack rather than
-    // placed separately. Positioned apart, a menu that opened upward would grow
-    // over the toolbar and leave it underneath, which is the one arrangement
-    // the toolbar must never be in.
-    let vertical = if flip_up {
-        format!("bottom: {}px;", (view_h - y).max(4.0))
-    } else {
-        format!("top: {top}px;")
-    };
+    // separately. Placed apart, a menu that opened upward would grow over the
+    // toolbar and leave it underneath, which is the one arrangement the
+    // toolbar must never be in.
+    let horizontal = crate::placement::horizontal(x, MENU_WIDTH, (view_w, view_h));
+    let vertical = crate::placement::vertical(y, (view_w, view_h));
 
     rsx! {
         div {
