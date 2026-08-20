@@ -660,7 +660,8 @@ pub fn GanttChart(
                                     line { x1: "{x}", y1: "0", x2: "{x}", y2: "{TIER_H}",
                                         stroke: palette.paint("--line"), stroke_width: "1" }
                                     text { class: "tl-major", x: "{x + w / 2.0}", y: "13",
-                                        text_anchor: "middle", "{label}" }
+                                        text_anchor: "middle", fill: palette.paint("--ink"),
+                                        "{label}" }
                                 }
                             }
                         }
@@ -676,13 +677,15 @@ pub fn GanttChart(
                             let w = (tick.to - tick.from).num_days() as f64 * scale.px_per_day;
                             let weekend = !project.calendar.is_working_day(tick.from);
                             let class = if weekend { "tl-minor weekend" } else { "tl-minor" };
+                            let tint = if weekend { "--ink-faint" } else { "--ink-soft" };
                             let label = fit(&tick.label, w);
                             rsx! {
                                 g { key: "mn{index}",
                                     line { x1: "{x}", y1: "{TIER_H}", x2: "{x}", y2: "{HEADER_H}",
                                         stroke: palette.paint("--line"), stroke_width: "1" }
                                     text { class: "{class}", x: "{x + w / 2.0}", y: "{TIER_H + 13.0}",
-                                        text_anchor: "middle", "{label}" }
+                                        text_anchor: "middle", fill: palette.paint(tint),
+                                        "{label}" }
                                 }
                             }
                         }
@@ -1039,7 +1042,8 @@ pub fn GanttChart(
                                 }
 
                                 if bar_text && !label.is_empty() {
-                                    text { class: "bar-label", x: "{right + 6.0}", y: "{centre + 0.5}", "{label}" }
+                                    text { class: "bar-label", x: "{right + 6.0}", y: "{centre + 0.5}",
+                                        fill: palette.paint("--ink-soft"), "{label}" }
                                 }
                             }
                         }
@@ -1774,9 +1778,9 @@ pub fn TimelineBand() -> Element {
             svg { width: "{width}", height: "{height}", view_box: "0 0 {width} {height}", font_family: palette.font(),
                 line { x1: "{BAND_LEFT}", y1: "16", x2: "{width - BAND_RIGHT}", y2: "16",
                     stroke: palette.paint("--line"), stroke_width: "1" }
-                text { x: "{BAND_LEFT}", y: "11", class: "tl-minor",
+                text { x: "{BAND_LEFT}", y: "11", class: "tl-minor", fill: palette.paint("--ink-soft"),
                     "{crate::state::format_date(start)}" }
-                text { x: "{width - BAND_RIGHT}", y: "11", class: "tl-minor", text_anchor: "end",
+                text { x: "{width - BAND_RIGHT}", y: "11", class: "tl-minor", text_anchor: "end", fill: palette.paint("--ink-soft"),
                     "{crate::state::format_date(finish)}" }
 
                 for (slot, (band, lane)) in placed.into_iter().enumerate() {

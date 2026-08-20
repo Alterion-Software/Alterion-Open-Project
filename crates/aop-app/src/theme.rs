@@ -324,36 +324,8 @@ pub fn use_palette() -> Palette {
 /// Built once and kept. It goes into a `<style>` element that never re-renders,
 /// so there is no reason to assemble a hundred kilobytes of text twice.
 pub static CSS: LazyLock<String> =
-    LazyLock::new(|| format!("{}{}{}", face(), root_block(Palette::Dark), rules()));
+    LazyLock::new(|| format!("{}{}{RULES}", face(), root_block(Palette::Dark)));
 
-/// The rules, with anything the running renderer cannot do said another way.
-///
-/// **`position: fixed` on the webview-free build.** Taffy has two positions,
-/// relative and absolute, and no fixed at all, so a panel asking to be fixed
-/// is laid out in the flow instead of being taken out of it. A menu that
-/// should hang over the window pushes everything around it aside instead,
-/// which is what "clicking a dropdown shifts the interface" turns out to mean.
-///
-/// Nothing in this application scrolls: `html`, `body`, `#main` and `.app` are
-/// all `overflow: hidden`. Where there is no scrolling and no positioned
-/// ancestor, absolute and fixed resolve against the same box, so the swap is
-/// exact rather than approximate.
-///
-/// It is done here rather than in the rules themselves so the webview build
-/// keeps the property it was written with, and so this reads as what it is: a
-/// renderer's gap, worked around in one place, rather than eleven rules
-/// quietly rewritten to suit it.
-///
-/// The one thing that would break it is a positioned ancestor between a panel
-/// and the window, which would give absolute a nearer box to measure from.
-/// There is no such ancestor today and the test below says so.
-fn rules() -> String {
-    if cfg!(feature = "native") {
-        RULES.replace("position: fixed", "position: absolute")
-    } else {
-        RULES.to_string()
-    }
-}
 
 /// The bundled font, declared so the webview can use the same one the native
 /// build registers directly.
