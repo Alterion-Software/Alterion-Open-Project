@@ -10,6 +10,7 @@ use aop_core::{format_duration, format_work, Resource, ResourceKind, TaskId};
 
 use crate::gantt::{chart_range, Scale};
 use crate::state::{format_date, AppState, Dialog, ViewKind};
+use crate::theme::use_palette;
 
 // -------------------------------------------------------- resource sheet
 
@@ -515,6 +516,7 @@ pub fn NetworkDiagram() -> Element {
     let state = use_context::<Signal<AppState>>();
     let s = state.read();
     let project = &s.project;
+    let palette = s.theme.palette();
 
     let leaves: Vec<usize> = (0..project.tasks.len())
         .filter(|&i| !project.is_summary(i))
@@ -587,10 +589,10 @@ pub fn NetworkDiagram() -> Element {
                                     let d = format!("M{sx},{sy} L{mid},{sy} L{mid},{ey} L{ex},{ey}");
                                     rsx! {
                                         g { key: "nl{index}",
-                                            path { d: "{d}", fill: "none", stroke: "var(--link-arrow)", stroke_width: "1.2" }
+                                            path { d: "{d}", fill: "none", stroke: palette.paint("--link-arrow"), stroke_width: "1.2" }
                                             polygon {
                                                 points: "{ex - 6.0},{ey - 3.5} {ex - 6.0},{ey + 3.5} {ex},{ey}",
-                                                fill: "var(--link-arrow)",
+                                                fill: palette.paint("--link-arrow"),
                                             }
                                         }
                                     }
@@ -905,9 +907,11 @@ struct BandView {
     height: f64,
     fill: &'static str,
     name: String,
-    name_style: &'static str,
+    /// Resolved to colours rather than left as token names: these end up on an
+    /// SVG `text` element, where a var() is not a paint.
+    name_style: String,
     detail: String,
-    detail_style: &'static str,
+    detail_style: String,
     note: String,
     bars: Vec<BarView>,
 }
@@ -953,6 +957,9 @@ pub fn TeamPlanner() -> Element {
     let state = use_context::<Signal<AppState>>();
     let s = state.read();
     let project = &s.project;
+    // Every colour on this view goes into an SVG attribute or the style of an
+    // SVG element, and neither resolves a var(). See `crate::theme`.
+    let palette = s.theme.palette();
 
     if project.resources.is_empty() {
         return rsx! {
@@ -1018,11 +1025,18 @@ pub fn TeamPlanner() -> Element {
             .map(|slot| {
                 let index = slot.task;
                 let fill = if s.show_critical && aop_core::issues::shows_as_critical(&s.project, index) {
-                    "var(--bar-critical)"
+                    palette.paint("--bar-critical")
                 } else {
-                    "var(--bar)"
+                    palette.paint("--bar")
                 };
-                bar_view(&project.tasks[index].name, slot, y, fill, "var(--on-bar)", total_w)
+                bar_view(
+                    &project.tasks[index].name,
+                    slot,
+                    y,
+                    fill,
+                    palette.paint("--on-bar"),
+                    total_w,
+                )
             })
             .collect();
 
@@ -1035,23 +1049,23 @@ pub fn TeamPlanner() -> Element {
             // resource booked past its capacity is marked here, since that is
             // what the whole by-resource layout exists to show.
             fill: if over {
-                "var(--danger-bg)"
+                palette.paint("--danger-bg")
             } else if slot % 2 == 0 {
-                "var(--surface)"
+                palette.paint("--surface")
             } else {
-                "var(--surface-3)"
+                palette.paint("--surface-3")
             },
             name: resource.name.clone(),
-            name_style: "font-size: 11px; fill: var(--ink);",
+            name_style: format!("font-size: 11px; fill: {};", palette.paint("--ink")),
             detail: if over {
                 format!("{booked} task(s) \u{00b7} overallocated")
             } else {
                 format!("{booked} task(s)")
             },
             detail_style: if over {
-                "font-size: 9.5px; fill: var(--danger);"
+                format!("font-size: 9.5px; fill: {};", palette.paint("--danger"))
             } else {
-                "font-size: 9.5px; fill: var(--ink-faint);"
+                format!("font-size: 9.5px; fill: {};", palette.paint("--ink-faint"))
             },
             note: cap_note(packed.turned_away),
             bars,
@@ -1076,8 +1090,8 @@ pub fn TeamPlanner() -> Element {
                     &project.tasks[slot.task].name,
                     slot,
                     y,
-                    "var(--bar-inactive)",
-                    "var(--ink)",
+                    palette.paint("--bar-inactive"),
+                    palette.paint("--ink"),
                     total_w,
                 )
             })
@@ -1086,11 +1100,14 @@ pub fn TeamPlanner() -> Element {
             key: "tpun".to_string(),
             y,
             height,
-            fill: "var(--surface-2)",
+            fill: palette.paint("--surface-2"),
             name: "Unassigned".to_string(),
-            name_style: "font-size: 11px; fill: var(--ink-soft); font-style: italic;",
+            name_style: format!(
+                "font-size: 11px; fill: {}; font-style: italic;",
+                palette.paint("--ink-soft")
+            ),
             detail: format!("{waiting} task(s) with nobody booked"),
-            detail_style: "font-size: 9.5px; fill: var(--ink-faint);",
+            detail_style: format!("font-size: 9.5px; fill: {};", palette.paint("--ink-faint")),
             note: cap_note(packed.turned_away),
             bars,
         });
@@ -1098,16 +1115,20 @@ pub fn TeamPlanner() -> Element {
     }
 
     let height = y + 20.0;
+    // Built once rather than per band: the same two strings are written on
+    // every row that needs them.
+    let note_style = format!("font-size: 9.5px; fill: {};", palette.paint("--warn"));
+    let outside_style = format!("font-size: 10px; fill: {};", palette.paint("--ink-soft"));
 
     rsx! {
         div { class: "chart-pane", style: "width: {total_w}px;",
-            svg { width: "{total_w}", height: "{height}",
+            svg { width: "{total_w}", height: "{height}", view_box: "0 0 {total_w} {height}", font_family: palette.font(),
                 for band in bands {
                     g { key: "{band.key}",
                         rect { x: "0", y: "{band.y}", width: "{total_w}",
                             height: "{band.height}", fill: "{band.fill}" }
                         line { x1: "0", y1: "{band.y}", x2: "{total_w}", y2: "{band.y}",
-                            stroke: "var(--grid-line)", stroke_width: "1" }
+                            stroke: palette.paint("--grid-line"), stroke_width: "1" }
                         // The name sits at the top of the band. Centred, it
                         // would float away from its own first bar as soon as a
                         // busy resource grew the band to a dozen rows.
@@ -1117,7 +1138,7 @@ pub fn TeamPlanner() -> Element {
                             style: "{band.detail_style}", "{band.detail}" }
                         if !band.note.is_empty() {
                             text { x: "8", y: "{band.y + 38.0}",
-                                style: "font-size: 9.5px; fill: var(--warn);",
+                                style: "{note_style}",
                                 "{band.note}" }
                         }
                         for bar in band.bars {
@@ -1132,7 +1153,7 @@ pub fn TeamPlanner() -> Element {
                                 }
                                 if !bar.outside.is_empty() {
                                     text { x: "{bar.x + bar.w + LABEL_GAP}", y: "{bar.y + 12.0}",
-                                        style: "font-size: 10px; fill: var(--ink-soft);",
+                                        style: "{outside_style}",
                                         "{bar.outside}" }
                                 }
                             }
@@ -1140,7 +1161,7 @@ pub fn TeamPlanner() -> Element {
                     }
                 }
                 line { x1: "{NAME_COL_W - 5.0}", y1: "0", x2: "{NAME_COL_W - 5.0}", y2: "{height}",
-                    stroke: "var(--line)", stroke_width: "1" }
+                    stroke: palette.paint("--line"), stroke_width: "1" }
             }
         }
     }
@@ -1481,6 +1502,7 @@ fn Axes(
     what: String,
 ) -> Element {
     let plot = Plot::new(plot_w, plot_h);
+    let palette = use_palette();
     let steps = 4;
     let (_, per_unit) = basis.axis_unit(peak);
 
@@ -1505,7 +1527,7 @@ fn Axes(
                             line {
                                 x1: "{plot.left}", y1: "{y:.1}",
                                 x2: "{plot.left + plot.inner_w()}", y2: "{y:.1}",
-                                stroke: "var(--grid-line)", stroke_width: "1",
+                                stroke: palette.paint("--grid-line"), stroke_width: "1",
                             }
                             text {
                                 x: "{plot.left - 9.0}", y: "{y + 3.5:.1}",
@@ -1521,12 +1543,12 @@ fn Axes(
             line {
                 x1: "{plot.left}", y1: "{plot.top}",
                 x2: "{plot.left}", y2: "{plot.top + plot.inner_h()}",
-                stroke: "var(--line)", stroke_width: "1.5",
+                stroke: palette.paint("--line"), stroke_width: "1.5",
             }
             line {
                 x1: "{plot.left}", y1: "{plot.top + plot.inner_h()}",
                 x2: "{plot.left + plot.inner_w()}", y2: "{plot.top + plot.inner_h()}",
-                stroke: "var(--line)", stroke_width: "1.5",
+                stroke: palette.paint("--line"), stroke_width: "1.5",
             }
 
             for (index, date) in ticks {
@@ -1537,7 +1559,7 @@ fn Axes(
                         g { key: "x{index}",
                             line {
                                 x1: "{x:.1}", y1: "{base}", x2: "{x:.1}", y2: "{base + 4.0}",
-                                stroke: "var(--line)", stroke_width: "1",
+                                stroke: palette.paint("--line"), stroke_width: "1",
                             }
                             text {
                                 x: "{x:.1}", y: "{base + 16.0}",
@@ -1567,12 +1589,13 @@ fn Axes(
 #[component]
 fn StatusRule(plot_w: f64, plot_h: f64, index: usize, count: usize, peak: i64) -> Element {
     let plot = Plot::new(plot_w, plot_h);
+    let palette = use_palette();
     let (x, _) = plot.point(index, count, 0, peak);
     rsx! {
         g { class: "status-rule",
             line {
                 x1: "{x:.1}", y1: "{plot.top}", x2: "{x:.1}", y2: "{plot.top + plot.inner_h()}",
-                stroke: "var(--contextual)", stroke_width: "1", stroke_dasharray: "3 3",
+                stroke: palette.paint("--contextual"), stroke_width: "1", stroke_dasharray: "3 3",
             }
             text {
                 x: "{x - 4.0:.1}", y: "{plot.top + 9.0}",
@@ -1669,6 +1692,7 @@ fn against_plan(metrics: &Metrics) -> String {
 
 #[component]
 fn BurndownPage(metrics: Metrics, w: f64, h: f64) -> Element {
+    let palette = use_palette();
     let basis = metrics.basis;
     let peak = nice_peak(
         metrics
@@ -1715,9 +1739,9 @@ fn BurndownPage(metrics: Metrics, w: f64, h: f64) -> Element {
                     StatusRule { plot_w: w, plot_h: h, index, count: dates.len(), peak }
                 }
                 polyline { points: "{plot.path(&ideal, peak)}", fill: "none",
-                    stroke: "var(--ink-faint)", stroke_width: "1.5", stroke_dasharray: "5 4" }
+                    stroke: palette.paint("--ink-faint"), stroke_width: "1.5", stroke_dasharray: "5 4" }
                 polyline { points: "{plot.partial_path(&actual, dates.len(), peak)}", fill: "none",
-                    stroke: "var(--accent-bright)", stroke_width: "2.5" }
+                    stroke: palette.paint("--accent-bright"), stroke_width: "2.5" }
             }
             if dates.len() < 2 {
                 ChartNote { text: "The plan is one day long, so there is no line to draw across it yet. The figures above are the whole story.".to_string() }
@@ -1735,6 +1759,7 @@ fn BurndownPage(metrics: Metrics, w: f64, h: f64) -> Element {
 
 #[component]
 fn BurnupPage(metrics: Metrics, w: f64, h: f64) -> Element {
+    let palette = use_palette();
     let basis = metrics.basis;
     let peak = nice_peak(metrics.points.iter().map(|p| p.scope).max().unwrap_or(1));
     let done: Vec<i64> = metrics.points.iter().filter_map(|p| p.completed).collect();
@@ -1780,9 +1805,9 @@ fn BurnupPage(metrics: Metrics, w: f64, h: f64) -> Element {
                     StatusRule { plot_w: w, plot_h: h, index, count: dates.len(), peak }
                 }
                 polyline { points: "{plot.path(&scope, peak)}", fill: "none",
-                    stroke: "var(--ink-faint)", stroke_width: "1.5" }
+                    stroke: palette.paint("--ink-faint"), stroke_width: "1.5" }
                 polyline { points: "{plot.partial_path(&done, dates.len(), peak)}", fill: "none",
-                    stroke: "var(--bar-progress)", stroke_width: "2.5" }
+                    stroke: palette.paint("--bar-progress"), stroke_width: "2.5" }
             }
             if dates.len() < 2 {
                 ChartNote { text: "The plan is one day long, so there is no line to draw across it yet. The figures above are the whole story.".to_string() }

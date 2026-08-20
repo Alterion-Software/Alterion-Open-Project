@@ -163,7 +163,7 @@ fn handed_argument() -> Option<handoff::Handed> {
 /// is the kind of thing an engine can answer with a repaint of everything.
 #[component]
 fn Stylesheet() -> Element {
-    rsx! { style { dangerous_inner_html: theme::CSS } }
+    rsx! { style { dangerous_inner_html: theme::CSS.as_str() } }
 }
 
 /// The palette overlay, which changes only when the theme does.

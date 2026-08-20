@@ -4,74 +4,330 @@
 //! The layout follows Microsoft Project (green-bar chrome, ribbon groups, a
 //! grid beside a timescale) but the palette is Alterion's: near-black surfaces,
 //! a muted teal accent and pale teal text, taken from the Alterion website.
+//!
+//! The palette itself is Rust data rather than text in the sheet. It used to be
+//! written straight into a `:root` block, which reads perfectly well right up
+//! until something outside CSS needs to know what a colour is. An SVG
+//! presentation attribute is an attribute, not a declaration: `fill="var(--line)"`
+//! is only ever resolved by a browser choosing to be generous about it, and a
+//! renderer that parses SVG as SVG finds no valid paint there and falls back to
+//! the SVG default, which is black. That is a chart of black blocks.
+//!
+//! So the table below is the one place a colour is written down. The `:root`
+//! blocks are generated from it, which is why they no longer appear here as
+//! text, and `Palette::paint` hands the same value to anything that has to say
+//! it literally. One source, two consumers, no second list to keep in step.
 
-pub const CSS: &str = r##"
-:root {
-  /* Alterion palette */
-  --bg: #0d0f10;
-  --surface: #131718;
-  --surface-2: #0d1a1a;
-  --surface-3: #171d1e;
-  --surface-4: #1b2223;
+use std::sync::LazyLock;
 
-  --accent: #81b5b5;
-  --accent-bright: #a5d3d3;
-  /* Ink for text sitting on the accent or the contextual colour. Those are the
-     pale elements on this palette, so it is the dark one. It flips with the
-     palette; anything hardcoding a colour here is a bug waiting for a theme. */
-  --on-accent: #0b1414;
-  /* Ink for text sitting on a chart bar. The bars are a mid tone in both
-     palettes, so unlike --on-accent this does not flip. */
-  --on-bar: #f2f7f7;
-  --accent-dim: rgba(129, 181, 181, 0.14);
-  --accent-line: rgba(129, 181, 181, 0.42);
-  --contextual: #8aa2c4;
+use dioxus::prelude::*;
 
-  --line: #27302f;
-  --line-soft: #1d2425;
-  --ink: #d8e7e8;
-  --ink-soft: #8fafaf;
-  --ink-faint: #5f7676;
+use crate::state::AppState;
 
-  --hover: rgba(216, 231, 232, 0.065);
-  --pressed: rgba(216, 231, 232, 0.12);
-  --selection: rgba(129, 181, 181, 0.17);
-  --selection-line: rgba(129, 181, 181, 0.55);
-  --focus: var(--accent);
-
-  --grid-line: #222a2b;
-  --grid-header: #171d1e;
-  --nonworking: rgba(216, 231, 232, 0.032);
-
-  /* chart */
-  --bar: #3f7d7d;
-  --bar-edge: #6aadad;
-  --bar-progress: #a5d3d3;
-  --bar-critical: #9d474d;
-  --bar-critical-edge: #d9636a;
-  --bar-progress-critical: #e79aa0;
-  --bar-summary: #cfe3e3;
-  --bar-inactive: #414c4c;
-  --baseline: #6b7f7f;
-  --slack: #4d6060;
-  --today: #d9636a;
-  --link-arrow: #7e9a9a;
-
-  --danger: #d9636a;
-  --danger-bg: rgba(217, 99, 106, 0.12);
-  --warn: #d9b06a;
-
-  --shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
-
-  /* Families are listed most-wanted first, but every name here must be one
-     that actually exists somewhere, because a matcher that falls back by
-     substring can land on an unrelated font whose name merely contains the
-     word. "Inter" matching a symbol font called CustomTkinter_shapes_font is
-     exactly that, and it renders text as arbitrary shapes. */
-  --font: "Inter", "InterVariable", "Segoe UI", "Noto Sans", "DejaVu Sans", "Liberation Sans", sans-serif;
-  --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+/// What a custom property holds.
+///
+/// Worth telling apart, because the whole reason the palette is data is that
+/// something outside CSS wants to read it, and what that something wants is
+/// almost always a paint. Three of these are not paints: two font stacks and a
+/// drop shadow. Naming that here lets `Palette::colour` answer "there is no
+/// colour under that name" instead of handing an SVG `fill` a list of font
+/// families, which would leave the shape black and the mistake invisible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    /// A paint. Valid as an SVG `fill` or `stroke` exactly as it stands.
+    Colour,
+    /// Anything else the sheet needs, which only CSS can make sense of.
+    NotAColour,
 }
 
+/// One custom property, in both palettes.
+pub struct Token {
+    /// The name as CSS spells it, leading dashes included, so that the table
+    /// reads the same way the sheet used to and nothing has to remember
+    /// whether the dashes are part of the name or part of the syntax.
+    pub name: &'static str,
+    /// What the dark palette says. The sheet's own `:root` is the dark one, so
+    /// every token has this and it is what an unanswered token falls back to.
+    pub dark: &'static str,
+    /// What the light palette says, where it says anything at all. `None`
+    /// means the light overlay leaves the token alone, which it does for the
+    /// two font stacks, and for `--on-bar`, whose bars are a mid tone in both
+    /// palettes and so want the same ink on them either way.
+    pub light: Option<&'static str>,
+    pub kind: TokenKind,
+}
+
+impl Token {
+    /// A paint the two palettes disagree about, which is nearly all of them.
+    const fn colour(name: &'static str, dark: &'static str, light: &'static str) -> Self {
+        Self { name, dark, light: Some(light), kind: TokenKind::Colour }
+    }
+
+    /// A paint that is the same whichever palette is up.
+    const fn colour_either_way(name: &'static str, value: &'static str) -> Self {
+        Self { name, dark: value, light: None, kind: TokenKind::Colour }
+    }
+
+    /// Something only CSS can use, that the two palettes disagree about.
+    const fn other(name: &'static str, dark: &'static str, light: &'static str) -> Self {
+        Self { name, dark, light: Some(light), kind: TokenKind::NotAColour }
+    }
+
+    /// Something only CSS can use that is the same either way.
+    const fn other_either_way(name: &'static str, value: &'static str) -> Self {
+        Self { name, dark: value, light: None, kind: TokenKind::NotAColour }
+    }
+}
+
+/// The palette, in the order the `:root` block declares it.
+///
+/// Order is load bearing rather than incidental: the generated blocks are
+/// written out in this order, and the test that holds them against the sheet
+/// they replaced compares the sequence, not just the set.
+///
+/// `static` rather than `const` on purpose. A `const` array is copied at every
+/// mention, so a reference into one borrows a temporary and cannot be handed
+/// back; the resolver returns `&'static str` out of these entries.
+static PALETTE: [Token; 43] = [
+    // ---- Alterion palette --------------------------------------------
+    Token::colour("--bg", "#0d0f10", "#eaefef"),
+    Token::colour("--surface", "#131718", "#ffffff"),
+    Token::colour("--surface-2", "#0d1a1a", "#f2f7f7"),
+    Token::colour("--surface-3", "#171d1e", "#f7fafa"),
+    Token::colour("--surface-4", "#1b2223", "#ffffff"),
+    // The accent darkens rather than staying put when the palette flips: a mid
+    // teal that reads well on near-black has too little contrast against white
+    // to carry text or a focus ring.
+    Token::colour("--accent", "#81b5b5", "#2f5f5e"),
+    Token::colour("--accent-bright", "#a5d3d3", "#1e4746"),
+    // Ink for text sitting on the accent or the contextual colour. Those are
+    // the pale elements on this palette, so it is the dark one. It flips with
+    // the palette; anything hardcoding a colour here is a bug waiting for a
+    // theme.
+    Token::colour("--on-accent", "#0b1414", "#f4f8f8"),
+    // Ink for text sitting on a chart bar. The bars are a mid tone in both
+    // palettes, so unlike --on-accent this does not flip.
+    Token::colour_either_way("--on-bar", "#f2f7f7"),
+    Token::colour("--accent-dim", "rgba(129, 181, 181, 0.14)", "rgba(47, 95, 94, 0.10)"),
+    Token::colour("--accent-line", "rgba(129, 181, 181, 0.42)", "rgba(47, 95, 94, 0.38)"),
+    Token::colour("--contextual", "#8aa2c4", "#45699b"),
+    Token::colour("--line", "#27302f", "#d2dedd"),
+    Token::colour("--line-soft", "#1d2425", "#e6eded"),
+    Token::colour("--ink", "#d8e7e8", "#10201f"),
+    Token::colour("--ink-soft", "#8fafaf", "#4a6362"),
+    Token::colour("--ink-faint", "#5f7676", "#7b9291"),
+    Token::colour("--hover", "rgba(216, 231, 232, 0.065)", "rgba(16, 32, 31, 0.055)"),
+    Token::colour("--pressed", "rgba(216, 231, 232, 0.12)", "rgba(16, 32, 31, 0.10)"),
+    Token::colour("--selection", "rgba(129, 181, 181, 0.17)", "rgba(47, 95, 94, 0.13)"),
+    Token::colour("--selection-line", "rgba(129, 181, 181, 0.55)", "rgba(47, 95, 94, 0.5)"),
+    // The one token in the palette that names another rather than a value, and
+    // the reason the resolver follows a name instead of reading a field.
+    Token::colour("--focus", "var(--accent)", "var(--accent)"),
+    Token::colour("--grid-line", "#222a2b", "#e3ebeb"),
+    Token::colour("--grid-header", "#171d1e", "#f2f7f7"),
+    Token::colour("--nonworking", "rgba(216, 231, 232, 0.032)", "rgba(16, 32, 31, 0.038)"),
+    // ---- chart --------------------------------------------------------
+    Token::colour("--bar", "#3f7d7d", "#4b8b8b"),
+    Token::colour("--bar-edge", "#6aadad", "#2f5f5e"),
+    Token::colour("--bar-progress", "#a5d3d3", "#1e4746"),
+    Token::colour("--bar-critical", "#9d474d", "#b3565c"),
+    Token::colour("--bar-critical-edge", "#d9636a", "#8b393f"),
+    Token::colour("--bar-progress-critical", "#e79aa0", "#7a2f34"),
+    Token::colour("--bar-summary", "#cfe3e3", "#20403f"),
+    Token::colour("--bar-inactive", "#414c4c", "#b9c6c6"),
+    Token::colour("--baseline", "#6b7f7f", "#8aa3a2"),
+    Token::colour("--slack", "#4d6060", "#a9bdbc"),
+    Token::colour("--today", "#d9636a", "#b3565c"),
+    Token::colour("--link-arrow", "#7e9a9a", "#6d8786"),
+    Token::colour("--danger", "#d9636a", "#ac5157"),
+    Token::colour("--danger-bg", "rgba(217, 99, 106, 0.12)", "rgba(172, 81, 87, 0.10)"),
+    Token::colour("--warn", "#d9b06a", "#9d6f16"),
+    Token::other("--shadow", "0 12px 34px rgba(0, 0, 0, 0.55)", "0 12px 30px rgba(16, 32, 31, 0.18)"),
+    // Families are listed most-wanted first, but every name here must be one
+    // that actually exists somewhere, because a matcher that falls back by
+    // substring can land on an unrelated font whose name merely contains the
+    // word. "Inter" matching a symbol font called CustomTkinter_shapes_font is
+    // exactly that, and it renders text as arbitrary shapes.
+    Token::other_either_way(
+        "--font",
+        "\"Inter\", \"InterVariable\", \"Segoe UI\", \"Noto Sans\", \"DejaVu Sans\", \"Liberation Sans\", sans-serif",
+    ),
+    Token::other_either_way(
+        "--mono",
+        "ui-monospace, \"Cascadia Mono\", \"JetBrains Mono\", Consolas, monospace",
+    ),
+];
+
+/// One of the two palettes, as something that can be asked for a value.
+///
+/// Separate from `ThemeChoice` because the two are different questions. A
+/// choice includes "whatever the desktop says", which is not a palette until
+/// something has answered it; this is the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Palette {
+    Dark,
+    Light,
+}
+
+/// How many names deep a token is followed before it is called a cycle.
+///
+/// The palette uses exactly one hop today, `--focus: var(--accent)`. A second
+/// is allowed for rather than assumed, so that adding one does not quietly put
+/// the literal text `var(--accent)` into an SVG attribute, which is the same
+/// black shape this whole change exists to get rid of. Anything longer than
+/// this is a loop, and a loop has no value to hand back.
+const MAX_HOPS: usize = 4;
+
+fn token(name: &str) -> Option<&'static Token> {
+    PALETTE.iter().find(|token| token.name == name)
+}
+
+impl Palette {
+    /// What this palette says about a token, before any name is followed.
+    ///
+    /// A token the light palette does not restate keeps the dark value, which
+    /// is exactly what the overlay does in CSS: it wins by coming after the
+    /// sheet, so a property it never mentions still holds what the sheet gave
+    /// it.
+    fn stated(self, token: &Token) -> &'static str {
+        match self {
+            Palette::Dark => token.dark,
+            Palette::Light => token.light.unwrap_or(token.dark),
+        }
+    }
+
+    /// The value of a token in this palette, with any `var()` followed until
+    /// it lands on something literal.
+    ///
+    /// `None` for a name the palette does not have, and for a chain that never
+    /// ends.
+    pub fn value(self, name: &str) -> Option<&'static str> {
+        let mut at = token(name)?;
+        for _ in 0..MAX_HOPS {
+            let value = self.stated(at);
+            let Some(inner) = value.strip_prefix("var(").and_then(|v| v.strip_suffix(')')) else {
+                return Some(value);
+            };
+            at = token(inner.trim())?;
+        }
+        None
+    }
+
+    /// The literal colour a token stands for, or `None` if that name is not a
+    /// colour in this palette.
+    ///
+    /// The honest form of the question, and the one worth calling when the
+    /// name came from somewhere other than the source of this program.
+    pub fn colour(self, name: &str) -> Option<&'static str> {
+        match token(name) {
+            Some(found) if found.kind == TokenKind::Colour => self.value(name),
+            _ => None,
+        }
+    }
+
+    /// The literal colour for a token, for an attribute that cannot take a
+    /// `var()`.
+    ///
+    /// A name that is not a colour is a mistake in this program rather than
+    /// something a plan can cause, and there is a test that walks the source of
+    /// every caller and checks each name against the table. What it falls back
+    /// to still matters, because a fallback is what ships if that test is ever
+    /// weakened: `currentColor` inherits, so a mistake shows up as a shape in
+    /// the wrong colour rather than as the black rectangle this change is
+    /// about.
+    pub fn paint(self, name: &str) -> &'static str {
+        self.colour(name).unwrap_or("currentColor")
+    }
+
+    /// The font stack for text drawn inside an SVG.
+    ///
+    /// Text in a page inherits its font from whatever contains it. Text inside
+    /// an SVG only inherits it if the renderer carries the inheritance across
+    /// that boundary, and not every renderer does. Text that inherits nothing
+    /// gets whatever the renderer reaches for first, which on one machine was
+    /// a symbol face: `Aug` came out as `Auy` in Greek letters, and the days
+    /// of the week as sigmas and omegas. Latin codepoints, Greek glyphs, no
+    /// error anywhere.
+    ///
+    /// So the chart says which font it wants rather than assuming it will be
+    /// told. `sans-serif` is the fallback because a generic family is the one
+    /// thing every renderer resolves to something readable.
+    pub fn font(self) -> &'static str {
+        self.value("--font").unwrap_or("sans-serif")
+    }
+
+    /// The same, for a value that may or may not be naming a token.
+    ///
+    /// Colours that ride with the plan rather than the program come through
+    /// here: an annotation's stroke is a string somebody typed or a token the
+    /// defaults chose, and `aop_core` has no idea which palette is up. A
+    /// literal colour is handed straight back, so this is safe to put in front
+    /// of anything.
+    pub fn literal(self, value: &str) -> &str {
+        match value.strip_prefix("var(").and_then(|v| v.strip_suffix(')')) {
+            Some(name) => self.paint(name.trim()),
+            None => value,
+        }
+    }
+}
+
+/// The `:root` block for one palette, which is what the sheet used to carry as
+/// text.
+///
+/// Light emits only the tokens it actually restates. The overlay wins by
+/// coming after the sheet, so a token it leaves out keeps the value the sheet
+/// already gave it, and restating those would be forty lines saying nothing.
+fn root_block(palette: Palette) -> String {
+    let mut css = String::from(":root {\n");
+    for token in &PALETTE {
+        let value = match palette {
+            Palette::Dark => Some(token.dark),
+            Palette::Light => token.light,
+        };
+        if let Some(value) = value {
+            css.push_str("  ");
+            css.push_str(token.name);
+            css.push_str(": ");
+            css.push_str(value);
+            css.push_str(";\n");
+        }
+    }
+    css.push_str("}\n");
+    css
+}
+
+/// The palette the interface is painting with, for anything that has to write
+/// a colour down rather than name it.
+///
+/// A lookup where the drawing happens rather than an argument threaded down
+/// from the top: the components that draw SVG are spread across three files and
+/// most of them already reach for the application state exactly this way, so
+/// this adds no new route in and nothing to keep passing along. Reading the
+/// signal also subscribes the caller, which is what makes a chart repaint when
+/// the theme changes rather than keeping the colours it was first drawn with.
+///
+/// `consume_context` and not `use_context`, despite the name of this function.
+/// `use_context` is a hook and takes a hook slot, so it may only be called
+/// before any early return; several of the callers here start with one, and a
+/// palette that has to be fetched at the top of a function that has not yet
+/// decided whether it is drawing anything is a rule waiting to be broken by
+/// somebody who did not know it existed. Consuming the context walks the scope
+/// tree instead, which costs a few pointer hops and can be called anywhere. The
+/// subscription is unaffected: it comes from reading the signal, not from how
+/// the signal was found.
+pub fn use_palette() -> Palette {
+    consume_context::<Signal<AppState>>().read().theme.palette()
+}
+
+/// The whole stylesheet: the dark palette, then every rule written against it.
+///
+/// Built once and kept. It goes into a `<style>` element that never re-renders,
+/// so there is no reason to assemble a hundred kilobytes of text twice.
+pub static CSS: LazyLock<String> =
+    LazyLock::new(|| format!("{}{RULES}", root_block(Palette::Dark)));
+
+/// Everything in the sheet that is not the palette.
+const RULES: &str = r##"
 * { box-sizing: border-box; }
 
 html, body, #main {
@@ -1785,6 +2041,15 @@ button { font: inherit; color: inherit; }
   align-items: center;
   justify-content: center;
   border-right: 1px solid var(--line);
+  /* The label inside is turned on its side and told not to wrap, so it is far
+     wider than this bar until something turns it. A renderer that does not
+     support vertical writing leaves it lying flat, and a flat line of text
+     that is told not to wrap runs straight out of the window and paints over
+     whatever is beside it. Clipping does not make that readable, but it does
+     keep a missing feature inside its own 22 pixels instead of across the
+     screen. The label itself still needs rebuilding without vertical writing
+     mode, which is a separate job. */
+  overflow: hidden;
 }
 
 .viewbar span {
@@ -3638,62 +3903,9 @@ button { font: inherit; color: inherit; }
 /// a second theme exists. Only the tokens are restated; anything that reads a
 /// raw colour rather than a token would have to be fixed where it does so, not
 /// here.
-///
-/// The accent darkens rather than staying put: a mid teal that reads well on
-/// near-black has too little contrast against white to carry text or a focus
-/// ring.
-const LIGHT_RULES: &str = r##"
-:root {
-  --bg: #eaefef;
-  --surface: #ffffff;
-  --surface-2: #f2f7f7;
-  --surface-3: #f7fafa;
-  --surface-4: #ffffff;
-
-  --accent: #2f5f5e;
-  --accent-bright: #1e4746;
-  --on-accent: #f4f8f8;
-  --accent-dim: rgba(47, 95, 94, 0.10);
-  --accent-line: rgba(47, 95, 94, 0.38);
-  --contextual: #45699b;
-
-  --line: #d2dedd;
-  --line-soft: #e6eded;
-  --ink: #10201f;
-  --ink-soft: #4a6362;
-  --ink-faint: #7b9291;
-
-  --hover: rgba(16, 32, 31, 0.055);
-  --pressed: rgba(16, 32, 31, 0.10);
-  --selection: rgba(47, 95, 94, 0.13);
-  --selection-line: rgba(47, 95, 94, 0.5);
-  --focus: var(--accent);
-
-  --grid-line: #e3ebeb;
-  --grid-header: #f2f7f7;
-  --nonworking: rgba(16, 32, 31, 0.038);
-
-  /* chart */
-  --bar: #4b8b8b;
-  --bar-edge: #2f5f5e;
-  --bar-progress: #1e4746;
-  --bar-critical: #b3565c;
-  --bar-critical-edge: #8b393f;
-  --bar-progress-critical: #7a2f34;
-  --bar-summary: #20403f;
-  --bar-inactive: #b9c6c6;
-  --baseline: #8aa3a2;
-  --slack: #a9bdbc;
-  --today: #b3565c;
-  --link-arrow: #6d8786;
-
-  --danger: #ac5157;
-  --danger-bg: rgba(172, 81, 87, 0.10);
-  --warn: #9d6f16;
-
-  --shadow: 0 12px 30px rgba(16, 32, 31, 0.18);
+fn light_rules() -> String {
+    root_block(Palette::Light)
 }
-"##;
 
 /// Which palette to paint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3732,10 +3944,30 @@ impl ThemeChoice {
     pub fn overlay(self) -> String {
         match self {
             ThemeChoice::Dark => String::new(),
-            ThemeChoice::Light => LIGHT_RULES.to_string(),
+            ThemeChoice::Light => light_rules(),
             ThemeChoice::System => {
-                format!("@media (prefers-color-scheme: light) {{\n{LIGHT_RULES}\n}}")
+                format!("@media (prefers-color-scheme: light) {{\n{}\n}}", light_rules())
             }
+        }
+    }
+
+    /// Which palette to read a literal colour out of.
+    ///
+    /// System reads as dark, and that is a compromise worth naming rather than
+    /// hiding. Following the desktop is a media query, and a media query is
+    /// answered by the engine at paint time; nothing in this process is told
+    /// what the desktop asked for, so there is no honest way to answer it here.
+    /// Dark is the sheet's own `:root`, so it is what gets painted whenever the
+    /// query is not met, which makes it the right guess rather than an
+    /// arbitrary one. The cost is a desktop set to light with the theme left on
+    /// System: the chrome lightens and the colours written into SVG attributes
+    /// stay dark. Closing that gap means the window telling the application
+    /// which scheme it was given, which is a different change in a different
+    /// place; an explicit Light or Dark is exact today.
+    pub fn palette(self) -> Palette {
+        match self {
+            ThemeChoice::Light => Palette::Light,
+            ThemeChoice::Dark | ThemeChoice::System => Palette::Dark,
         }
     }
 }
@@ -3743,6 +3975,195 @@ impl ThemeChoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The palette exactly as the stylesheet carried it before any of this,
+    /// captured from the file itself and never touched since.
+    ///
+    /// The whole argument for lifting the palette into Rust is that the
+    /// generated sheet is the sheet that was there before, and an argument is
+    /// worth no more than what checks it.
+    const AS_IT_WAS: &str = include_str!("palette-as-it-was.css");
+
+    /// The same CSS with every comment taken out, so the parser below only has
+    /// to understand declarations.
+    fn without_comments(css: &str) -> String {
+        let mut kept = String::with_capacity(css.len());
+        let mut rest = css;
+        while let Some(opened) = rest.find("/*") {
+            kept.push_str(&rest[..opened]);
+            match rest[opened..].find("*/") {
+                Some(closed) => rest = &rest[opened + closed + 2..],
+                None => return kept,
+            }
+        }
+        kept.push_str(rest);
+        kept
+    }
+
+    /// Every `:root` block in some CSS, each as its declarations in the order
+    /// they are written.
+    ///
+    /// Order and not just membership, because the sheet is a cascade: two
+    /// declarations of the same property mean the later one, and a comparison
+    /// that sorted them would call two different stylesheets the same.
+    ///
+    /// Crude on purpose, in the same way as `rule_for` below. Neither block has
+    /// a nested brace or a semicolon inside a value, so a block runs to the
+    /// next `}` and a declaration to the next `;`, and nothing here has to
+    /// parse CSS.
+    fn root_blocks(css: &str) -> Vec<Vec<(String, String)>> {
+        css.split(":root {")
+            .skip(1)
+            .map(|block| {
+                block
+                    .split('}')
+                    .next()
+                    .unwrap_or_default()
+                    .split(';')
+                    .filter_map(|declaration| declaration.split_once(':'))
+                    .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+                    .filter(|(name, _)| name.starts_with("--"))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_generated_dark_palette_says_what_the_sheet_used_to_say() {
+        let was = without_comments(AS_IT_WAS);
+        let was = root_blocks(&was);
+        let now = root_blocks(&root_block(Palette::Dark));
+        assert_eq!(now[0], was[0]);
+    }
+
+    #[test]
+    fn the_generated_light_palette_says_what_the_overlay_used_to_say() {
+        let was = without_comments(AS_IT_WAS);
+        let was = root_blocks(&was);
+        let now = root_blocks(&root_block(Palette::Light));
+        assert_eq!(now[0], was[1]);
+    }
+
+    /// The light overlay restates only what it changes, and that is the whole
+    /// mechanism: a property it never mentions keeps what the sheet gave it.
+    /// A generator that helpfully emitted all forty three would still paint
+    /// correctly, so nothing else here would notice it had stopped being an
+    /// overlay.
+    #[test]
+    fn the_light_overlay_restates_only_the_tokens_it_changes() {
+        let dark = root_blocks(&root_block(Palette::Dark)).remove(0);
+        let light = root_blocks(&root_block(Palette::Light)).remove(0);
+        assert!(light.len() < dark.len());
+        for (name, _) in &light {
+            let stated = PALETTE.iter().find(|token| token.name == name).unwrap();
+            assert!(stated.light.is_some(), "{name} is restated without changing");
+        }
+    }
+
+    #[test]
+    fn the_sheet_is_the_palette_followed_by_the_rules_written_against_it() {
+        assert!(CSS.starts_with(":root {"));
+        assert!(CSS.contains("--grid-header: #171d1e;"));
+        assert!(CSS.contains("* { box-sizing: border-box; }"));
+    }
+
+    #[test]
+    fn a_token_that_names_another_resolves_to_the_colour_it_names() {
+        // --focus is var(--accent) in both palettes, which is the only
+        // indirection the palette actually has.
+        assert_eq!(Palette::Dark.paint("--focus"), "#81b5b5");
+        assert_eq!(Palette::Light.paint("--focus"), "#2f5f5e");
+    }
+
+    #[test]
+    fn every_colour_in_the_palette_resolves_to_something_a_paint_attribute_can_use() {
+        for token in &PALETTE {
+            if token.kind != TokenKind::Colour {
+                continue;
+            }
+            for palette in [Palette::Dark, Palette::Light] {
+                let resolved = palette
+                    .colour(token.name)
+                    .unwrap_or_else(|| panic!("{} resolves to nothing", token.name));
+                assert!(
+                    !resolved.contains("var("),
+                    "{} is still a name rather than a colour: {resolved}",
+                    token.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_light_palette_answers_with_light_values() {
+        assert_eq!(Palette::Dark.paint("--line"), "#27302f");
+        assert_eq!(Palette::Light.paint("--line"), "#d2dedd");
+    }
+
+    /// A token the light palette leaves alone still has to answer, and answer
+    /// with the value the sheet gave it rather than with nothing.
+    #[test]
+    fn a_token_the_light_palette_leaves_alone_keeps_the_sheets_value() {
+        assert_eq!(Palette::Light.paint("--on-bar"), "#f2f7f7");
+        assert_eq!(Palette::Dark.paint("--on-bar"), "#f2f7f7");
+    }
+
+    #[test]
+    fn a_font_stack_is_not_offered_as_a_paint() {
+        // The reason the table records what a token holds instead of assuming
+        // it is a colour. Handed to an SVG fill, this list of families is not a
+        // paint, and the shape would come out black with nothing to say why.
+        assert!(Palette::Dark.colour("--font").is_none());
+        assert!(Palette::Dark.colour("--mono").is_none());
+        assert!(Palette::Dark.colour("--shadow").is_none());
+        assert!(Palette::Dark.value("--font").unwrap().contains("Inter"));
+    }
+
+    #[test]
+    fn a_name_the_palette_does_not_have_is_not_a_colour() {
+        assert!(Palette::Dark.colour("--nothing-of-the-sort").is_none());
+        assert_eq!(Palette::Dark.paint("--nothing-of-the-sort"), "currentColor");
+    }
+
+    #[test]
+    fn a_value_that_is_not_naming_a_token_is_handed_back_untouched() {
+        assert_eq!(Palette::Dark.literal("#123456"), "#123456");
+        assert_eq!(Palette::Dark.literal("none"), "none");
+        assert_eq!(Palette::Dark.literal("transparent"), "transparent");
+        assert_eq!(Palette::Dark.literal("var(--line)"), "#27302f");
+        assert_eq!(Palette::Light.literal("var(--line)"), "#d2dedd");
+    }
+
+    #[test]
+    fn following_the_desktop_reads_as_the_palette_the_sheet_itself_states() {
+        assert_eq!(ThemeChoice::System.palette(), Palette::Dark);
+        assert_eq!(ThemeChoice::Dark.palette(), Palette::Dark);
+        assert_eq!(ThemeChoice::Light.palette(), Palette::Light);
+    }
+
+    /// Every token the drawing code asks for by name, gathered from the source
+    /// itself so a name added later is covered without anyone updating a list.
+    #[test]
+    fn every_token_the_charts_paint_with_is_a_colour_in_the_palette() {
+        // An unknown name falls back to currentColor rather than failing, which
+        // is right at run time and useless as a warning. This is what catches
+        // it, and it is the only thing that does.
+        let mut wrong = Vec::new();
+        for file in [
+            include_str!("gantt.rs"),
+            include_str!("cursors.rs"),
+            include_str!("views.rs"),
+        ] {
+            for chunk in file.split(".paint(\"").skip(1) {
+                if let Some(name) = chunk.split('"').next()
+                    && Palette::Dark.colour(name).is_none()
+                {
+                    wrong.push(name.to_string());
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "these are not colours in the palette: {wrong:?}");
+    }
 
     #[test]
     fn following_the_desktop_is_the_default() {
@@ -3834,3 +4255,4 @@ mod tests {
         }
     }
 }
+

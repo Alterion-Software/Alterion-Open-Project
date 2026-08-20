@@ -39,6 +39,7 @@ use crate::cloud::live::{Cell, Peer, Pointer};
 use crate::cloud::{Account, oauth};
 use crate::gantt::{HEADER_H, ROW_H};
 use crate::state::AppState;
+use crate::theme::use_palette;
 
 /// How far from the pointer's tip the label sits.
 ///
@@ -236,6 +237,9 @@ fn Overlay(people: Vec<Placed>) -> Element {
     if people.is_empty() {
         return rsx! {};
     }
+    // The outline is drawn into an SVG attribute, so it has to be a colour
+    // rather than the name of one. See `crate::theme`.
+    let palette = use_palette();
     rsx! {
         div { class: "cursors",
             for (peer, x, y) in people {
@@ -262,7 +266,7 @@ fn Overlay(people: Vec<Placed>) -> Element {
                                 path {
                                     d: "M1 1 L1 15 L4.6 11.6 L7 17 L9.6 15.8 L7.2 10.7 L11.5 10.4 Z",
                                     fill: "{colour}",
-                                    stroke: "var(--surface)",
+                                    stroke: palette.paint("--surface"),
                                     stroke_width: "1.2",
                                     stroke_linejoin: "round",
                                 }

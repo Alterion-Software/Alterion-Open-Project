@@ -16,6 +16,7 @@ use aop_core::{LinkType, Project, TaskId, WorkCalendar};
 
 use crate::viewport::{PaneScroll, RowWindow, SpanWindow};
 use crate::state::{AppState, BarDragKind, Dialog, DrawDragKind, ViewKind, Zoom};
+use crate::theme::Palette;
 
 /// Row height, matched to the grid so the two panes line up.
 pub const ROW_H: f64 = 22.0;
@@ -472,6 +473,10 @@ pub fn GanttChart(
     let (width, body_h, today_x) = (*width, *body_h, *today_x);
     let s = state.read();
     let project = &s.project;
+    // Written into SVG attributes rather than named there, because a
+    // presentation attribute is not a CSS declaration and a var() in one is not
+    // a paint. See `crate::theme`.
+    let palette = s.theme.palette();
 
     let tracking = s.view == ViewKind::TrackingGantt;
     // A hidden status line is simply never given an x to draw at.
@@ -639,7 +644,9 @@ pub fn GanttChart(
             // ---- pinned timescale ---------------------------------------
             div { class: "chart-head",
                 svg { class: "chart-svg", width: "{width}", height: "{HEADER_H}",
-                    rect { x: "0", y: "0", width: "{width}", height: "{HEADER_H}", fill: "var(--grid-header)" }
+                    view_box: "0 0 {width} {HEADER_H}", font_family: palette.font(),
+                    style: "width: {width}px; height: {HEADER_H}px; flex: none;",
+                    rect { x: "0", y: "0", width: "{width}", height: "{HEADER_H}", fill: palette.paint("--grid-header") }
                     for (index, tick) in major.iter().enumerate().filter(|(_, t)| {
                         let x = scale.x_date(t.from);
                         span.overlaps(x, x + (t.to - t.from).num_days() as f64 * scale.px_per_day)
@@ -651,7 +658,7 @@ pub fn GanttChart(
                             rsx! {
                                 g { key: "mj{index}",
                                     line { x1: "{x}", y1: "0", x2: "{x}", y2: "{TIER_H}",
-                                        stroke: "var(--line)", stroke_width: "1" }
+                                        stroke: palette.paint("--line"), stroke_width: "1" }
                                     text { class: "tl-major", x: "{x + w / 2.0}", y: "13",
                                         text_anchor: "middle", "{label}" }
                                 }
@@ -659,7 +666,7 @@ pub fn GanttChart(
                         }
                     }
                     line { x1: "0", y1: "{TIER_H}", x2: "{width}", y2: "{TIER_H}",
-                        stroke: "var(--line)", stroke_width: "1" }
+                        stroke: palette.paint("--line"), stroke_width: "1" }
                     for (index, tick) in minor.iter().enumerate().filter(|(_, t)| {
                         let x = scale.x_date(t.from);
                         span.overlaps(x, x + (t.to - t.from).num_days() as f64 * scale.px_per_day)
@@ -673,7 +680,7 @@ pub fn GanttChart(
                             rsx! {
                                 g { key: "mn{index}",
                                     line { x1: "{x}", y1: "{TIER_H}", x2: "{x}", y2: "{HEADER_H}",
-                                        stroke: "var(--line)", stroke_width: "1" }
+                                        stroke: palette.paint("--line"), stroke_width: "1" }
                                     text { class: "{class}", x: "{x + w / 2.0}", y: "{TIER_H + 13.0}",
                                         text_anchor: "middle", "{label}" }
                                 }
@@ -681,12 +688,14 @@ pub fn GanttChart(
                         }
                     }
                     line { x1: "0", y1: "{HEADER_H - 0.5}", x2: "{width}", y2: "{HEADER_H - 0.5}",
-                        stroke: "var(--line)", stroke_width: "1" }
+                        stroke: palette.paint("--line"), stroke_width: "1" }
                 }
             }
 
             // ---- chart body ---------------------------------------------
             svg { class: "chart-svg", width: "{width}", height: "{body_h}",
+                view_box: "0 0 {width} {body_h}", font_family: palette.font(),
+                style: "width: {width}px; height: {body_h}px; flex: none;",
 
                 // First, so everything else is painted over it and it takes a
                 // pointer only where the chart is otherwise bare. It exists to
@@ -725,7 +734,7 @@ pub fn GanttChart(
                         key: "nw{index}",
                         x: "{x}", y: "0",
                         width: "{scale.px_per_day}", height: "{body_h}",
-                        fill: "var(--nonworking)",
+                        fill: palette.paint("--nonworking"),
                     }
                 }
 
@@ -734,7 +743,7 @@ pub fn GanttChart(
                         key: "bd{line}",
                         x: "0", y: "{line as f64 * ROW_H}",
                         width: "{width}", height: "{ROW_H}",
-                        fill: "var(--grid-header)",
+                        fill: palette.paint("--grid-header"),
                     }
                 }
 
@@ -744,7 +753,7 @@ pub fn GanttChart(
                         rsx! {
                             if grid_rows {
                                 line { key: "rl{line_index}", x1: "0", y1: "{y}", x2: "{width}", y2: "{y}",
-                                    stroke: "var(--grid-line)", stroke_width: "1" }
+                                    stroke: palette.paint("--grid-line"), stroke_width: "1" }
                             }
                         }
                     }
@@ -760,7 +769,7 @@ pub fn GanttChart(
                         rsx! {
                             if grid_columns {
                                 line { key: "vl{index}", x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
-                                    stroke: "var(--grid-line)", stroke_width: "1" }
+                                    stroke: palette.paint("--grid-line"), stroke_width: "1" }
                             }
                         }
                     }
@@ -773,7 +782,7 @@ pub fn GanttChart(
                             {
                                 match placed(d) {
                                     Some(at) => {
-                                        drawn_shape(d, at, selected_drawing == Some(d.id), state, interactive)
+                                        drawn_shape(d, at, selected_drawing == Some(d.id), state, interactive, palette)
                                     }
                                     None => rsx! {},
                                 }
@@ -796,8 +805,8 @@ pub fn GanttChart(
                         {
                             Some((d, head_x, head_y, downward)) => rsx! {
                                 g { key: "lk{index}",
-                                    path { d: "{d}", fill: "none", stroke: "var(--link-arrow)", stroke_width: "1" }
-                                    {arrow_head(head_x, head_y, downward)}
+                                    path { d: "{d}", fill: "none", stroke: palette.paint("--link-arrow"), stroke_width: "1" }
+                                    {arrow_head(head_x, head_y, downward, palette)}
                                 }
                             },
                             None => rsx! {},
@@ -834,7 +843,7 @@ pub fn GanttChart(
                         let critical =
                             show_critical && aop_core::issues::shows_as_critical(project, index);
                         let fill = if !task.active {
-                            "var(--bar-inactive)".to_string()
+                            palette.paint("--bar-inactive").to_string()
                         } else if critical {
                             styles.critical.clone()
                         } else {
@@ -924,7 +933,7 @@ pub fn GanttChart(
                                 if s.show_slack && !summary && has_slack {
                                     line {
                                         x1: "{right}", y1: "{centre}", x2: "{slack_x}", y2: "{centre}",
-                                        stroke: "var(--slack)", stroke_width: "1", stroke_dasharray: "3 2",
+                                        stroke: palette.paint("--slack"), stroke_width: "1", stroke_dasharray: "3 2",
                                     }
                                 }
 
@@ -934,7 +943,7 @@ pub fn GanttChart(
                                 if hovered {
                                     rect {
                                         x: "0", y: "{y}", width: "{width}", height: "{ROW_H}",
-                                        fill: "var(--selection)",
+                                        fill: palette.paint("--selection"),
                                         style: "pointer-events: none;",
                                     }
                                 }
@@ -968,7 +977,11 @@ pub fn GanttChart(
                                             x: "{left + ghost_dx}", y: "{bar_y}",
                                             width: "{ghost_w}", height: "{BAR_H}",
                                             rx: "1.5", fill: "{fill}",
-                                            stroke: if dragging_this || hovered { "var(--accent-bright)" } else { "var(--bar-edge)" },
+                                            stroke: if dragging_this || hovered {
+                                                palette.paint("--accent-bright")
+                                            } else {
+                                                palette.paint("--bar-edge")
+                                            },
                                             stroke_width: if dragging_this || hovered { "1.4" } else { "0.6" },
                                             opacity: if dragging_this { "0.85" } else { "1" },
                                         }
@@ -1061,11 +1074,11 @@ pub fn GanttChart(
                                             line {
                                                 x1: "{x}", y1: "{y + 1.0}",
                                                 x2: "{x}", y2: "{y + ROW_H - 1.0}",
-                                                stroke: "var(--contextual)", stroke_width: "1.5",
+                                                stroke: palette.paint("--contextual"), stroke_width: "1.5",
                                             }
                                             polygon {
                                                 points: "{x - 4.0},{mid - 5.0} {x + 4.0},{mid - 5.0} {x},{mid + 1.0}",
-                                                fill: "var(--contextual)",
+                                                fill: palette.paint("--contextual"),
                                             }
                                         }
                                     }
@@ -1082,7 +1095,7 @@ pub fn GanttChart(
                             {
                                 match placed(d) {
                                     Some(at) => {
-                                        drawn_shape(d, at, selected_drawing == Some(d.id), state, interactive)
+                                        drawn_shape(d, at, selected_drawing == Some(d.id), state, interactive, palette)
                                     }
                                     None => rsx! {},
                                 }
@@ -1094,14 +1107,14 @@ pub fn GanttChart(
                 if let Some(x) = today_x {
                     line {
                         x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
-                        stroke: "var(--today)", stroke_width: "1", stroke_dasharray: "4 3",
+                        stroke: palette.paint("--today"), stroke_width: "1", stroke_dasharray: "4 3",
                     }
                 }
 
                 if tracking {
                     if let Some(x) = status_x {
                         line { x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
-                            stroke: "var(--contextual)", stroke_width: "1.4" }
+                            stroke: palette.paint("--contextual"), stroke_width: "1.4" }
                     }
                 }
 
@@ -1117,7 +1130,7 @@ pub fn GanttChart(
                             } else {
                                 (dx, dy)
                             };
-                            rubber_band(kind, x, y, dx, dy)
+                            rubber_band(kind, x, y, dx, dy, palette)
                         }
                         None => rsx! {},
                     }
@@ -1269,13 +1282,13 @@ fn arrow_path(
     Some((path, end_x, y2 - 6.0, true))
 }
 
-fn arrow_head(x: f64, y: f64, downward: bool) -> Element {
+fn arrow_head(x: f64, y: f64, downward: bool, palette: Palette) -> Element {
     let points = if downward {
         format!("{},{y} {},{y} {x},{}", x - 3.0, x + 3.0, y + 5.0)
     } else {
         format!("{},{} {},{} {x},{y}", x - 5.0, y - 3.0, x - 5.0, y + 3.0)
     };
-    rsx! { polygon { points: "{points}", fill: "var(--link-arrow)" } }
+    rsx! { polygon { points: "{points}", fill: palette.paint("--link-arrow") } }
 }
 
 // ---------------------------------------------------------------- drawings
@@ -1330,14 +1343,19 @@ fn drawn_shape(
     selected: bool,
     mut state: Signal<AppState>,
     interactive: bool,
+    palette: Palette,
 ) -> Element {
     let id = d.id;
     let outer = at.normalised();
     let (end_x, end_y) = at.end();
-    let stroke = d.style.stroke();
+    // A shape's own colours ride with the plan and may name a token or give a
+    // colour outright, and `aop_core` has no idea which palette is up, so they
+    // are resolved here rather than there.
+    let stroke = palette.literal(d.style.stroke());
     let stroke_w = d.style.width();
     let dash = d.style.line_style.dasharray().unwrap_or("none");
-    let fill = d.style.fill();
+    let fill = palette.literal(d.style.fill());
+    let ink = palette.literal(d.style.ink());
     // A locked shape lets the pointer through to the bars underneath, which is
     // the point of locking one: mark the plan up, then get back to work on it.
     // A report is locked all over, since nothing on it is meant to be touched.
@@ -1428,7 +1446,7 @@ fn drawn_shape(
                     text {
                         class: "draw-text",
                         x: "{outer.x + 4.0}", y: "{outer.y + outer.h / 2.0}",
-                        fill: "{d.style.ink()}",
+                        fill: "{ink}",
                         font_size: "{d.style.font_size()}pt",
                         font_weight: if d.style.bold { "600" } else { "400" },
                         font_style: if d.style.italic { "italic" } else { "normal" },
@@ -1442,7 +1460,7 @@ fn drawn_shape(
                 rect {
                     x: "{outer.x - SELECT_PAD}", y: "{outer.y - SELECT_PAD}",
                     width: "{outer.w + 2.0 * SELECT_PAD}", height: "{outer.h + 2.0 * SELECT_PAD}",
-                    fill: "none", stroke: "var(--accent-bright)", stroke_width: "1",
+                    fill: "none", stroke: palette.paint("--accent-bright"), stroke_width: "1",
                     stroke_dasharray: "3 2", style: "pointer-events: none;",
                 }
             }
@@ -1477,12 +1495,12 @@ fn arrow_tip(x1: f64, y1: f64, x2: f64, y2: f64, stroke: &str, stroke_w: f64) ->
 ///
 /// Deliberately not the shape itself: a dashed box says "this is where it will
 /// go" without pretending the shape exists before the pointer is let go.
-fn rubber_band(kind: ShapeKind, x: f64, y: f64, dx: f64, dy: f64) -> Element {
+fn rubber_band(kind: ShapeKind, x: f64, y: f64, dx: f64, dy: f64, palette: Palette) -> Element {
     if matches!(kind, ShapeKind::Line | ShapeKind::Arrow) {
         return rsx! {
             line {
                 x1: "{x}", y1: "{y}", x2: "{x + dx}", y2: "{y + dy}",
-                stroke: "var(--accent-bright)", stroke_width: "1.5",
+                stroke: palette.paint("--accent-bright"), stroke_width: "1.5",
                 stroke_dasharray: "4 3", style: "pointer-events: none;",
             }
         };
@@ -1491,7 +1509,7 @@ fn rubber_band(kind: ShapeKind, x: f64, y: f64, dx: f64, dy: f64) -> Element {
     rsx! {
         rect {
             x: "{band.x}", y: "{band.y}", width: "{band.w}", height: "{band.h}",
-            fill: "none", stroke: "var(--accent-bright)", stroke_width: "1",
+            fill: "none", stroke: palette.paint("--accent-bright"), stroke_width: "1",
             stroke_dasharray: "4 3", style: "pointer-events: none;",
         }
     }
@@ -1659,6 +1677,7 @@ pub fn TimelineBand() -> Element {
     let state = use_context::<Signal<AppState>>();
     let s = state.read();
     let project = &s.project;
+    let palette = s.theme.palette();
 
     // The pane reports its width once it is laid out. Until then a plausible
     // width keeps the first paint from being nonsense.
@@ -1752,9 +1771,9 @@ pub fn TimelineBand() -> Element {
                 }
             },
             div { class: "timeline-caption", "{caption}" }
-            svg { width: "{width}", height: "{height}", view_box: "0 0 {width} {height}",
+            svg { width: "{width}", height: "{height}", view_box: "0 0 {width} {height}", font_family: palette.font(),
                 line { x1: "{BAND_LEFT}", y1: "16", x2: "{width - BAND_RIGHT}", y2: "16",
-                    stroke: "var(--line)", stroke_width: "1" }
+                    stroke: palette.paint("--line"), stroke_width: "1" }
                 text { x: "{BAND_LEFT}", y: "11", class: "tl-minor",
                     "{crate::state::format_date(start)}" }
                 text { x: "{width - BAND_RIGHT}", y: "11", class: "tl-minor", text_anchor: "end",

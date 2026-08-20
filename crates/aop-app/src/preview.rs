@@ -38,7 +38,7 @@ pub fn mini_gantt(
     let rows: Vec<usize> = (0..project.tasks.len()).take(row_limit).collect();
     if rows.is_empty() {
         return rsx! {
-            svg { width: "{width}", height: "{height}",
+            svg { width: "{width}", height: "{height}", view_box: "0 0 {width} {height}",
                 if palette.ground != "none" {
                     rect { x: "0", y: "0", width: "{width}", height: "{height}", fill: "{palette.ground}" }
                 }
@@ -75,7 +75,7 @@ pub fn mini_gantt(
     let x = |at: chrono::NaiveDateTime| pad_x + (at - start).num_minutes() as f64 / span * usable;
 
     rsx! {
-        svg { width: "{width}", height: "{height}",
+        svg { width: "{width}", height: "{height}", view_box: "0 0 {width} {height}",
             if palette.ground != "none" {
                 rect { x: "0", y: "0", width: "{width}", height: "{height}", fill: "{palette.ground}" }
             }
