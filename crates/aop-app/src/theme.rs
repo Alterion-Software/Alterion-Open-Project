@@ -2150,93 +2150,75 @@ button { font: inherit; color: inherit; }
   white-space: nowrap;
 }
 
-/* Three rows: the column titles and the timescale, then the rows and the bars,
-   then a sideways scrollbar for each pane.
+/* Two panes side by side, each one box.
 
-   The headings are pinned by being in a different row from the thing that
-   scrolls, which is the only way to pin them here. Asking them to stay behind
-   as their rows go past makes each one a stacking context on this renderer,
-   and a stacking context is painted as its own layer outside the clip its pane
-   set up, so a heading pinned that way is drawn over the whole window instead.
-   See the note further down beside the table heading.
+   Each pane holds its own heading, its own rows and its own sideways
+   scrollbar, and clips all three once at its own edge. Nothing in here is a
+   scroll container: both panes are moved by the same two numbers, which is a
+   stronger guarantee that their rows stay level than two scroll positions kept
+   in step would be, and it is the only one available anyway, since scrolling a
+   box from code answers `NotSupported` on this renderer.
 
-   The rows are one scroll container holding both panes rather than two kept in
-   step. Keeping two in step is not open to us: scrolling a box from code
-   reports itself unsupported here, so the table and the chart share a single
-   position rather than copying one to the other. */
+   It was three rows before, a row of headings above a row of bodies above a
+   row of scrollbars, because the row of bodies was a scroll container and one
+   container holding both panes was how the two stayed level. That container is
+   also what stopped either pane from clipping: the headings clipped, the
+   scrollbars clipped, and the bodies, alone in being inside it, did not, so
+   the table's last columns were painted across the chart. Three rows of
+   identical markup with only the one inside the scroller failing is as plain
+   as evidence gets. */
 .split {
   flex: 1 1 auto;
   display: flex;
-  flex-direction: column;
+  align-items: stretch;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: var(--surface);
-  /* The sheet that catches a splitter or column drag covers this. */
+  /* The sheets that carry a splitter, a column or a scrollbar drag cover this,
+     and so does the bar down the right. */
   position: relative;
 }
 
-.split-heads { display: flex; align-items: stretch; flex: none; min-width: 0; }
-
-.split-bodies {
+.pane {
   display: flex;
-  align-items: flex-start;
-  flex: 1 1 auto;
+  flex-direction: column;
   min-width: 0;
   min-height: 0;
-  /* The one vertical scrollbar, at the far right of the window, carrying both
-     panes. Sideways is handled by the strips below, so it is shut off here. */
-  overflow-y: scroll;
-  overflow-x: hidden;
+  /* The whole point of the box. Its contents are wider and taller than it is,
+     and this is what stops them being painted over everything beside it. */
+  overflow: hidden;
+  background: var(--surface);
 }
 
-/* Started at the top rather than stretched. Stretching would give each pane
-   the height of the window and then clip its table to it, and a table clipped
-   to the window has nowhere left to scroll. The floor is so that a plan of
-   three tasks still paints its panes down to the bottom of the frame instead
-   of leaving a band of bare surface under them. */
-.split-bodies > * { min-height: 100%; }
+/* The left pane is as wide as the splitter was dragged to; the right takes
+   what is left. A basis of zero, not `auto`, because `auto` means "start from
+   the size of my contents" and the contents are the whole plan. */
+.pane.right { flex: 1 1 0; min-width: 120px; }
 
-.split-rails { display: flex; align-items: stretch; flex: none; min-width: 0; }
-
-/* A pane is cut off at its own edge and its contents are slid under it by the
-   strip at the bottom. The heading and the rows are slid by the same number,
-   which is what keeps a column title over its column. */
-/* A basis of zero, not `auto`.
-
-   `auto` means "start from the size of my contents", and the contents are the
-   whole table: a thousand pixels of columns inside a pane six hundred wide.
-   The box then wants to be as wide as the table, and a clipping box that is as
-   wide as what it holds clips nothing, which is why the last columns were
-   being painted over the splitter and across the chart. A basis of zero asks
-   for the room that is left instead, which is the pane, and then the clip has
-   something to do.
-
-   This is the second time this exact line has cost a day. The chart pane was
-   `flex: 1 1 auto` for the same reason and laid itself out over the table. */
-.shift-clip { flex: 1 1 0; min-width: 0; overflow: hidden; }
-/* Slid by a transform, not by a margin.
-
-   A margin is a layout property: moving it re-runs the layout of everything
-   inside, and what is inside is a table of fifty rows and eight columns. Once
-   per frame of a drag, that is what made scrolling sideways feel like it was
-   catching. A transform is a paint property; the boxes stay exactly where they
-   were and only the painting moves. */
-.shift { display: flex; align-items: stretch; }
+.pane-head { flex: none; overflow: hidden; }
+.pane-body { flex: 1 1 0; min-height: 0; overflow: hidden; }
 
 /* Always there, whether or not there is anywhere to go, so the bottom edge of
    the window does not move as columns are widened. */
-.rail {
-  flex: 1 1 auto;
-  min-width: 0;
+.pane-rail {
+  flex: none;
   height: 11px;
   position: relative;
   background: var(--surface-2);
   border-top: 1px solid var(--line);
 }
 
-/* The bar down the right, over the rows. Fourteen pixels of track, drawn on
-   top of the pane rather than beside it, because both panes fill the split and
+/* Slid by a transform, not by a margin.
+
+   A margin is a layout property: moving it re-runs the layout of everything
+   inside, and what is inside is a table of fifty rows and eight columns. Once
+   per frame of a drag, that is what made scrolling feel like it was catching.
+   A transform is a paint property; the boxes stay where they are and only the
+   painting moves. */
+.shift { display: flex; align-items: stretch; }
+
+/* The bar down the right, over both panes, because they fill the split and
    there is no column left to give it. */
 .vbar {
   position: absolute;
@@ -2250,11 +2232,10 @@ button { font: inherit; color: inherit; }
 
 /* The part that says where you are.
 
-   Drawn by hand, because the renderer's own is an overlay that fades out a
-   moment after the last scroll: most of the time there was nothing on screen
-   to say that there was more of the plan below or to the right. This one does
-   not fade. It also takes no pointer, so a press goes through to the
-   renderer's thumb underneath, which is the one that knows how to be dragged. */
+   Drawn by hand. The renderer has its own, but they are overlays that fade a
+   moment after the last scroll, and a faded thumb cannot even be taken hold
+   of: at rest there was nothing on screen and nothing to grab. These do not
+   fade, and they carry their own drag. */
 .thumb {
   position: absolute;
   background: var(--ink-faint);
@@ -2264,66 +2245,24 @@ button { font: inherit; color: inherit; }
 }
 .thumb.down { right: 2px; width: 7px; min-height: 24px; }
 .thumb.across { bottom: 2px; height: 7px; min-width: 24px; }
-/* The one you can take hold of says so. */
 .thumb.live { pointer-events: auto; cursor: default; }
 .thumb.live:hover { opacity: 0.8; }
 
-/* The splitter runs through all three rows so the line between the panes is
-   unbroken. The one in the bottom row is only the line: there is nothing worth
-   dragging across fourteen pixels. */
-.splitter.ghost { cursor: default; }
-.splitter.ghost::after { display: none; }
-
-/* The right-hand column of every row of the split. */
-.chart-cell {
-  /* A basis of zero, not `auto`. `auto` means "start from the size of my
-     contents", and the contents are a chart spanning the whole plan, thousands
-     of pixels wide; the chart would then ask for all of it and lay itself out
-     starting where the table should be. A basis of zero asks for what is left,
-     which is what a pane beside a sized one should do. */
-  flex: 1 1 0;
-  /* The other half of the mirror with `.pane-left`. Without this the chart
-     shrinks to nothing and the table takes the window. */
-  min-width: 120px;
-  display: flex;
-  align-items: stretch;
-  overflow: hidden;
-}
-
-.split.hide-table .pane-left { display: none; }
-.split.hide-chart .chart-cell { display: none; }
+.split.hide-table .pane.left { display: none; }
+.split.hide-table .splitter { display: none; }
+.split.hide-chart .pane.right { display: none; }
 
 /* One window, so no second pane and no splitter to leave room for. */
-.split.solo .chart-cell { min-width: 0; }
+.split.solo .pane { flex: 1 1 auto; min-width: 0; }
 
-/* Maximising one pane should look the same whichever pane it is, and it did
-   not. The chart is `flex: 1 1 auto` and simply took the space the table left
-   behind; the table is `flex: none` at the width the splitter gave it, so
-   hiding the chart left it exactly as wide as it was with a gap beside it.
-   Both grow now, and only while the other is hidden. */
-.split.hide-chart .pane-left { flex: 1 1 auto; }
 /* Nothing to drag when there is nothing on the other side of it. */
 .split.hide-chart .splitter { display: none; }
 
-.pane-left {
-  display: flex;
-  align-items: stretch;
-  /* Shrinkable, so the chart's own minimum can push back on it, and floored
-     at the same width the chart is floored at. The two constraints are then
-     mirrored by construction rather than by arithmetic that has to know how
-     wide the window is. */
-  flex: 0 1 auto;
-  min-width: 120px;
-  /* Clipped, because it can now be squeezed narrower than what is inside it.
-     While this pane was `flex: none` it was always exactly as wide as the grid
-     it holds and nothing could spill; giving the chart a floor made this pane
-     shrinkable, and a shrinkable box holding a fixed width child paints that
-     child straight out through its own edge unless it is told not to.
-     The scrolling belongs to the split around it, which is the thing that
-     knows how far there is to go. */
-  overflow: hidden;
-  background: var(--surface);
-}
+/* The left pane, as wide as the splitter was dragged to. Shrinkable, so the
+   right pane's own floor can push back on it, and floored at the same width,
+   so the two constraints mirror each other by construction rather than by
+   arithmetic that has to know how wide the window is. */
+.pane.left { flex: 0 1 auto; min-width: 120px; }
 
 .splitter {
   position: relative;
@@ -4831,7 +4770,7 @@ mod pane_floor_tests {
             let end = rest.find(';').expect("a semicolon");
             rest[..end].trim()
         }
-        assert_eq!(floor(".pane-left {"), floor(".chart-cell {"));
+        assert_eq!(floor(".pane.left {"), floor(".pane.right {"));
     }
 
     #[test]
@@ -4839,7 +4778,7 @@ mod pane_floor_tests {
         // A floor on the chart does nothing unless the table can give way. It
         // was `flex: none`, which cannot, so the chart's minimum would have
         // been ignored and the table would still have taken the window.
-        let at = CSS.find(".pane-left {").expect(".pane-left");
+        let at = CSS.find(".pane.left {").expect(".pane.left");
         let block = &CSS[at..at + CSS[at..].find('}').expect("a closing brace")];
         assert!(
             !block.contains("flex: none"),
@@ -4863,18 +4802,18 @@ mod pane_clip_tests {
     fn a_pane_that_can_shrink_also_clips() {
         // These two go together and the pairing is easy to break: a pane made
         // shrinkable without being clipped paints its contents out through its
-        // own edge and across whatever is beside it, which is what happened
-        // the moment the chart was given a floor.
-        for selector in [".pane-left {", ".chart-cell {"] {
-            let block = rule(selector);
-            let shrinkable = !block.contains("flex: none");
-            if shrinkable {
-                assert!(
-                    block.contains("overflow: hidden") || block.contains("overflow: auto"),
-                    "{selector} can be squeezed narrower than its contents, so it has \
-                     to clip them"
-                );
-            }
+        // own edge and across whatever is beside it, which is exactly what the
+        // table did to the chart for most of a day.
+        let block = rule(".pane {");
+        assert!(
+            block.contains("overflow: hidden"),
+            "a pane is narrower than the plan it holds, so it has to clip it"
+        );
+        for selector in [".pane.left {", ".pane.right {"] {
+            assert!(
+                !rule(selector).contains("flex: none"),
+                "{selector} has to give way to the other pane's floor"
+            );
         }
     }
 }
@@ -4901,7 +4840,7 @@ mod tab_bar_tests {
             let rest = &block[at + "min-width:".len()..];
             rest[..rest.find(';').expect("a semicolon")].trim()
         }
-        assert_eq!(floor(rule(".pane-tab.grow {")), floor(rule(".chart-cell {")));
+        assert_eq!(floor(rule(".pane-tab.grow {")), floor(rule(".pane.right {")));
     }
 }
 
@@ -4971,58 +4910,52 @@ mod pinned_heading_tests {
     }
 
     #[test]
-    fn a_heading_is_not_in_the_box_that_scrolls() {
-        // This is the whole of how a heading stays put here, and it is one
-        // edit away from being undone: give the heading row an overflow and it
-        // becomes a scroller of its own, and the titles wander off from the
-        // columns they name. The heading row must not scroll; the row under it
-        // must.
-        let heads = rule(".split-heads {");
-        assert!(
-            !heads.contains("overflow: auto")
-                && !heads.contains("overflow: scroll")
-                && !heads.contains("overflow-y:"),
-            "the heading row must not scroll, or the headings are back inside \
-             the thing they are meant to sit above"
-        );
-        assert!(
-            rule(".split-bodies {").contains("overflow-y: scroll"),
-            "the rows are the one scroll container the two panes share"
-        );
-    }
-
-    #[test]
-    fn both_panes_scroll_down_together_because_there_is_only_one_of_them() {
-        // Two scroll containers cannot be kept in step on this renderer:
-        // scrolling a box from code answers `NotSupported`. So there is one,
-        // holding both panes, and neither pane may quietly become another.
-        for selector in [".chart-cell {", ".shift-clip {", ".grid-body {", ".chart-body {"] {
+    fn nothing_in_the_split_scrolls_itself() {
+        // This is load bearing twice over.
+        //
+        // It is how the two panes stay level: they are moved by one pair of
+        // numbers rather than by two scroll positions kept in step, and
+        // keeping two in step is not open to us anyway, since scrolling a box
+        // from code answers `NotSupported` here.
+        //
+        // And it is how they clip at all. While the bodies sat inside a scroll
+        // container, the headings clipped, the scrollbars clipped, and the
+        // bodies did not, so the table's last columns were painted across the
+        // chart. Give any of these an overflow that scrolls and both go.
+        for selector in [".split {", ".pane {", ".pane-head {", ".pane-body {"] {
             let block = rule(selector);
             assert!(
-                !block.contains("overflow-y: auto")
-                    && !block.contains("overflow-y: scroll")
-                    && !block.contains("overflow: auto")
-                    && !block.contains("overflow: scroll"),
-                "{selector} must not scroll downwards, or its rows part company \
-                 with the other pane's"
+                !block.contains("overflow: auto")
+                    && !block.contains("overflow: scroll")
+                    && !block.contains("overflow-y: auto")
+                    && !block.contains("overflow-y: scroll"),
+                "{selector} must not scroll itself"
             );
         }
     }
 
     #[test]
+    fn a_heading_is_not_in_the_box_the_rows_are_in() {
+        // The heading stays put because it is in a different box from the
+        // rows, and for no other reason. Asking it to stay behind instead, with
+        // `position: sticky`, makes it a stacking context on this renderer and
+        // paints it over the whole window.
+        assert!(rule(".pane-head {").contains("flex: none"));
+        assert!(rule(".pane-body {").contains("flex: 1 1 0"));
+    }
+
+    #[test]
     fn the_sideways_bar_is_always_there() {
         // Asked for in as many words: the scrollbars should show whenever
-        // there is anywhere to scroll to. The renderer's own do not: they are
-        // overlays that fade out a moment after the last scroll, and a faded
-        // thumb cannot even be taken hold of, so at rest there was nothing on
-        // screen and nothing to grab. These are drawn, and drawn things do not
-        // fade unless something animates them.
-        for selector in [".rail {", ".vbar {"] {
+        // there is anywhere to scroll to. The renderer's own do not, being
+        // overlays that fade a moment after the last scroll, and a faded thumb
+        // cannot even be taken hold of. These are drawn, and drawn things do
+        // not fade unless something animates them.
+        for selector in [".pane-rail {", ".vbar {"] {
             let block = rule(selector);
             assert!(
                 block.contains("height:") || block.contains("width:"),
-                "{selector} is a fixture with a size of its own, not something \
-                 that appears when it feels like it"
+                "{selector} is a fixture with a size of its own"
             );
         }
         let thumb = rule(".thumb {");
@@ -5031,13 +4964,8 @@ mod pinned_heading_tests {
             "the whole point of drawing the thumb is that it stays put"
         );
         assert!(
-            thumb.contains("pointer-events: none"),
-            "the drawn thumb sits over the renderer's own, so it must let a \
-             press through to whatever is underneath"
-        );
-        assert!(
             rule(".thumb.live {").contains("pointer-events: auto"),
-            "the one that carries a drag has to be able to catch it"
+            "a scrollbar you cannot take hold of is not a scrollbar"
         );
     }
 }
@@ -5058,7 +4986,8 @@ mod clip_box_tests {
         // that never clips anything. It has cost this build a day twice: once
         // as the chart pane laying itself out over the table, once as the
         // table's last columns painted across the chart.
-        for selector in [".shift-clip {", ".chart-cell {"] {
+        {
+            let selector = ".pane.right {";
             let block = rule(selector);
             assert!(
                 block.contains("flex: 1 1 0"),

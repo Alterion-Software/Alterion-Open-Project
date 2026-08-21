@@ -834,8 +834,11 @@ fn SplitPanes(
     // what the offset was then. Tracked from where it started rather than from
     // the thumb, so a pointer moving faster than the thumb cannot drop it.
     let mut rail_drag = use_signal(|| RailDrag::None);
+    // The bar down the right, being dragged: where the pointer started and what
+    // the offset was then.
+    let mut down_drag = use_signal(|| None::<(f64, f64)>);
     let reach = use_context::<Signal<Reach>>();
-    let mut grid_scroll = use_context::<GridScroll>().0;
+    let grid_scroll = use_context::<GridScroll>().0;
     let mut chart_scroll = use_context::<ChartScroll>().0;
 
     let (grid_width, focus, rows_len) = {
@@ -883,6 +886,26 @@ fn SplitPanes(
         }
     });
 
+    // How much of the plan is on screen, in pixels.
+    //
+    // An estimate, from the window less everything stacked above and below the
+    // panes. It used to come from the scroll container's own report of its
+    // height, and there is no scroll container any more; measuring the box
+    // instead means `get_client_rect`, which takes the document's `RefCell`
+    // and is the call that was killing the process. What hangs on it is how
+    // big the thumb is drawn and how far the last row can be pulled up, and
+    // both are forgiving of being a little out.
+    {
+        let (_, tall) = use_context::<Signal<crate::state::Viewport>>()();
+        let port = (tall - CHROME_H).max(120.0);
+        if (down().1 - port).abs() >= 1.0 {
+            let at = down().0;
+            down.set((at, port));
+        }
+    }
+
+    let panes = (use_context::<GridScroll>(), use_context::<ChartScroll>());
+
     let shift = shifted();
     let far = reach();
     // How wide each pane is, for sizing the scrollbar thumbs. Taken from the
@@ -912,9 +935,11 @@ fn SplitPanes(
     let left_cell = if focus == PaneFocus::TableOnly {
         "flex: 1 1 auto;".to_string()
     } else {
+        // The splitter is a box of its own beside the pane now, not a child
+        // of it, so the pane is exactly the width the splitter was dragged to.
         format!(
             "width: {}px; flex: 0 1 auto; min-width: {}px;",
-            grid_width + SPLITTER_W,
+            grid_width,
             crate::state::AppState::MIN_PANE
         )
     };
@@ -1078,124 +1103,106 @@ fn SplitPanes(
                         }
                     }
 
-                    // ---- the headings -----------------------------------
-                    //
-                    // Above the box that scrolls, not inside it, which is the
-                    // whole of how they stay put. Asking them to stay behind
-                    // instead, with `position: sticky`, makes each one a layer
-                    // of its own here and paints it over the window.
-                    div { class: "split-heads",
-                        div { class: "pane-left", style: "{left_cell}",
-                            div { class: "shift-clip",
-                                div { class: "shift", style: "transform: translateX(-{shift.table}px);",
-                                    {left_head}
+                    // And once more for the bar down the right.
+                    if down_drag().is_some() {
+                        div {
+                            class: "drag-shield",
+                            onmousemove: move |event| {
+                                let Some((from_y, from_at)) = down_drag() else {
+                                    return;
+                                };
+                                let (_, port) = down();
+                                let content = rows_len as f64 * gantt::ROW_H;
+                                if port <= 1.0 || content <= port {
+                                    return;
                                 }
-                            }
-                            Splitter { on_grab: move |x| {
-                                let width = state.read().table_view_width();
-                                resize_from.set(Some((x, width)));
-                            } }
-                        }
-                        div { class: "chart-cell",
-                            div { class: "shift-clip",
-                                div { class: "shift", style: "transform: translateX(-{shift.chart}px);",
-                                    {right_head}
+                                let moved = event.client_coordinates().y - from_y;
+                                let at = (from_at + moved * content / port)
+                                    .clamp(0.0, content - port);
+                                if (at - down().0).abs() >= 0.5 {
+                                    down.set((at, port));
+                                    settle(at, port, rows_len, panes);
                                 }
-                            }
+                            },
+                            onmouseup: move |_| down_drag.set(None),
                         }
                     }
 
-                    // ---- the rows ---------------------------------------
+                    // ---- the two panes ----------------------------------
                     //
-                    // One scroll container holding both panes. That is what
-                    // makes their rows stay level: not two positions kept in
-                    // step, but one position. Keeping two in step is not open
-                    // to us anyway, since scrolling a box from code reports
-                    // itself unsupported on this renderer.
-                    div {
-                        class: "split-bodies",
-                        onscroll: move |event| {
-                            let data = event.data();
-                            let top = data.scroll_top();
-                            let height = data.client_height() as f64;
-                            // Written only when a different set of rows is on
-                            // screen. Every frame of a scroll would redraw both
-                            // panes to show the same rows again.
-                            let was = grid_scroll();
-                            let now = PaneScroll { top, height, ..was };
-                            if was.window(rows_len) != now.window(rows_len) {
-                                grid_scroll.set(now);
+                    // One box each, and each one clips its own contents once.
+                    //
+                    // They used to be three rows of the split, a row of
+                    // headings above a row of bodies above a row of scrollbars,
+                    // because the row of bodies was a scroll container and one
+                    // scroll container holding both panes is how their rows
+                    // stayed level. It also stopped either pane from clipping:
+                    // the headings clipped, the scrollbars clipped, and the
+                    // bodies, alone in being inside that container, did not, so
+                    // the table's last columns were painted across the chart.
+                    // Three rows with identical markup and only the one inside
+                    // the scroller failing is as plain as evidence gets.
+                    //
+                    // So nothing here scrolls itself. Both panes are moved by
+                    // the same two numbers, which is a stronger guarantee than
+                    // two scroll positions kept in step, and the boxes are
+                    // ordinary clipped boxes again.
+                    div { class: "pane left", style: "{left_cell}",
+                        div { class: "pane-head",
+                            div { class: "shift", style: "transform: translateX(-{shift.table}px);",
+                                {left_head}
                             }
-                            let was = chart_scroll();
-                            let now = PaneScroll { top, height, ..was };
-                            if was.window(rows_len) != now.window(rows_len) {
-                                chart_scroll.set(now);
-                            }
-                            if down() != (top, height) {
-                                down.set((top, height));
-                            }
-                        },
-                        div { class: "pane-left", style: "{left_cell}",
-                            div { class: "shift-clip",
-                                div { class: "shift", style: "transform: translateX(-{shift.table}px);",
-                                    {left_body}
-                                }
-                            }
-                            Splitter { on_grab: move |x| {
-                                let width = state.read().table_view_width();
-                                resize_from.set(Some((x, width)));
-                            } }
                         }
-                        div { class: "chart-cell",
-                            div { class: "shift-clip",
-                                div { class: "shift", style: "transform: translateX(-{shift.chart}px);",
-                                    {right_body}
-                                }
+                        div {
+                            class: "pane-body",
+                            onwheel: move |event| wheel(event, &mut down, rows_len, panes),
+                            div {
+                                class: "shift",
+                                style: "transform: translate(-{shift.table}px, -{down().0}px);",
+                                {left_body}
                             }
+                        }
+                        div { class: "pane-rail",
+                            {thumb(false, shift.table, ports.table, far.table, Some(EventHandler::new(move |x| {
+                                rail_drag.set(Some((RailSide::Table, x, shifted().table)));
+                            })))}
                         }
                     }
 
-                    // ---- the bar down the right --------------------------
-                    //
-                    // Over the rows rather than beside them: the panes fill the
-                    // split and there is no column left to give it. It takes no
-                    // pointer, because the renderer's own thumb is in the same
-                    // place and knows how to be dragged; this one is only there
-                    // to be seen, which the renderer's is not for long.
+                    Splitter { on_grab: move |x| {
+                        let width = state.read().table_view_width();
+                        resize_from.set(Some((x, width)));
+                    } }
+
+                    div { class: "pane right",
+                        div { class: "pane-head",
+                            div { class: "shift", style: "transform: translateX(-{shift.chart}px);",
+                                {right_head}
+                            }
+                        }
+                        div {
+                            class: "pane-body",
+                            onwheel: move |event| wheel(event, &mut down, rows_len, panes),
+                            div {
+                                class: "shift",
+                                style: "transform: translate(-{shift.chart}px, -{down().0}px);",
+                                {right_body}
+                            }
+                        }
+                        div { class: "pane-rail",
+                            {thumb(false, shift.chart, ports.chart, far.chart, Some(EventHandler::new(move |x| {
+                                rail_drag.set(Some((RailSide::Chart, x, shifted().chart)));
+                            })))}
+                        }
+                    }
+
+                    // The bar down the right, over both panes, because they
+                    // fill the split and there is no column left to give it.
                     div { class: "vbar",
-                        {thumb(true, down().0, down().1, rows_len as f64 * gantt::ROW_H, None)}
-                    }
-
-                    // ---- the sideways bars -------------------------------
-                    //
-                    // A strip of its own along the bottom of each pane rather
-                    // than the pane scrolling itself. A box that scrolls puts
-                    // its bar at the far edge of what it holds, and what these
-                    // hold is a plan hundreds of rows deep, so the bar would be
-                    // somewhere below the bottom of the window. Here it is
-                    // always where it can be reached, and always showing.
-                    div { class: "split-rails",
-                        div { class: "pane-left", style: "{left_cell}",
-                            Rail {
-                                content: far.table,
-                                port: ports.table,
-                                at: shift.table,
-                                on_grab: move |x| {
-                                    rail_drag.set(Some((RailSide::Table, x, shifted().table)));
-                                },
-                            }
-                            div { class: "splitter ghost" }
-                        }
-                        div { class: "chart-cell",
-                            Rail {
-                                content: far.chart,
-                                port: ports.chart,
-                                at: shift.chart,
-                                on_grab: move |x| {
-                                    rail_drag.set(Some((RailSide::Chart, x, shifted().chart)));
-                                },
-                            }
-                        }
+                        {thumb(true, down().0, down().1, rows_len as f64 * gantt::ROW_H,
+                               Some(EventHandler::new(move |y| {
+                                   down_drag.set(Some((y, down().0)));
+                               })))}
                     }
                 }
             }
@@ -1213,12 +1220,23 @@ fn SplitPanes(
 fn SoloGrid() -> Element {
     let mut shifted = use_signal(Shifted::default);
     let reach = use_context::<Signal<Reach>>();
-    let mut grid_scroll = use_context::<GridScroll>().0;
+    let grid_scroll = use_context::<GridScroll>().0;
     let mut column_drag = use_context::<Signal<ColumnDrag>>();
     let mut state = use_context::<Signal<AppState>>();
     let rows_len = state.read().layout_rows().len();
     let shift = shifted();
     let mut rail_drag = use_signal(|| RailDrag::None);
+    let mut down_drag = use_signal(|| None::<(f64, f64)>);
+    let mut down = use_signal(|| (0.0f64, 0.0f64));
+    let panes = (use_context::<GridScroll>(), use_context::<ChartScroll>());
+    {
+        let (_, tall) = use_context::<Signal<crate::state::Viewport>>()();
+        let seen = (tall - CHROME_H).max(120.0);
+        if (down().1 - seen).abs() >= 1.0 {
+            let at = down().0;
+            down.set((at, seen));
+        }
+    }
     // One window, so the pane is the window less the frame around it.
     let port = {
         let (wide, _) = use_context::<Signal<crate::state::Viewport>>()();
@@ -1240,72 +1258,131 @@ fn SoloGrid() -> Element {
                     onmouseup: move |_| column_drag.set(None),
                 }
             }
-            div { class: "split-heads",
-                div { class: "chart-cell",
-                    div { class: "shift-clip",
-                        div { class: "shift", style: "transform: translateX(-{shift.table}px);",
-                            grid::TaskGrid { part: Part::Head }
-                        }
+            div { class: "pane",
+                div { class: "pane-head",
+                    div { class: "shift", style: "transform: translateX(-{shift.table}px);",
+                        grid::TaskGrid { part: Part::Head }
                     }
                 }
-            }
-            div {
-                class: "split-bodies",
-                onscroll: move |event| {
-                    let data = event.data();
-                    let was = grid_scroll();
-                    let now = PaneScroll {
-                        top: data.scroll_top(),
-                        height: data.client_height() as f64,
-                        ..was
-                    };
-                    if was.window(rows_len) != now.window(rows_len) {
-                        grid_scroll.set(now);
-                    }
-                },
-                div { class: "chart-cell",
-                    div { class: "shift-clip",
-                        div { class: "shift", style: "transform: translateX(-{shift.table}px);",
-                            grid::TaskGrid { part: Part::Body }
-                        }
+                div {
+                    class: "pane-body",
+                    onwheel: move |event| wheel(event, &mut down, rows_len, panes),
+                    div {
+                        class: "shift",
+                        style: "transform: translate(-{shift.table}px, -{down().0}px);",
+                        grid::TaskGrid { part: Part::Body }
                     }
                 }
+                div { class: "pane-rail",
+                    {thumb(false, shift.table, port, reach().table, Some(EventHandler::new(move |x| {
+                        rail_drag.set(Some((RailSide::Table, x, shifted().table)));
+                    })))}
+                }
             }
-            div { class: "split-rails",
-                div { class: "chart-cell",
-                    Rail {
-                        content: reach().table,
-                        port,
-                        at: shift.table,
-                        on_grab: move |x| {
-                            rail_drag.set(Some((RailSide::Table, x, shifted().table)));
-                        },
-                    }
-                    if rail_drag().is_some() {
-                        div {
-                            class: "drag-shield",
-                            onmousemove: move |event| {
-                                let Some((_, from_x, from_at)) = rail_drag() else {
-                                    return;
-                                };
-                                let content = reach().table;
-                                if port <= 1.0 || content <= port {
-                                    return;
-                                }
-                                let moved = event.client_coordinates().x - from_x;
-                                let at = (from_at + moved * content / port)
-                                    .clamp(0.0, content - port);
-                                let now = shifted();
-                                if now.table != at {
-                                    shifted.set(Shifted { table: at, ..now });
-                                }
-                            },
-                            onmouseup: move |_| rail_drag.set(None),
+            div { class: "vbar",
+                {thumb(true, down().0, down().1, rows_len as f64 * gantt::ROW_H,
+                       Some(EventHandler::new(move |y| {
+                           down_drag.set(Some((y, down().0)));
+                       })))}
+            }
+            if rail_drag().is_some() {
+                div {
+                    class: "drag-shield",
+                    onmousemove: move |event| {
+                        let Some((_, from_x, from_at)) = rail_drag() else { return };
+                        let content = reach().table;
+                        if port <= 1.0 || content <= port {
+                            return;
                         }
-                    }
+                        let moved = event.client_coordinates().x - from_x;
+                        let at = (from_at + moved * content / port).clamp(0.0, content - port);
+                        let now = shifted();
+                        if now.table != at {
+                            shifted.set(Shifted { table: at, ..now });
+                        }
+                    },
+                    onmouseup: move |_| rail_drag.set(None),
+                }
+            }
+            if down_drag().is_some() {
+                div {
+                    class: "drag-shield",
+                    onmousemove: move |event| {
+                        let Some((from_y, from_at)) = down_drag() else { return };
+                        let (_, tall) = down();
+                        let content = rows_len as f64 * gantt::ROW_H;
+                        if tall <= 1.0 || content <= tall {
+                            return;
+                        }
+                        let moved = event.client_coordinates().y - from_y;
+                        let at = (from_at + moved * content / tall).clamp(0.0, content - tall);
+                        if (at - down().0).abs() >= 0.5 {
+                            down.set((at, tall));
+                            settle(at, tall, rows_len, panes);
+                        }
+                    },
+                    onmouseup: move |_| down_drag.set(None),
                 }
             }
         }
+    }
+}
+
+/// Everything stacked above and below the panes: the ribbon, the timeline, the
+/// view bar, the tabs, the sideways scrollbar and the status line.
+///
+/// Used only to guess how much of the plan is on screen, which decides how big
+/// the thumb is drawn and how far the last row can be pulled up. Being a little
+/// out costs a slightly wrong thumb, not a wrong plan.
+const CHROME_H: f64 = 330.0;
+
+/// Move both panes together by a turn of the wheel.
+///
+/// Nothing in the split is a scroll container, so this is the whole of how a
+/// wheel moves the plan. Both panes read the same number, which is why their
+/// rows cannot come apart: there is one position, not two being kept in step.
+fn wheel(
+    event: Event<WheelData>,
+    down: &mut Signal<(f64, f64)>,
+    rows: usize,
+    panes: (GridScroll, ChartScroll),
+) {
+    // A wheel reports in pixels on some devices and in lines on others, and a
+    // line is not a pixel.
+    let (at, port) = down();
+    let step = match event.data().delta() {
+        dioxus::html::geometry::WheelDelta::Pixels(v) => v.y,
+        dioxus::html::geometry::WheelDelta::Lines(v) => v.y * 20.0,
+        dioxus::html::geometry::WheelDelta::Pages(v) => v.y * port,
+    };
+    // A plan is a long list, and one notch moving three rows makes getting
+    // down it feel like work.
+    const SPEED: f64 = 1.8;
+    let content = rows as f64 * gantt::ROW_H;
+    let next = (at + step * SPEED).clamp(0.0, (content - port).max(0.0));
+    if (next - at).abs() >= 0.5 {
+        down.set((next, port));
+        settle(next, port, rows, panes);
+    }
+}
+
+/// Tell both panes which rows are on screen now.
+///
+/// Only when the answer has changed. Moving the panes is a transform and costs
+/// nothing to redraw; working out which rows exist at all is the expensive
+/// part, and that only changes once a block of them has gone by.
+fn settle(at: f64, port: f64, rows: usize, (grid, chart): (GridScroll, ChartScroll)) {
+    let mut grid = grid.0;
+    let was = grid();
+    let now = PaneScroll { top: at, height: port, ..was };
+    if was.window(rows) != now.window(rows) {
+        grid.set(now);
+    }
+    let mut chart = chart.0;
+    let was = chart();
+    let now = PaneScroll { top: at, height: port, ..was };
+    if was.window(rows) != now.window(rows) {
+        chart.set(now);
     }
 }
 
