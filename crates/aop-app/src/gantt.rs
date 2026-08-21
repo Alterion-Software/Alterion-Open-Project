@@ -659,7 +659,7 @@ pub fn GanttChart(
                                 g { key: "mj{index}",
                                     line { x1: "{x}", y1: "0", x2: "{x}", y2: "{TIER_H}",
                                         stroke: palette.paint("--line"), stroke_width: "1" }
-                                    text { class: "tl-major", x: "{x + w / 2.0}", y: "13",
+                                    text { class: "tl-major", x: "{x + w / 2.0}", y: "13", font_size: "10",
                                         text_anchor: "middle", fill: palette.paint("--ink"),
                                         "{label}" }
                                 }
@@ -683,7 +683,7 @@ pub fn GanttChart(
                                 g { key: "mn{index}",
                                     line { x1: "{x}", y1: "{TIER_H}", x2: "{x}", y2: "{HEADER_H}",
                                         stroke: palette.paint("--line"), stroke_width: "1" }
-                                    text { class: "{class}", x: "{x + w / 2.0}", y: "{TIER_H + 13.0}",
+                                    text { class: "{class}", x: "{x + w / 2.0}", y: "{TIER_H + 13.0}", font_size: "10",
                                         text_anchor: "middle", fill: palette.paint(tint),
                                         "{label}" }
                                 }
@@ -1042,7 +1042,7 @@ pub fn GanttChart(
                                 }
 
                                 if bar_text && !label.is_empty() {
-                                    text { class: "bar-label", x: "{right + 6.0}", y: "{centre + 0.5}",
+                                    text { class: "bar-label", x: "{right + 6.0}", y: "{centre + 0.5}", font_size: "10",
                                         fill: palette.paint("--ink-soft"), "{label}" }
                                 }
                             }
@@ -1808,9 +1808,9 @@ pub fn TimelineBand() -> Element {
                 style: "width: {width}px; height: {height}px; flex: none;",
                 line { x1: "{BAND_LEFT}", y1: "16", x2: "{width - BAND_RIGHT}", y2: "16",
                     stroke: palette.paint("--line"), stroke_width: "1" }
-                text { x: "{BAND_LEFT}", y: "11", class: "tl-minor", fill: palette.paint("--ink-soft"),
+                text { x: "{BAND_LEFT}", y: "11", class: "tl-minor", font_size: "10", fill: palette.paint("--ink-soft"),
                     "{crate::state::format_date(start)}" }
-                text { x: "{width - BAND_RIGHT}", y: "11", class: "tl-minor", text_anchor: "end", fill: palette.paint("--ink-soft"),
+                text { x: "{width - BAND_RIGHT}", y: "11", class: "tl-minor", text_anchor: "end", font_size: "10", fill: palette.paint("--ink-soft"),
                     "{crate::state::format_date(finish)}" }
 
                 for (slot, (band, lane)) in placed.into_iter().enumerate() {
@@ -1840,10 +1840,16 @@ pub fn TimelineBand() -> Element {
                         let label_class = if band.inside { "band-label in" } else { "band-label" };
                         // Pale shades need dark ink, dark shades need pale.
                         let label_ink = if band.inside { shade(&fill, -0.75) } else { String::new() };
+                        // Size and colour on the element, not from the class.
+                        // A stylesheet class does not reach inside an inline
+                        // SVG here, so `.band-label { font-size: 10px }` never
+                        // applied and these labels were drawn at whatever they
+                        // inherited, which is why the band came out looking
+                        // like a headline whenever it was rebuilt.
                         let label_style = if band.inside {
-                            format!("fill: {label_ink};")
+                            format!("font-size: 10px; fill: {label_ink};")
                         } else {
-                            String::new()
+                            format!("font-size: 10px; fill: {};", palette.paint("--ink-soft"))
                         };
                         rsx! {
                             g { key: "tb{band.index}",

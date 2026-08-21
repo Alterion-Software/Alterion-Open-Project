@@ -2042,7 +2042,7 @@ button { font: inherit; color: inherit; }
 /* The chart's tab grows into whatever is left, exactly as the chart pane does,
    and stops at the same floor. Both rows then resolve to the same widths under
    the same constraints, which is the only way a tab stays over its own pane. */
-.pane-tab.grow { flex: 1 1 auto; min-width: 120px; }
+.pane-tab.grow { flex: 1 1 0; min-width: 120px; }
 .pane-tab.active { color: var(--accent-bright); background: var(--surface-3); }
 /* The name takes the slack, so the button lands on the tab's right edge
    whether or not there is a subtitle to sit beside it. */
@@ -2600,7 +2600,14 @@ button { font: inherit; color: inherit; }
 /* ---------- gantt chart ---------- */
 
 .chart-pane {
-  flex: 1 1 auto;
+  /* A basis of zero, not `auto`. `auto` means "start from the size of my
+     contents", and the contents here are a chart spanning the whole plan,
+     thousands of pixels wide. The chart then asks for all of it, and since the
+     table pane became shrinkable so this one could have a floor, the table is
+     squeezed to that floor and the chart is laid out starting where the table
+     should be. A basis of zero asks for what is left instead, which is what a
+     pane beside a sized one should do. */
+  flex: 1 1 0;
   /* The other half of the mirror. Without this the chart shrinks to nothing
      and the table takes the window. */
   min-width: 120px;
