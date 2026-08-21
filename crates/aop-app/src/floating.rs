@@ -134,69 +134,100 @@ impl Default for Layer {
 /// A direct child of the root and nothing else, which is the entire point: its
 /// children's parent is the window, so `absolute` reaches the window the same
 /// way `fixed` was meant to.
+/// Renders whatever panel is up, at the root of the application.
+///
+/// A direct child of the root and nothing else, which is the entire point: its
+/// children's parent is the window, so `absolute` reaches the window the same
+/// way `fixed` was meant to.
+///
+/// **The shape it returns never changes**, and that is deliberate rather than
+/// tidy. Returning an empty `rsx!` when nothing is up and a two element tree
+/// when something is gives this component two different templates, and every
+/// row being a `button` except separators being a `div` gives its list two
+/// more. Dioxus addresses nodes by a path through the template it expects, so
+/// a template that changes underneath a diff sends `assign_node_id` walking
+/// into a child that is not there, and `blitz_dom` says `invalid key` and
+/// takes the process down. Same markup every time, hidden when there is
+/// nothing to show, and one element type for every row.
 #[component]
 pub fn Host() -> Element {
     let layer = use_context::<Layer>();
     let panel = layer.0.read().clone();
-    let Some(panel) = panel else {
-        return rsx! {};
-    };
 
-    let (x, y) = panel.at;
-    let sizing = match panel.width {
+    let showing = panel.is_some();
+    let (x, y) = panel.as_ref().map(|p| p.at).unwrap_or((0.0, 0.0));
+    let sizing = match panel.as_ref().and_then(|p| p.width) {
         Some(w) => format!("width: {w}px;"),
-        None => format!("min-width: {}px;", panel.min_width),
+        None => format!("min-width: {}px;", panel.as_ref().map(|p| p.min_width).unwrap_or(0.0)),
     };
-    let on_close = panel.on_close;
-    let on_pick = panel.on_pick;
+    let hidden = if showing { "" } else { "display: none;" };
+    let chosen = panel.as_ref().map(|p| p.chosen.clone()).unwrap_or_default();
+    let rows: Vec<Row> = panel.as_ref().map(|p| p.rows.clone()).unwrap_or_default();
+    let empty = panel
+        .as_ref()
+        .filter(|p| p.rows.is_empty())
+        .and_then(|p| p.empty.clone())
+        .unwrap_or_default();
+    let on_close = panel.as_ref().map(|p| p.on_close);
+    let on_pick = panel.as_ref().map(|p| p.on_pick);
 
     rsx! {
         div {
             class: "ctx-scrim",
+            style: "{hidden}",
             onclick: move |event| {
                 event.stop_propagation();
-                on_close.call(());
+                if let Some(close) = on_close { close.call(()); }
             },
             oncontextmenu: move |event| {
                 event.prevent_default();
-                on_close.call(());
+                if let Some(close) = on_close { close.call(()); }
             },
         }
         div {
             class: "dd-list",
-            style: "left: {x.max(4.0)}px; top: {y.max(4.0)}px; {sizing}",
+            style: "left: {x.max(4.0)}px; top: {y.max(4.0)}px; {sizing} {hidden}",
             onclick: move |event| event.stop_propagation(),
 
-            if panel.rows.is_empty()
-                && let Some(empty) = panel.empty.clone() {
-                div { class: "dd-empty", "{empty}" }
-            }
+            div { class: "dd-empty", style: if empty.is_empty() { "display: none;" } else { "" }, "{empty}" }
 
-            for (index, row) in panel.rows.iter().enumerate() {
-                if row.is_separator() {
-                    div { key: "sep{index}", class: "ctxsep" }
-                } else {
-                    {
-                        let picked = row.value == panel.chosen;
-                        let class = if picked { "dd-item on" } else { "dd-item" };
-                        let chosen = row.value.clone();
-                        let glyph = row.glyph.clone();
-                        rsx! {
-                            button {
-                                key: "row{index}",
-                                class: "{class}",
-                                onclick: move |event| {
-                                    event.stop_propagation();
-                                    on_close.call(());
-                                    on_pick.call(chosen.clone());
-                                },
-                                if let Some(glyph) = glyph {
-                                    span { class: "glyph", {crate::icons::icon(&glyph, 15)} }
-                                } else {
-                                    span { class: "tick", if picked { "\u{2713}" } }
+            for (index, row) in rows.iter().enumerate() {
+                {
+                    let separator = row.is_separator();
+                    let picked = !separator && row.value == chosen;
+                    let class = if separator {
+                        "ctxsep"
+                    } else if picked {
+                        "dd-item on"
+                    } else {
+                        "dd-item"
+                    };
+                    let value = row.value.clone();
+                    let label = row.label.clone();
+                    let glyph = row.glyph.clone().unwrap_or_default();
+                    rsx! {
+                        button {
+                            key: "row{index}",
+                            class: "{class}",
+                            onclick: move |event| {
+                                event.stop_propagation();
+                                if separator {
+                                    return;
                                 }
-                                span { "{row.label}" }
+                                if let Some(close) = on_close { close.call(()); }
+                                if let Some(pick) = on_pick { pick.call(value.clone()); }
+                            },
+                            span {
+                                class: "glyph",
+                                style: if glyph.is_empty() { "display: none;" } else { "" },
+                                {crate::icons::icon(&glyph, 15)}
                             }
+                            span {
+                                class: "tick",
+                                style: if glyph.is_empty() { "" } else { "display: none;" },
+                                if picked { "\u{2713}" }
+                            }
+                            span { "{label}" }
                         }
                     }
                 }
