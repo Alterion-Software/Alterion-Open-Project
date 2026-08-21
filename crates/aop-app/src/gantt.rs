@@ -21,7 +21,7 @@ use crate::theme::Palette;
 /// Row height, matched to the grid so the two panes line up.
 pub const ROW_H: f64 = 22.0;
 /// Height of the two-tier timescale, matched to the grid's header row.
-pub const HEADER_H: f64 = 38.0;
+pub const HEADER_H: f64 = 37.0;
 const TIER_H: f64 = 19.0;
 const BAR_H: f64 = 11.0;
 const SUMMARY_H: f64 = 5.0;

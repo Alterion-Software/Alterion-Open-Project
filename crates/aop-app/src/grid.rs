@@ -293,12 +293,10 @@ pub fn TaskGrid(part: Part) -> Element {
     let rows_len = rows.len();
     let window = scroll().window(rows_len);
 
-    // The heading and the rows are the same table drawn twice, once into each
-    // row of the split. Splitting them is what pins the heading: it is not in
-    // the box that scrolls, so there is nothing for it to scroll away from.
-    // They are still worked out together, here, so a column width can never be
-    // one number in the titles and another in the cells.
-    // The heading, written once and put in both halves.
+    // The heading, written once and put in both halves of the grid.
+    //
+    // Splitting the heading from the rows is what pins it: it is not in the
+    // box that scrolls, so there is nothing for it to scroll away from.
     //
     // The copy in the row table is the heading of the real table: the widths
     // of the columns are then one decision rather than two that have to agree,
@@ -306,8 +304,8 @@ pub fn TaskGrid(part: Part) -> Element {
     // titles drifting off their columns was. It is pulled up out of sight by
     // its own height there, so it costs no room. The copy above is the one you
     // see, and its grips are the ones that resize a column.
-    let heading = || rsx! {
-                thead {
+    let heading = |ghost: bool| rsx! {
+                thead { class: if ghost { "ghost" } else { "" },
                     tr {
                         for (index, column) in columns.iter().enumerate() {
                             {
@@ -377,18 +375,21 @@ pub fn TaskGrid(part: Part) -> Element {
                 // shares the width out evenly, which is a heading whose
                 // columns do not line up with the cells under it.
                 {colgroup(&columns)}
-                {heading()}
+                {heading(false)}
             }
         }
     };
 
     let body = rsx! {
-        // Pulled up by exactly the heading's own height, so the heading that
-        // makes this the real table takes none of the room in it.
-        div { class: "grid-body", style: "width: {table_width}px; margin-top: -{HEADER_H}px;",
+        div { class: "grid-body", style: "width: {table_width}px;",
             table { class: "{grid_class}", style: "width: {table_width}px;",
                 {colgroup(&columns)}
-                {heading()}
+                // The same heading, of no height at all. It is here so that
+                // the widths of the columns are settled by one heading rather
+                // than by two that have to agree, and it is flattened rather
+                // than pulled up by its own height, because a pull-up is a
+                // number that has to match another number and this is not.
+                {heading(true)}
                 tbody {
                     // Always here, at whatever height the rows above need,
                     // rather than appearing when that height is more than

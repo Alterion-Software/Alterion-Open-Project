@@ -2208,23 +2208,21 @@ button { font: inherit; color: inherit; }
 .rail {
   flex: 1 1 auto;
   min-width: 0;
-  height: 14px;
-  overflow-x: scroll;
-  overflow-y: hidden;
+  height: 11px;
+  position: relative;
   background: var(--surface-2);
   border-top: 1px solid var(--grid-line);
 }
-.rail-run { height: 1px; }
 
 /* The bar down the right, over the rows. Fourteen pixels of track, drawn on
    top of the pane rather than beside it, because both panes fill the split and
    there is no column left to give it. */
 .vbar {
   position: absolute;
-  top: 38px;
-  bottom: 14px;
+  top: 37px;
+  bottom: 11px;
   right: 0;
-  width: 14px;
+  width: 11px;
   background: var(--surface-2);
   border-left: 1px solid var(--grid-line);
 }
@@ -2243,8 +2241,11 @@ button { font: inherit; color: inherit; }
   opacity: 0.5;
   pointer-events: none;
 }
-.thumb.down { right: 2px; width: 10px; min-height: 24px; }
-.thumb.across { bottom: 2px; height: 10px; min-width: 24px; }
+.thumb.down { right: 2px; width: 7px; min-height: 24px; }
+.thumb.across { bottom: 2px; height: 7px; min-width: 24px; }
+/* The one you can take hold of says so. */
+.thumb.live { pointer-events: auto; cursor: default; }
+.thumb.live:hover { opacity: 0.8; }
 
 /* The splitter runs through all three rows so the line between the panes is
    unbroken. The one in the bottom row is only the line: there is nothing worth
@@ -2391,7 +2392,7 @@ button { font: inherit; color: inherit; }
   border-width: 0 1px 1px 1px;
   border-style: solid;
   border-color: var(--grid-line);
-  height: 38px;
+  height: 37px;
   font-weight: 500;
   font-size: 11px;
   color: var(--ink-soft);
@@ -2401,6 +2402,19 @@ button { font: inherit; color: inherit; }
 }
 
 .grid th.num { text-align: center; }
+
+/* The row table's own copy of the heading: there so that the width of a column
+   is settled once, drawn nowhere. Flattened rather than pulled up out of view,
+   because a pull-up is one number that has to match another and this is not. */
+.grid thead.ghost th {
+  height: 0;
+  padding: 0;
+  border: 0;
+  font-size: 0;
+  line-height: 0;
+  overflow: hidden;
+}
+.grid thead.ghost th * { display: none; }
 
 .grid td {
   border-width: 1px;
@@ -4939,20 +4953,33 @@ mod pinned_heading_tests {
 
     #[test]
     fn the_sideways_bar_is_always_there() {
-        // Asked for in as many words: the sideways scrollbars should show
-        // whenever there is anywhere to scroll to. `auto` hides one until the
-        // contents outgrow the pane and then takes fourteen pixels off the
-        // bottom of the rows when it appears, which moves everything. `scroll`
-        // keeps it there and keeps the height still.
-        let rail = rule(".rail {");
+        // Asked for in as many words: the scrollbars should show whenever
+        // there is anywhere to scroll to. The renderer's own do not: they are
+        // overlays that fade out a moment after the last scroll, and a faded
+        // thumb cannot even be taken hold of, so at rest there was nothing on
+        // screen and nothing to grab. These are drawn, and drawn things do not
+        // fade unless something animates them.
+        for selector in [".rail {", ".vbar {"] {
+            let block = rule(selector);
+            assert!(
+                block.contains("height:") || block.contains("width:"),
+                "{selector} is a fixture with a size of its own, not something \
+                 that appears when it feels like it"
+            );
+        }
+        let thumb = rule(".thumb {");
         assert!(
-            rail.contains("overflow-x: scroll"),
-            "the sideways bar is a fixture, not something that comes and goes"
+            !thumb.contains("transition") && !thumb.contains("animation"),
+            "the whole point of drawing the thumb is that it stays put"
         );
         assert!(
-            rail.contains("overflow-y: hidden"),
-            "the strip is fourteen pixels tall and holds a rule one pixel high; \
-             anything downwards in it is a mistake"
+            thumb.contains("pointer-events: none"),
+            "the drawn thumb sits over the renderer's own, so it must let a \
+             press through to whatever is underneath"
+        );
+        assert!(
+            rule(".thumb.live {").contains("pointer-events: auto"),
+            "the one that carries a drag has to be able to catch it"
         );
     }
 }

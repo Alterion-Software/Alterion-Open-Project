@@ -830,6 +830,10 @@ fn SplitPanes(
     // every frame of a scroll, and read by nothing but the bar on the right,
     // so a scroll redraws a thumb rather than a plan.
     let mut down = use_signal(|| (0.0f64, 0.0f64));
+    // A sideways bar being dragged: which one, where the pointer started, and
+    // what the offset was then. Tracked from where it started rather than from
+    // the thumb, so a pointer moving faster than the thumb cannot drop it.
+    let mut rail_drag = use_signal(|| RailDrag::None);
     let reach = use_context::<Signal<Reach>>();
     let mut grid_scroll = use_context::<GridScroll>().0;
     let mut chart_scroll = use_context::<ChartScroll>().0;
@@ -985,6 +989,54 @@ fn SplitPanes(
                         }
                     }
 
+                    // The same again for a scrollbar. A thumb is ten pixels
+                    // thick and the pointer leaves it at once.
+                    if rail_drag().is_some() {
+                        div {
+                            class: "drag-shield",
+                            onmousemove: move |event| {
+                                let Some((side, from_x, from_at)) = rail_drag() else {
+                                    return;
+                                };
+                                let (port, content) = match side {
+                                    RailSide::Table => (ports.table, far.table),
+                                    RailSide::Chart => (ports.chart, far.chart),
+                                };
+                                if port <= 1.0 || content <= port {
+                                    return;
+                                }
+                                // The thumb stands for the pane as a share of
+                                // the plan, so one pixel of thumb is worth
+                                // content-over-port pixels of plan.
+                                let moved = event.client_coordinates().x - from_x;
+                                let at = (from_at + moved * content / port)
+                                    .clamp(0.0, content - port);
+                                let now = shifted();
+                                match side {
+                                    RailSide::Table if now.table != at => {
+                                        shifted.set(Shifted { table: at, ..now });
+                                    }
+                                    RailSide::Chart if now.chart != at => {
+                                        shifted.set(Shifted { chart: at, ..now });
+                                        // The chart draws only the stretch of
+                                        // timescale on screen, worked out from
+                                        // this. Coarse on purpose: the window
+                                        // carries a margin either side, so it
+                                        // changes far less often than the drag.
+                                        let was = chart_scroll();
+                                        let next =
+                                            PaneScroll { left: at, width: port, ..was };
+                                        if was.span() != next.span() {
+                                            chart_scroll.set(next);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            },
+                            onmouseup: move |_| rail_drag.set(None),
+                        }
+                    }
+
                     // ---- the headings -----------------------------------
                     //
                     // Above the box that scrolls, not inside it, which is the
@@ -1070,7 +1122,7 @@ fn SplitPanes(
                     // place and knows how to be dragged; this one is only there
                     // to be seen, which the renderer's is not for long.
                     div { class: "vbar",
-                        {thumb(true, down().0, down().1, rows_len as f64 * gantt::ROW_H)}
+                        {thumb(true, down().0, down().1, rows_len as f64 * gantt::ROW_H, None)}
                     }
 
                     // ---- the sideways bars -------------------------------
@@ -1087,20 +1139,8 @@ fn SplitPanes(
                                 content: far.table,
                                 port: ports.table,
                                 at: shift.table,
-                                on_slide: move |(left, width): (f64, f64)| {
-                                    let now = shifted();
-                                    if now.table != left {
-                                        shifted.set(Shifted { table: left, ..now });
-                                    }
-                                    // The table draws every column it has, so
-                                    // where it is scrolled to sideways changes
-                                    // nothing about what it draws. Only its
-                                    // width is worth keeping, and only when it
-                                    // has actually changed.
-                                    let was = grid_scroll();
-                                    if (was.width - width).abs() >= 1.0 {
-                                        grid_scroll.set(PaneScroll { width, ..was });
-                                    }
+                                on_grab: move |x| {
+                                    rail_drag.set(Some((RailSide::Table, x, shifted().table)));
                                 },
                             }
                             div { class: "splitter ghost" }
@@ -1110,22 +1150,8 @@ fn SplitPanes(
                                 content: far.chart,
                                 port: ports.chart,
                                 at: shift.chart,
-                                on_slide: move |(left, width)| {
-                                    let now = shifted();
-                                    if now.chart != left {
-                                        shifted.set(Shifted { chart: left, ..now });
-                                    }
-                                    // The chart draws only the stretch of
-                                    // timescale on screen, and that is worked
-                                    // out from this. It is coarse on purpose:
-                                    // the window carries a margin either side,
-                                    // so it changes far less often than the
-                                    // scroll does.
-                                    let was = chart_scroll();
-                                    let now = PaneScroll { left, width, ..was };
-                                    if was.span() != now.span() {
-                                        chart_scroll.set(now);
-                                    }
+                                on_grab: move |x| {
+                                    rail_drag.set(Some((RailSide::Chart, x, shifted().chart)));
                                 },
                             }
                         }
@@ -1151,6 +1177,13 @@ fn SoloGrid() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let rows_len = state.read().layout_rows().len();
     let shift = shifted();
+    let mut rail_drag = use_signal(|| RailDrag::None);
+    // One window, so the pane is the window less the frame around it.
+    let port = {
+        let (wide, _) = use_context::<Signal<crate::state::Viewport>>()();
+        let seen = grid_scroll().width;
+        if seen > 1.0 && seen < wide { seen } else { (wide - 16.0).max(120.0) }
+    };
 
     rsx! {
         div { class: "split solo",
@@ -1201,16 +1234,33 @@ fn SoloGrid() -> Element {
                 div { class: "chart-cell",
                     Rail {
                         content: reach().table,
-                        port: grid_scroll().width,
-                        at: shifted().table,
-                        on_slide: move |(left, width)| {
-                            let now = shifted();
-                            if now.table != left {
-                                shifted.set(Shifted { table: left, ..now });
-                            }
-                            let was = grid_scroll();
-                            grid_scroll.set(PaneScroll { left, width, ..was });
+                        port,
+                        at: shift.table,
+                        on_grab: move |x| {
+                            rail_drag.set(Some((RailSide::Table, x, shifted().table)));
                         },
+                    }
+                    if rail_drag().is_some() {
+                        div {
+                            class: "drag-shield",
+                            onmousemove: move |event| {
+                                let Some((_, from_x, from_at)) = rail_drag() else {
+                                    return;
+                                };
+                                let content = reach().table;
+                                if port <= 1.0 || content <= port {
+                                    return;
+                                }
+                                let moved = event.client_coordinates().x - from_x;
+                                let at = (from_at + moved * content / port)
+                                    .clamp(0.0, content - port);
+                                let now = shifted();
+                                if now.table != at {
+                                    shifted.set(Shifted { table: at, ..now });
+                                }
+                            },
+                            onmouseup: move |_| rail_drag.set(None),
+                        }
                     }
                 }
             }
@@ -1250,18 +1300,22 @@ fn Splitter(on_grab: EventHandler<f64>) -> Element {
 /// thumb by hand would have meant knowing the strip's own width in pixels, and
 /// a window that has been resized since it was measured cannot be asked.
 #[component]
-fn Rail(content: f64, port: f64, at: f64, on_slide: EventHandler<(f64, f64)>) -> Element {
+fn Rail(content: f64, port: f64, at: f64, on_grab: EventHandler<f64>) -> Element {
     rsx! {
-        div {
-            class: "rail",
-            onscroll: move |event| {
-                let data = event.data();
-                on_slide.call((data.scroll_left(), data.client_width() as f64));
-            },
-            div { class: "rail-run", style: "width: {content}px;" }
-            {thumb(false, at, port, content)}
+        div { class: "rail",
+            {thumb(false, at, port, content, Some(on_grab))}
         }
     }
+}
+
+/// Where a scrollbar drag started: the pointer, and the offset it started from.
+type RailDrag = Option<(RailSide, f64, f64)>;
+
+/// Which pane's sideways bar is being dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RailSide {
+    Table,
+    Chart,
 }
 
 /// A scrollbar thumb that is actually there to be seen.
@@ -1274,7 +1328,13 @@ fn Rail(content: f64, port: f64, at: f64, on_slide: EventHandler<(f64, f64)>) ->
 /// It takes no pointer. The real thumb is underneath it in the same place, and
 /// that is the one that knows how to be dragged, so letting this one catch the
 /// press would be taking the drag away from the thing that can do it.
-fn thumb(down: bool, at: f64, port: f64, content: f64) -> Element {
+fn thumb(
+    down: bool,
+    at: f64,
+    port: f64,
+    content: f64,
+    on_grab: Option<EventHandler<f64>>,
+) -> Element {
     // Nothing to say when everything already fits.
     if content <= port + 1.0 || port <= 1.0 {
         return rsx! {};
@@ -1289,7 +1349,26 @@ fn thumb(down: bool, at: f64, port: f64, content: f64) -> Element {
         format!("left: {}%; width: {}%;", from * 100.0, share * 100.0)
     };
     let class = if down { "thumb down" } else { "thumb across" };
-    rsx! { div { class: "{class}", style: "{style}" } }
+    match on_grab {
+        // A bar that can be taken hold of. The renderer's own thumb is under
+        // this one and can be dragged, but only while it is showing, and it
+        // fades a moment after the last scroll: "a faded-out thumb doesn't
+        // capture", says the comment beside the code that decides. So at rest
+        // there was nothing there to grab, which is exactly what a scrollbar
+        // is for.
+        Some(grab) => rsx! {
+            div {
+                class: "{class} live",
+                style: "{style}",
+                onmousedown: move |event| {
+                    event.prevent_default();
+                    event.stop_propagation();
+                    grab.call(event.client_coordinates().x);
+                },
+            }
+        },
+        None => rsx! { div { class: "{class}", style: "{style}" } },
+    }
 }
 
 /// One internal window: a title tab plus whatever it frames.
