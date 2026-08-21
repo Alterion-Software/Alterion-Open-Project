@@ -825,6 +825,9 @@ fn SplitPanes(
     // The grip stays under the pointer however the panes are scrolled, so the
     // drag is tracked from where it started rather than from the grip itself.
     let mut resize_from = use_signal(|| None::<(f64, f64)>);
+    // The room the two panes share, so the drag can stop the chart being
+    // squeezed past the same minimum the table has.
+    let room = use_context::<Signal<crate::state::Viewport>>();
 
     let (grid_width, focus) = {
         let s = state.read();
@@ -850,7 +853,10 @@ fn SplitPanes(
                 onmousemove: move |event| {
                     if let Some((from_x, from_width)) = resize_from() {
                         let moved = event.client_coordinates().x - from_x;
-                        state.write().set_table_width(from_width + moved);
+                        // The room the two panes are sharing, so the chart
+                        // keeps its own minimum rather than only the table.
+                        let workspace = room().0;
+                        state.write().set_table_width(from_width + moved, workspace);
                     }
                 },
                 onmouseup: move |_| resize_from.set(None),

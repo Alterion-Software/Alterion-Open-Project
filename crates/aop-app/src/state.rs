@@ -5809,9 +5809,21 @@ impl AppState {
     ///
     /// It deliberately does not resize any column: narrowing the pane scrolls
     /// the table instead, so the columns stay the width they were set to.
-    pub fn set_table_width(&mut self, width: f64) {
-        self.table_pane_width = width.clamp(120.0, 2000.0);
+    pub fn set_table_width(&mut self, width: f64, workspace: f64) {
+        // Both panes keep the same minimum, so the handle stops at the same
+        // distance from either end. Squeezing the chart to nothing by dragging
+        // right was possible where squeezing the table to nothing by dragging
+        // left never was, which is the asymmetry: one pane had a floor and the
+        // other did not.
+        let most = (workspace - Self::MIN_PANE).max(Self::MIN_PANE);
+        self.table_pane_width = width.clamp(Self::MIN_PANE, most);
     }
+
+    /// The least either pane is allowed to be squeezed to.
+    ///
+    /// Enough to still show something rather than a sliver nobody can grab
+    /// hold of to undo it with.
+    pub const MIN_PANE: f64 = 120.0;
 
     /// The visible width of the table pane.
     ///
@@ -9594,5 +9606,41 @@ mod tests {
             state.project.tasks[1].id
         ));
         assert!(matches!(state.dialog, Some(Dialog::Message { .. })));
+    }
+}
+
+#[cfg(test)]
+mod splitter_tests {
+    use super::*;
+
+    #[test]
+    fn the_handle_stops_the_same_distance_from_either_end() {
+        let mut s = AppState::default();
+        let room = 1000.0;
+
+        // Dragged hard left: the table keeps its minimum.
+        s.set_table_width(-500.0, room);
+        assert_eq!(s.table_view_width(), AppState::MIN_PANE);
+
+        // Dragged hard right: the chart keeps the same one, which is the half
+        // that was missing. Before this the table could take everything.
+        s.set_table_width(5_000.0, room);
+        assert_eq!(s.table_view_width(), room - AppState::MIN_PANE);
+    }
+
+    #[test]
+    fn a_window_too_narrow_for_two_panes_still_answers() {
+        // Nothing sensible can be shared here, and the old arithmetic would
+        // have produced a maximum below the minimum and panicked on the clamp.
+        let mut s = AppState::default();
+        s.set_table_width(400.0, 100.0);
+        assert_eq!(s.table_view_width(), AppState::MIN_PANE);
+    }
+
+    #[test]
+    fn an_ordinary_drag_is_left_alone() {
+        let mut s = AppState::default();
+        s.set_table_width(420.0, 1600.0);
+        assert_eq!(s.table_view_width(), 420.0);
     }
 }
