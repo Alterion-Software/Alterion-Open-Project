@@ -65,14 +65,78 @@ pub fn Dropdown(
         "flex: 1;".to_string()
     };
 
-    let (ax, ay) = anchor();
     let list_width = if width > 0.0 { width.max(120.0) } else { 260.0 };
+
+    // The list is handed to the layer at the root rather than rendered here.
+    // Rendered here it is a child of the ribbon, which is ninety four pixels
+    // tall and clips its contents so it can collapse to nothing, and no
+    // amount of positioning gets a list out of a box that clips. At the root
+    // its parent is the window, which is what `position: fixed` used to mean
+    // and what `absolute` means to an engine with no `fixed`. See
+    // `crate::floating`.
+    let mut floating = use_context::<crate::floating::Layer>();
+    let mine = use_hook(crate::floating::claim);
+    {
+        let options = options.clone();
+        let value = value.clone();
+        use_effect(move || {
+            if !open() {
+                floating.clear(mine);
+                return;
+            }
+            let (ax, ay) = anchor();
+            let options = options.clone();
+            let value = value.clone();
+            floating.put(
+                mine,
+                rsx! {
+                    div {
+                        class: "ctx-scrim",
+                        onclick: move |event| {
+                            event.stop_propagation();
+                            open.set(false);
+                        },
+                        oncontextmenu: move |event| {
+                            event.prevent_default();
+                            open.set(false);
+                        },
+                    }
+                    div {
+                        class: "dd-list",
+                        style: "left: {ax.max(4.0)}px; top: {ay.max(4.0)}px; width: {list_width}px;",
+                        onclick: move |event| event.stop_propagation(),
+                        for choice in options.iter() {
+                            {
+                                let picked = choice.value == value;
+                                let item_class = if picked { "dd-item on" } else { "dd-item" };
+                                let chosen = choice.value.clone();
+                                rsx! {
+                                    button {
+                                        key: "{choice.value}",
+                                        class: "{item_class}",
+                                        onclick: move |event| {
+                                            event.stop_propagation();
+                                            open.set(false);
+                                            on_pick.call(chosen.clone());
+                                        },
+                                        span { class: "tick", if picked { {crate::icons::icon("tick", 12)} } }
+                                        span { "{choice.label}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+        });
+    }
 
     rsx! {
         button {
             class: "{class}",
             style: "{style}",
             title: "{selected}",
+            disabled,
             onclick: move |event| {
                 if disabled {
                     return;
@@ -85,45 +149,6 @@ pub fn Dropdown(
             },
             span { class: "dd-value", "{selected}" }
             span { class: "dd-caret", {crate::icons::icon("caret-down", 13)} }
-        }
-
-        if open() {
-            div {
-                class: "ctx-scrim",
-                onclick: move |event| {
-                    event.stop_propagation();
-                    open.set(false);
-                },
-                oncontextmenu: move |event| {
-                    event.prevent_default();
-                    open.set(false);
-                },
-            }
-            div {
-                class: "dd-list",
-                style: "left: {ax.max(4.0)}px; top: {ay.max(4.0)}px; width: {list_width}px;",
-                onclick: move |event| event.stop_propagation(),
-                for choice in options.iter() {
-                    {
-                        let picked = choice.value == value;
-                        let item_class = if picked { "dd-item on" } else { "dd-item" };
-                        let chosen = choice.value.clone();
-                        rsx! {
-                            button {
-                                key: "{choice.value}",
-                                class: "{item_class}",
-                                onclick: move |event| {
-                                    event.stop_propagation();
-                                    open.set(false);
-                                    on_pick.call(chosen.clone());
-                                },
-                                span { class: "tick", if picked { "\u{2713}" } }
-                                span { "{choice.label}" }
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -178,28 +203,25 @@ pub fn MenuBtn(
     } else {
         format!("{base} disabled")
     };
-    let (ax, ay) = anchor();
     let size = if large { 28 } else { 16 };
 
-    rsx! {
-        button {
-            class: "{class}",
-            title: "{caption}",
-            onclick: move |event| {
-                if !enabled {
-                    return;
-                }
-                let point = event.client_coordinates();
-                let drop = if large { 46.0 } else { 18.0 };
-                anchor.set((point.x - 14.0, point.y + drop));
-                open.set(!open());
-            },
-            span { class: "glyph", {crate::icons::icon(&glyph, size)} }
-            span { class: "caption", "{caption}" }
-            span { class: "caret", {crate::icons::icon("caret-down", 12)} }
-        }
-
-        if open() {
+    // Handed to the layer at the root, not rendered here. Inside the ribbon
+    // it is a child of a box that clips, which a list dropped from a ribbon
+    // button has to escape, and so does the scrim behind it: clipped, the
+    // scrim only covers the ribbon, so clicking anywhere else never reached it
+    // and the menu would not close. See `crate::floating`.
+    let mut floating = use_context::<crate::floating::Layer>();
+    let mine = use_hook(crate::floating::claim);
+    {
+        let options = options.clone();
+        use_effect(move || {
+            if !open() {
+                floating.clear(mine);
+                return;
+            }
+            let (ax, ay) = anchor();
+            let options = options.clone();
+            floating.put(mine, rsx! {
             div {
                 class: "ctx-scrim",
                 onclick: move |event| {
@@ -238,7 +260,28 @@ pub fn MenuBtn(
                     }
                 }
             }
+        });
+        });
+    }
+
+    rsx! {
+        button {
+            class: "{class}",
+            title: "{caption}",
+            onclick: move |event| {
+                if !enabled {
+                    return;
+                }
+                let point = event.client_coordinates();
+                let drop = if large { 46.0 } else { 18.0 };
+                anchor.set((point.x - 14.0, point.y + drop));
+                open.set(!open());
+            },
+            span { class: "glyph", {crate::icons::icon(&glyph, size)} }
+            span { class: "caption", "{caption}" }
+            span { class: "caret", {crate::icons::icon("caret-down", 12)} }
         }
+
     }
 }
 
@@ -254,33 +297,21 @@ pub fn ComboBox(
     let mut anchor = use_signal(|| (0.0f64, 0.0f64));
     let mut draft = use_signal(|| value.clone());
 
-    let (ax, ay) = anchor();
 
-    rsx! {
-        div { class: "combo", style: "width: {width}px;",
-            input {
-                class: "combo-input",
-                value: "{draft}",
-                oninput: move |event| draft.set(event.value()),
-                onkeydown: move |event| {
-                    if event.key() == Key::Enter {
-                        on_pick.call(draft());
-                    }
-                },
-                onblur: move |_| on_pick.call(draft()),
+    // As in `Dropdown` and `MenuBtn`: the panel and the scrim behind it go to
+    // the layer at the root. See `crate::floating`.
+    let mut floating = use_context::<crate::floating::Layer>();
+    let mine = use_hook(crate::floating::claim);
+    {
+        let options = options.clone();
+        use_effect(move || {
+            if !open() {
+                floating.clear(mine);
+                return;
             }
-            button {
-                class: "combo-caret",
-                onclick: move |event| {
-                    let point = event.client_coordinates();
-                    anchor.set((point.x - width + 22.0, point.y + 16.0));
-                    open.set(!open());
-                },
-                span { class: "caret", {crate::icons::icon("caret-down", 12)} }
-            }
-        }
-
-        if open() {
+            let (ax, ay) = anchor();
+            let options = options.clone();
+            floating.put(mine, rsx! {
             div {
                 class: "ctx-scrim",
                 onclick: move |event| {
@@ -314,7 +345,34 @@ pub fn ComboBox(
                     }
                 }
             }
+        });
+        });
+    }
+
+    rsx! {
+        div { class: "combo", style: "width: {width}px;",
+            input {
+                class: "combo-input",
+                value: "{draft}",
+                oninput: move |event| draft.set(event.value()),
+                onkeydown: move |event| {
+                    if event.key() == Key::Enter {
+                        on_pick.call(draft());
+                    }
+                },
+                onblur: move |_| on_pick.call(draft()),
+            }
+            button {
+                class: "combo-caret",
+                onclick: move |event| {
+                    let point = event.client_coordinates();
+                    anchor.set((point.x - width + 22.0, point.y + 16.0));
+                    open.set(!open());
+                },
+                span { class: "caret", {crate::icons::icon("caret-down", 12)} }
+            }
         }
+
     }
 }
 

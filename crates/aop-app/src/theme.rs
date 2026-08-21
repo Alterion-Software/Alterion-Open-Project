@@ -3289,7 +3289,7 @@ button { font: inherit; color: inherit; }
 /* The toolbar and the menu, anchored as one so the toolbar is above the menu
    whichever way the pair opened. */
 .ctx-stack {
-  position: fixed;
+  position: absolute;
   z-index: 81;
   display: flex;
   flex-direction: column;
@@ -3332,13 +3332,22 @@ button { font: inherit; color: inherit; }
 
 .minisep { width: 1px; height: 18px; margin: 0 3px; background: var(--line); }
 
-.ctx-scrim { position: fixed; inset: 0; z-index: 80; }
+/* `absolute`, not `fixed`, and the difference is only in what answers it.
+   These panels are all mounted at the root of the application, nothing on the
+   page scrolls, and none of them has a positioned ancestor. Under those three
+   conditions a browser resolves `absolute` against the initial containing
+   block, which is the same box `fixed` uses, so nothing changes here. A layout
+   engine with no `fixed` at all resolves it against the parent, which for a
+   panel at the root is the window. Both arrive at the same place, which
+   `fixed` did not: unhonoured, it degrades to relative, and a top of 400px
+   then means four hundred pixels below wherever the panel already sat. */
+.ctx-scrim { position: absolute; inset: 0; z-index: 80; }
 
 /* A panel that places itself, for the pickers, which have no stack to be
    placed by. Without it a panel lays out in the flow beneath a window that is
    already the full height, so it is never seen, while the scrim beside it
    still covers everything and swallows the clicks meant for the cell. */
-.ctx-anchored { position: fixed; z-index: 81; }
+.ctx-anchored { position: absolute; z-index: 81; }
 
 .ctxmenu {
   /* Sits inside the stack, so it is the menu that scrolls when the pair is
@@ -4377,8 +4386,8 @@ mod tests {
             // Against the window: the predecessor and resource pickers, a
             // context menu with its mini toolbar, and the lists a dropdown
             // drops. None of these has a positioned ancestor to hang from.
-            (crate::popups::ANCHORED_CLASS, "position: fixed"),
-            ("ctx-stack", "position: fixed"),
+            (crate::popups::ANCHORED_CLASS, "position: absolute"),
+            ("ctx-stack", "position: absolute"),
             ("dd-list", "position: fixed"),
             // Against a pane instead, which is the whole point: a peer's
             // pointer is written in that pane's own scrolling coordinates, so

@@ -18,6 +18,7 @@ mod dictionary;
 mod dialogs;
 mod gantt;
 mod grid;
+mod floating;
 mod fonts;
 mod handoff;
 mod keymap;
@@ -286,6 +287,7 @@ fn App() -> Element {
     // it on the plan's state would redraw the window on every letter.
     let drafting = use_context_provider(|| crate::state::Drafting(Signal::new(None))).0;
     let mut viewport = use_context_provider(|| Signal::new(crate::state::Viewport::default()));
+    use_context_provider(crate::floating::Layer::new);
 
     // Snapshot the plan on a timer so that a crash, a kill, or a power cut
     // costs at most one interval of work rather than everything since the last
@@ -634,6 +636,11 @@ fn App() -> Element {
         if let Some(dialog) = dialog {
             dialogs::DialogHost { dialog }
         }
+
+        // Last, and a direct child of the root. Panels handed to it are then
+        // children of the window, which is what makes `absolute` mean the
+        // same thing as `fixed` did. See `crate::floating`.
+        floating::Host {}
 
         if splash {
             Splash {}
