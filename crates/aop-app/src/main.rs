@@ -913,10 +913,21 @@ fn SplitPanes(
                     // fault this comment used to describe in the other
                     // direction.
                     div {
+                        // Sized exactly as the pane below it is sized, which
+                        // means sharing its flex arithmetic and not merely its
+                        // number. The pane is `flex: 0 1 auto` with a floor and
+                        // is squeezed by the chart's floor from the other side;
+                        // a tab given the same width as a plain `flex: none`
+                        // keeps the unsqueezed number and parts company with
+                        // its own pane by exactly the amount flexbox took off.
                         style: if focus == PaneFocus::TableOnly {
                             "flex: 1 1 auto; display: flex;".to_string()
                         } else {
-                            format!("width: {grid_width}px; flex: none; display: flex;")
+                            format!(
+                                "width: {grid_width}px; flex: 0 1 auto; \
+                                 min-width: {}px; display: flex;",
+                                crate::state::AppState::MIN_PANE
+                            )
                         },
                         PaneTab {
                             name: left_name,

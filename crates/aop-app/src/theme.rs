@@ -2039,7 +2039,10 @@ button { font: inherit; color: inherit; }
   min-width: 0;
 }
 
-.pane-tab.grow { flex: 1; }
+/* The chart's tab grows into whatever is left, exactly as the chart pane does,
+   and stops at the same floor. Both rows then resolve to the same widths under
+   the same constraints, which is the only way a tab stays over its own pane. */
+.pane-tab.grow { flex: 1 1 auto; min-width: 120px; }
 .pane-tab.active { color: var(--accent-bright); background: var(--surface-3); }
 /* The name takes the slack, so the button lands on the tab's right edge
    whether or not there is a subtitle to sit beside it. */
@@ -4544,5 +4547,31 @@ mod pane_clip_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tab_bar_tests {
+    use super::*;
+
+    fn rule(selector: &str) -> &'static str {
+        let at = CSS.find(&format!("\n{selector}")).expect(selector) + 1;
+        &CSS[at..at + CSS[at..].find('}').expect("a closing brace")]
+    }
+
+    #[test]
+    fn a_growing_tab_is_floored_like_the_pane_under_it() {
+        // A tab sits directly over its pane and has to be the same width. That
+        // only holds if the two rows resolve under the same constraints, so
+        // the growing tab needs the same floor the growing pane has. Without
+        // it the tab bar and the panes drift apart by however much flexbox
+        // took off one and not the other, and the chart's contents end up
+        // drawn under the table's heading.
+        fn floor(block: &str) -> &str {
+            let at = block.find("min-width:").expect("a min-width");
+            let rest = &block[at + "min-width:".len()..];
+            rest[..rest.find(';').expect("a semicolon")].trim()
+        }
+        assert_eq!(floor(rule(".pane-tab.grow {")), floor(rule(".chart-pane {")));
     }
 }
