@@ -2216,6 +2216,36 @@ button { font: inherit; color: inherit; }
 }
 .rail-run { height: 1px; }
 
+/* The bar down the right, over the rows. Fourteen pixels of track, drawn on
+   top of the pane rather than beside it, because both panes fill the split and
+   there is no column left to give it. */
+.vbar {
+  position: absolute;
+  top: 38px;
+  bottom: 14px;
+  right: 0;
+  width: 14px;
+  background: var(--surface-2);
+  border-left: 1px solid var(--grid-line);
+}
+
+/* The part that says where you are.
+
+   Drawn by hand, because the renderer's own is an overlay that fades out a
+   moment after the last scroll: most of the time there was nothing on screen
+   to say that there was more of the plan below or to the right. This one does
+   not fade. It also takes no pointer, so a press goes through to the
+   renderer's thumb underneath, which is the one that knows how to be dragged. */
+.thumb {
+  position: absolute;
+  background: var(--ink-faint);
+  border-radius: 5px;
+  opacity: 0.5;
+  pointer-events: none;
+}
+.thumb.down { right: 2px; width: 10px; min-height: 24px; }
+.thumb.across { bottom: 2px; height: 10px; min-width: 24px; }
+
 /* The splitter runs through all three rows so the line between the panes is
    unbroken. The one in the bottom row is only the line: there is nothing worth
    dragging across fourteen pixels. */

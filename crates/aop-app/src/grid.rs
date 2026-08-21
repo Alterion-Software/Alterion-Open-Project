@@ -298,23 +298,15 @@ pub fn TaskGrid(part: Part) -> Element {
     // the box that scrolls, so there is nothing for it to scroll away from.
     // They are still worked out together, here, so a column width can never be
     // one number in the titles and another in the cells.
-    let head = rsx! {
-        div { class: "grid-head", style: "width: {table_width}px;",
-            table { class: "{grid_class}", style: "width: {table_width}px;",
-                // A colgroup, in both tables, saying the same widths.
-                //
-                // It used to be left out on the grounds that `table-layout:
-                // fixed` reads the widths from the first row and the heading
-                // cells already carried them, so the group would have been
-                // saying it twice. That stopped being true the moment the
-                // heading moved into a table of its own: the row table's first
-                // row is now the spacer standing in for the rows scrolled off
-                // above, and a spacer has no cells to read a width from. Fixed
-                // layout with nothing to read shares the width out evenly, and
-                // two tables sharing it out differently is a heading whose
-                // columns do not line up with the cells under it.
-                {colgroup(&columns)}
-
+    // The heading, written once and put in both halves.
+    //
+    // The copy in the row table is the heading of the real table: the widths
+    // of the columns are then one decision rather than two that have to agree,
+    // which is what "make the header part of the table" asks for and what the
+    // titles drifting off their columns was. It is pulled up out of sight by
+    // its own height there, so it costs no room. The copy above is the one you
+    // see, and its grips are the ones that resize a column.
+    let heading = || rsx! {
                 thead {
                     tr {
                         for (index, column) in columns.iter().enumerate() {
@@ -370,14 +362,33 @@ pub fn TaskGrid(part: Part) -> Element {
                         }
                     }
                 }
+    };
+
+    let head = rsx! {
+        div { class: "grid-head", style: "width: {table_width}px;",
+            table { class: "{grid_class}", style: "width: {table_width}px;",
+                // A colgroup in both, saying the same widths. It was left out
+                // once, on the grounds that `table-layout: fixed` reads its
+                // widths from the first row and the heading cells carried
+                // them. That stopped being true when the heading was lifted
+                // out: the row table's first row became the spacer standing in
+                // for the rows scrolled off above, and a spacer has no cells
+                // to read a width from. Fixed layout with nothing to read
+                // shares the width out evenly, which is a heading whose
+                // columns do not line up with the cells under it.
+                {colgroup(&columns)}
+                {heading()}
             }
         }
     };
 
     let body = rsx! {
-        div { class: "grid-body", style: "width: {table_width}px;",
+        // Pulled up by exactly the heading's own height, so the heading that
+        // makes this the real table takes none of the room in it.
+        div { class: "grid-body", style: "width: {table_width}px; margin-top: -{HEADER_H}px;",
             table { class: "{grid_class}", style: "width: {table_width}px;",
                 {colgroup(&columns)}
+                {heading()}
                 tbody {
                     // Always here, at whatever height the rows above need,
                     // rather than appearing when that height is more than

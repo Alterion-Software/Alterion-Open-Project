@@ -826,6 +826,10 @@ fn SplitPanes(
     // Everything about scrolling lives here now, because both panes ride one
     // scroll container and neither of them owns it.
     let mut shifted = use_signal(Shifted::default);
+    // How far down the panes are and how much of them is on screen. Written on
+    // every frame of a scroll, and read by nothing but the bar on the right,
+    // so a scroll redraws a thumb rather than a plan.
+    let mut down = use_signal(|| (0.0f64, 0.0f64));
     let reach = use_context::<Signal<Reach>>();
     let mut grid_scroll = use_context::<GridScroll>().0;
     let mut chart_scroll = use_context::<ChartScroll>().0;
@@ -836,6 +840,26 @@ fn SplitPanes(
     };
     let shift = shifted();
     let far = reach();
+    // How wide each pane is, for sizing the scrollbar thumbs. Taken from the
+    // panes themselves once they have reported it, and worked out from the
+    // window until then, so a bar is the right size on the first paint rather
+    // than after the first scroll.
+    let ports = {
+        let (window_wide, _) = use_context::<Signal<crate::state::Viewport>>()();
+        let table = {
+            let seen = grid_scroll().width;
+            if seen > 1.0 && seen < window_wide { seen } else { grid_width }
+        };
+        let chart = {
+            let seen = chart_scroll().width;
+            if seen > 1.0 && seen < window_wide {
+                seen
+            } else {
+                (window_wide - grid_width - SPLITTER_W - 16.0).max(120.0)
+            }
+        };
+        Reach { table, chart }
+    };
 
     // The left column of all three rows is one width, so a column title, the
     // cells under it and the strip at the bottom are all cut off at the same
@@ -1014,6 +1038,9 @@ fn SplitPanes(
                             if was.window(rows_len) != now.window(rows_len) {
                                 chart_scroll.set(now);
                             }
+                            if down() != (top, height) {
+                                down.set((top, height));
+                            }
                         },
                         div { class: "pane-left", style: "{left_cell}",
                             div { class: "shift-clip",
@@ -1035,6 +1062,17 @@ fn SplitPanes(
                         }
                     }
 
+                    // ---- the bar down the right --------------------------
+                    //
+                    // Over the rows rather than beside them: the panes fill the
+                    // split and there is no column left to give it. It takes no
+                    // pointer, because the renderer's own thumb is in the same
+                    // place and knows how to be dragged; this one is only there
+                    // to be seen, which the renderer's is not for long.
+                    div { class: "vbar",
+                        {thumb(true, down().0, down().1, rows_len as f64 * gantt::ROW_H)}
+                    }
+
                     // ---- the sideways bars -------------------------------
                     //
                     // A strip of its own along the bottom of each pane rather
@@ -1047,13 +1085,22 @@ fn SplitPanes(
                         div { class: "pane-left", style: "{left_cell}",
                             Rail {
                                 content: far.table,
-                                on_slide: move |(left, width)| {
+                                port: ports.table,
+                                at: shift.table,
+                                on_slide: move |(left, width): (f64, f64)| {
                                     let now = shifted();
                                     if now.table != left {
                                         shifted.set(Shifted { table: left, ..now });
                                     }
+                                    // The table draws every column it has, so
+                                    // where it is scrolled to sideways changes
+                                    // nothing about what it draws. Only its
+                                    // width is worth keeping, and only when it
+                                    // has actually changed.
                                     let was = grid_scroll();
-                                    grid_scroll.set(PaneScroll { left, width, ..was });
+                                    if (was.width - width).abs() >= 1.0 {
+                                        grid_scroll.set(PaneScroll { width, ..was });
+                                    }
                                 },
                             }
                             div { class: "splitter ghost" }
@@ -1061,6 +1108,8 @@ fn SplitPanes(
                         div { class: "chart-cell",
                             Rail {
                                 content: far.chart,
+                                port: ports.chart,
+                                at: shift.chart,
                                 on_slide: move |(left, width)| {
                                     let now = shifted();
                                     if now.chart != left {
@@ -1152,6 +1201,8 @@ fn SoloGrid() -> Element {
                 div { class: "chart-cell",
                     Rail {
                         content: reach().table,
+                        port: grid_scroll().width,
+                        at: shifted().table,
                         on_slide: move |(left, width)| {
                             let now = shifted();
                             if now.table != left {
@@ -1199,7 +1250,7 @@ fn Splitter(on_grab: EventHandler<f64>) -> Element {
 /// thumb by hand would have meant knowing the strip's own width in pixels, and
 /// a window that has been resized since it was measured cannot be asked.
 #[component]
-fn Rail(content: f64, on_slide: EventHandler<(f64, f64)>) -> Element {
+fn Rail(content: f64, port: f64, at: f64, on_slide: EventHandler<(f64, f64)>) -> Element {
     rsx! {
         div {
             class: "rail",
@@ -1208,8 +1259,37 @@ fn Rail(content: f64, on_slide: EventHandler<(f64, f64)>) -> Element {
                 on_slide.call((data.scroll_left(), data.client_width() as f64));
             },
             div { class: "rail-run", style: "width: {content}px;" }
+            {thumb(false, at, port, content)}
         }
     }
+}
+
+/// A scrollbar thumb that is actually there to be seen.
+///
+/// The renderer draws its own, but as an overlay that fades out a moment after
+/// the last scroll, so most of the time there is nothing on screen to say that
+/// there is more to the right or below. This one is painted from the numbers
+/// the scroll events report and never fades.
+///
+/// It takes no pointer. The real thumb is underneath it in the same place, and
+/// that is the one that knows how to be dragged, so letting this one catch the
+/// press would be taking the drag away from the thing that can do it.
+fn thumb(down: bool, at: f64, port: f64, content: f64) -> Element {
+    // Nothing to say when everything already fits.
+    if content <= port + 1.0 || port <= 1.0 {
+        return rsx! {};
+    }
+    let share = (port / content).clamp(0.04, 1.0);
+    // Of the content, not of the scrollable remainder: the thumb then stands
+    // for the piece of the plan on screen, which is what it is for.
+    let from = (at / content).clamp(0.0, 1.0 - share);
+    let style = if down {
+        format!("top: {}%; height: {}%;", from * 100.0, share * 100.0)
+    } else {
+        format!("left: {}%; width: {}%;", from * 100.0, share * 100.0)
+    };
+    let class = if down { "thumb down" } else { "thumb across" };
+    rsx! { div { class: "{class}", style: "{style}" } }
 }
 
 /// One internal window: a title tab plus whatever it frames.
