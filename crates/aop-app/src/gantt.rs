@@ -1776,6 +1776,7 @@ pub fn TimelineBand() -> Element {
             },
             div { class: "timeline-caption", "{caption}" }
             svg { width: "{width}", height: "{height}", view_box: "0 0 {width} {height}", font_family: palette.font(),
+                style: "width: {width}px; height: {height}px; flex: none;",
                 line { x1: "{BAND_LEFT}", y1: "16", x2: "{width - BAND_RIGHT}", y2: "16",
                     stroke: palette.paint("--line"), stroke_width: "1" }
                 text { x: "{BAND_LEFT}", y: "11", class: "tl-minor", fill: palette.paint("--ink-soft"),
