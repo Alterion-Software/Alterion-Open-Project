@@ -2457,17 +2457,15 @@ button { font: inherit; color: inherit; }
   color: var(--ink);
 }
 
-/* Only a cell whose text would come out of it is clipped, and it is asked for
-   in Rust, per cell, rather than by every cell here.
+/* No cell clips. A clipping box costs a painting layer, the renderer keeps a
+   thousand of them for a whole frame, and a table drawing fifty rows of eight
+   columns wants four hundred: most of the window's ration spent on the table,
+   and nothing painted after the ration runs out is clipped at all. That is one
+   fault that showed up as three, in places with nothing to do with each other.
+   Cells over the splitter and into the chart, a dropdown's list outside its own
+   box, a menu outside its panel.
 
-   A clipping box is painted as a layer of its own and the renderer keeps a
-   thousand of them. A table drawing ninety rows of eight columns asks for
-   seven hundred and forty before the rest of the window has had one, and when
-   the ration runs out clipping stops silently: everything painted after that
-   spills. That is one fault wearing three faces, and all three were reported
-   as separate bugs. Table cells over the splitter and into the chart, a
-   dropdown's list outside its own box, and a menu outside its panel. */
-.grid td.tight { overflow: hidden; text-overflow: ellipsis; }
+   The text is cut to the column in Rust instead. See `grid::shorten`. */
 
 /* The gridline choices, as classes on the table so one toggle repaints
    without every cell carrying its own style. */

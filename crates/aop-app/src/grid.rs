@@ -534,29 +534,6 @@ pub fn TaskGrid(part: Part) -> Element {
                                                         cell_class.push_str(" rownum");
                                                     }
                                                     let value = field.value(project, index, pattern);
-                                                    // Clipped only if there is
-                                                    // something to clip. See
-                                                    // `overflows`: a clip is a
-                                                    // painting layer, layers
-                                                    // are rationed, and a
-                                                    // table that asks for one
-                                                    // per cell spends the
-                                                    // whole ration before the
-                                                    // rest of the window has
-                                                    // had any.
-                                                    let text = if field == Field::Name {
-                                                        task.name.as_str()
-                                                    } else {
-                                                        value.as_str()
-                                                    };
-                                                    let room = if field == Field::Name {
-                                                        column.width - 24.0 - task.outline_level as f64 * 12.0
-                                                    } else {
-                                                        column.width
-                                                    };
-                                                    if overflows(text, room) {
-                                                        cell_class.push_str(" tight");
-                                                    }
 
                                                     rsx! {
                                                         td {
@@ -625,7 +602,8 @@ pub fn TaskGrid(part: Part) -> Element {
 
                                                             {cell_body(
                                                                 field, project, index, summary, show_wbs,
-                                                                &currency, &value, is_editing, editor,
+                                                                &currency, &value, column.width,
+                                                                is_editing, editor,
                                                             )}
                                                         }
                                                     }
@@ -712,6 +690,36 @@ pub fn TaskGrid(part: Part) -> Element {
     }
 }
 
+/// A piece of text cut to the room it has, with an ellipsis if it was cut.
+///
+/// Cut here rather than clipped by the renderer. `overflow: hidden` is what a
+/// stylesheet would say, and it costs a painting layer per cell; the renderer
+/// keeps a thousand layers for a whole frame and a table drawing fifty rows of
+/// eight columns wants four hundred of them, which is most of the window's
+/// ration spent on a table. Whatever is painted after the ration runs out is
+/// not clipped at all, and that is one bug that shows up as three: cells over
+/// the splitter, a dropdown's list outside its box, a menu outside its panel.
+///
+/// The width comes from an average character, so the cut lands a character or
+/// so out either way on a proportional face. That is the trade: a cut that is
+/// approximately in the right place everywhere, against an exact one in the
+/// first four hundred cells and none at all after that.
+fn shorten(text: &str, room: f64) -> String {
+    if !overflows(text, room) {
+        return text.to_string();
+    }
+    const CHAR_W: f64 = 6.2;
+    const PADDING: f64 = 12.0;
+    // One character back for the ellipsis itself.
+    let fits = (((room - PADDING) / CHAR_W).floor() as isize - 1).max(0) as usize;
+    if fits == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(fits).collect();
+    out.push('\u{2026}');
+    out
+}
+
 /// Whether a piece of text is too long for the room it has.
 ///
 /// An estimate, from an average character width, and it only has to be roughly
@@ -758,6 +766,9 @@ fn cell_body(
     show_wbs: bool,
     currency: &str,
     value: &str,
+    // How wide the column is, so the text can be cut to it rather than clipped
+    // to it. See `shorten`.
+    room: f64,
     is_editing: bool,
     editor: Option<Column>,
 ) -> Element {
@@ -820,6 +831,9 @@ fn cell_body(
             } else {
                 task.name.clone()
             };
+            // The twisty in front of the name takes its own room, and the
+            // indent takes more the deeper the task sits.
+            let text = shorten(&text, room - indent - 14.0);
             rsx! {
                 div { class: "cell-name", style: "padding-left: {indent}px;",
                     if summary {
@@ -854,7 +868,10 @@ fn cell_body(
             }
         }
 
-        _ => rsx! { "{value}" },
+        _ => {
+            let text = shorten(value, room);
+            rsx! { "{text}" }
+        }
     }
 }
 
@@ -1010,5 +1027,42 @@ mod overflow_tests {
         // with no room at all is "yes, clip it".
         assert!(overflows("a", 0.0));
         assert!(overflows("a", 6.0));
+    }
+}
+
+#[cfg(test)]
+mod shorten_tests {
+    use super::*;
+
+    #[test]
+    fn text_that_fits_is_handed_back_whole() {
+        assert_eq!(shorten("3 days", 90.0), "3 days");
+        assert_eq!(shorten("Mon 13/10/25", 110.0), "Mon 13/10/25");
+    }
+
+    #[test]
+    fn text_that_does_not_fit_is_cut_and_says_so() {
+        let cut = shorten("CCT tool (Data Migration) Part of Fusion TIF", 120.0);
+        assert!(cut.ends_with('\u{2026}'), "a cut has to be visible as one");
+        assert!(cut.chars().count() < "CCT tool (Data Migration) Part of Fusion TIF".chars().count());
+        // And it has to actually fit, or the whole exercise is pointless.
+        assert!(!overflows(&cut, 120.0));
+    }
+
+    #[test]
+    fn a_column_with_no_room_at_all_shows_nothing() {
+        // Rather than an ellipsis on its own, or an arithmetic wrap.
+        assert_eq!(shorten("anything", 0.0), "");
+        assert_eq!(shorten("anything", 12.0), "");
+    }
+
+    #[test]
+    fn a_cut_never_splits_a_character() {
+        // Counted in characters, not bytes: a task may be named in any script,
+        // and slicing a string by bytes panics in the middle of a character.
+        let name = "r\u{e9}sum\u{e9} r\u{e9}sum\u{e9} r\u{e9}sum\u{e9}";
+        let cut = shorten(name, 40.0);
+        assert!(cut.chars().count() < name.chars().count());
+        assert!(cut.ends_with('\u{2026}'));
     }
 }
