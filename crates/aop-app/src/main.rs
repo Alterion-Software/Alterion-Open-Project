@@ -615,7 +615,16 @@ fn App() -> Element {
             div {
                 class: "workspace",
                 oncontextmenu: move |event| event.prevent_default(),
-                div { class: "viewbar", span { "{view.label()}" } }
+                div { class: "viewbar",
+                    // A letter to a line rather than a line turned on its
+                    // side. `writing-mode: vertical-rl` says this in one
+                    // declaration and is not implemented everywhere, and
+                    // where it is not the label lies flat and runs out of a
+                    // bar 22 pixels wide. Stacking needs nothing but a column.
+                    for (index, letter) in view.label().chars().enumerate() {
+                        span { key: "v{index}", class: if letter == ' ' { "gap" } else { "" }, "{letter}" }
+                    }
+                }
                 Workspace { view }
             }
 

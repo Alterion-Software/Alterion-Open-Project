@@ -2084,6 +2084,7 @@ button { font: inherit; color: inherit; }
   color: var(--ink-soft);
   flex: none;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
   border-right: 1px solid var(--line);
@@ -2099,12 +2100,14 @@ button { font: inherit; color: inherit; }
 }
 
 .viewbar span {
-  writing-mode: vertical-rl;
-  transform: rotate(180deg);
-  font-size: 10.5px;
-  letter-spacing: 0.8px;
-  white-space: nowrap;
+  font-size: 10px;
+  line-height: 1.15;
+  text-align: center;
+  width: 100%;
 }
+
+/* The space between words, kept as height rather than a blank letter. */
+.viewbar span.gap { height: 5px; }
 
 .split {
   flex: 1 1 auto;
@@ -2523,13 +2526,23 @@ button { font: inherit; color: inherit; }
 }
 
 .cell-input {
-  width: 100%;
+  /* Filling the cell rather than sitting inside it, so that starting to type
+     turns the cell into an editable one instead of dropping a box on top of
+     it. The negative margin covers the cell's own 6px padding and the width
+     makes that back up, then 1px of border and 5px of padding put the text
+     back on the pixel it was already on. Anything else moves the text the
+     moment it is clicked, which is the whole of "it does not feel like
+     editing in the table". */
+  width: calc(100% + 12px);
+  margin: 0 -6px;
   height: 20px;
   border: 1px solid var(--accent);
   outline: none;
   font: inherit;
-  padding: 0 4px;
-  background: var(--surface-4);
+  padding: 0 5px;
+  /* The row's own colour. The border says which cell is being edited; a
+     different background would say it twice and read as an overlay. */
+  background: var(--surface);
   color: var(--ink);
   -webkit-user-select: text;
   user-select: text;
