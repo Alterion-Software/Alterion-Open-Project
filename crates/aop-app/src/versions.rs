@@ -92,7 +92,7 @@ pub fn HistoryAndSync() -> Element {
                     class: "dlg-close",
                     title: "Close",
                     onclick: move |_| state.write().sync_open = false,
-                    "\u{2715}"
+                    {crate::icons::icon("x", 13)}
                 }
             }
             div { class: "sync-view",

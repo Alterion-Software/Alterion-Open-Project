@@ -2178,7 +2178,7 @@ pub fn SpellingPanel() -> Element {
                     class: "dlg-close",
                     title: "Close",
                     onclick: move |_| state.write().spelling_open = false,
-                    "\u{2715}"
+                    {crate::icons::icon("x", 13)}
                 }
             }
             div { class: "spell-panel-body",

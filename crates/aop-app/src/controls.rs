@@ -84,7 +84,7 @@ pub fn Dropdown(
                 open.set(!open());
             },
             span { class: "dd-value", "{selected}" }
-            span { class: "dd-caret", "\u{25be}" }
+            span { class: "dd-caret", {crate::icons::icon("caret-down", 13)} }
         }
 
         if open() {
@@ -196,7 +196,7 @@ pub fn MenuBtn(
             },
             span { class: "glyph", {crate::icons::icon(&glyph, size)} }
             span { class: "caption", "{caption}" }
-            span { class: "caret", "\u{25be}" }
+            span { class: "caret", {crate::icons::icon("caret-down", 12)} }
         }
 
         if open() {
@@ -276,7 +276,7 @@ pub fn ComboBox(
                     anchor.set((point.x - width + 22.0, point.y + 16.0));
                     open.set(!open());
                 },
-                span { class: "caret", "\u{25be}" }
+                span { class: "caret", {crate::icons::icon("caret-down", 12)} }
             }
         }
 

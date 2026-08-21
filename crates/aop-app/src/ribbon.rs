@@ -67,7 +67,7 @@ fn Group(title: String, launcher: bool, children: Element) -> Element {
             div { class: "rgroup-body", {children} }
             div { class: "rgroup-title",
                 "{title}"
-                if launcher { span { class: "launcher", "\u{2935}" } }
+                if launcher { span { class: "launcher", {crate::icons::icon("turn-down-right", 11)} } }
             }
         }
     }
@@ -192,7 +192,7 @@ pub fn TitleBar() -> Element {
                 div { class: "qat-sep" }
                 button { class: "qat-btn", title: "Customize Quick Access Toolbar",
                     onclick: move |_| state.write().dialog = Some(Dialog::CustomizeQat),
-                    span { class: "caret", "\u{25be}" }
+                    span { class: "caret", {crate::icons::icon("caret-down", 12)} }
                 }
             }
 

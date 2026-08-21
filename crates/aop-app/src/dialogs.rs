@@ -230,7 +230,7 @@ fn Head(title: String) -> Element {
     rsx! {
         div { class: "dlg-head",
             span { "{title}" }
-            button { class: "dlg-close", onclick: move |_| state.write().dialog = None, "\u{2715}" }
+            button { class: "dlg-close", onclick: move |_| state.write().dialog = None, {crate::icons::icon("x", 13)} }
         }
     }
 }
@@ -2746,7 +2746,7 @@ fn CustomizeQat() -> Element {
                                         button {
                                             class: "iconbtn danger", title: "Remove",
                                             onclick: move |_| state.write().toggle_qat(command),
-                                            "\u{2715}"
+                                            {crate::icons::icon("x", 13)}
                                         }
                                     }
                                 }

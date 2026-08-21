@@ -159,7 +159,7 @@ fn PickerCellEditor(row: usize, column: Column) -> Element {
                     let point = event.client_coordinates();
                     state.write().edit_cell_at(row, column, point.x, point.y);
                 },
-                "\u{25be}"
+                {crate::icons::icon("caret-down", 12)}
             }
         }
     }
@@ -321,7 +321,7 @@ pub fn TaskGrid() -> Element {
                                         key: "h{index}",
                                         class: "{align_class(field.align())}",
                                         title: "{field.label()}: {field.description()}",
-                                        style: "height: {HEADER_H}px;",
+                                        style: "height: {HEADER_H}px; width: {column.width}px;",
                                         oncontextmenu: move |event| {
                                             event.prevent_default();
                                             let point = event.client_coordinates();
@@ -746,7 +746,7 @@ fn cell_body(
 fn indicator_glyph(project: &aop_core::Project, index: usize) -> Element {
     let task = &project.tasks[index];
     if task.percent_complete >= 100 {
-        return rsx! { span { style: "color: var(--accent);", "\u{2714}" } };
+        return rsx! { span { style: "color: var(--accent);", {crate::icons::icon("tick", 13)} } };
     }
     // Being on the critical path is the thing most worth flagging: any slip
     // here moves the finish date. Once that has been acknowledged the marker
@@ -761,13 +761,13 @@ fn indicator_glyph(project: &aop_core::Project, index: usize) -> Element {
         return rsx! { span { class: "{class}", "\u{26a0}" } };
     }
     if !task.notes.is_empty() {
-        return rsx! { span { style: "color: var(--ink-soft);", "\u{270e}" } };
+        return rsx! { span { style: "color: var(--ink-soft);", {crate::icons::icon("pencil", 13)} } };
     }
     if task.deadline.is_some() {
-        return rsx! { span { style: "color: var(--bar-critical-edge);", "\u{2691}" } };
+        return rsx! { span { style: "color: var(--bar-critical-edge);", {crate::icons::icon("flag", 13)} } };
     }
     if task.constraint != ConstraintType::AsSoonAsPossible {
-        return rsx! { span { style: "color: var(--contextual);", "\u{25c9}" } };
+        return rsx! { span { style: "color: var(--contextual);", {crate::icons::icon("fisheye", 13)} } };
     }
     rsx! { span {} }
 }

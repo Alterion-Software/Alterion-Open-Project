@@ -71,6 +71,41 @@ fn body_for(name: &str) -> String {
         //
         // Fetched from the icon set rather than drawn here: a hand made
         // approximation of a well known icon reads as an approximation.
+        // Six shapes that used to be typed as characters and were not there.
+        //
+        // A caret, a tick, a flag, a pencil, a dot and a turning arrow are
+        // affordances, not text, and typing them as codepoints made them
+        // depend on the font having that glyph. The bundled font does not have
+        // any of these six, and with no system fallback they simply were not
+        // drawn: every dropdown lost its caret and nothing said so. Drawn
+        // here, they are the same in every build on every machine, they take
+        // their colour from `currentColor` like the rest of the set, and they
+        // line up by geometry rather than by a font's baseline.
+        //
+        // lucide: chevron-down
+        "caret-down" => String::from("<path d='m6 9 6 6 6-6' />"),
+        // lucide: check
+        "tick" => String::from("<path d='M20 6 9 17l-5-5' />"),
+        // lucide: flag
+        "flag" => String::from(
+            "<path d='M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z' />\
+             <line x1='4' x2='4' y1='22' y2='15' />",
+        ),
+        // lucide: pencil
+        "pencil" => String::from(
+            "<path d='M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 \
+             4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z' />\
+             <path d='m15 5 4 4' />",
+        ),
+        // lucide: circle-dot
+        "fisheye" => String::from(
+            "<circle cx='12' cy='12' r='10' /><circle cx='12' cy='12' r='2.5' />",
+        ),
+        // lucide: corner-down-right
+        "turn-down-right" => String::from(
+            "<path d='m15 10 5 5-5 5' /><path d='M4 4v7a4 4 0 0 0 4 4h12' />",
+        ),
+
         // lucide: user
         "account" => String::from(
             "<path d='M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2' /><circle cx='12' cy='7' r='4' />",

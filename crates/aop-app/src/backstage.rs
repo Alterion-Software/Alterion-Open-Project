@@ -1831,7 +1831,7 @@ fn AboutPage() -> Element {
                         }
                         button { class: "dlg-close",
                             onclick: move |_| show_attributions.set(false),
-                            "\u{2715}"
+                            {crate::icons::icon("x", 13)}
                         }
                     }
                     div { class: "dlg-body",

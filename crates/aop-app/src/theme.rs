@@ -518,6 +518,7 @@ button { font: inherit; color: inherit; }
 }
 
 .tab {
+  justify-content: flex-start;
   display: flex;
   align-items: center;
   padding: 0 14px;
@@ -636,6 +637,7 @@ button { font: inherit; color: inherit; }
 .rbtn-lg .caption { white-space: normal; overflow-wrap: anywhere; }
 
 .rbtn-sm {
+  justify-content: flex-start;
   display: flex;
   align-items: center;
   gap: 5px;
@@ -773,6 +775,7 @@ button { font: inherit; color: inherit; }
 }
 
 .dd-item {
+  justify-content: flex-start;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -882,6 +885,7 @@ button { font: inherit; color: inherit; }
 }
 
 .bs-back {
+  justify-content: flex-start;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -897,6 +901,7 @@ button { font: inherit; color: inherit; }
 .bs-back:hover { background: var(--hover); }
 
 .bs-item {
+  justify-content: flex-start;
   display: flex;
   align-items: center;
   gap: 11px;
@@ -1170,6 +1175,7 @@ button { font: inherit; color: inherit; }
 
 
 .tpl-card {
+  justify-content: flex-start;
   border: 1px solid var(--line);
   border-radius: 5px;
   background: var(--surface);
@@ -1203,6 +1209,7 @@ button { font: inherit; color: inherit; }
 .recent-list { max-width: 680px; }
 
 .recent-row {
+  justify-content: flex-start;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -1808,6 +1815,7 @@ button { font: inherit; color: inherit; }
 .about-row .v { color: var(--ink); text-align: right; }
 
 .about-attr-btn {
+  justify-content: flex-start;
   margin: 24px auto 0;
   display: flex;
   align-items: center;
@@ -2186,7 +2194,9 @@ button { font: inherit; color: inherit; }
   z-index: 3;
   overflow: visible;
   background: var(--grid-header);
-  border: 1px solid var(--grid-line);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--grid-line);
   border-top: 0;
   height: 38px;
   font-weight: 500;
@@ -2200,7 +2210,9 @@ button { font: inherit; color: inherit; }
 .grid th.num { text-align: center; }
 
 .grid td {
-  border: 1px solid var(--grid-line);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--grid-line);
   height: 22px;
   padding: 0 6px;
   overflow: hidden;
@@ -2948,6 +2960,7 @@ button { font: inherit; color: inherit; }
 /* The fields this plan already uses, as a way back to one. */
 .cf-inuse { display: flex; flex-wrap: wrap; gap: 6px; }
 .cf-chip {
+  justify-content: flex-start;
   display: flex;
   align-items: baseline;
   gap: 7px;

@@ -72,7 +72,7 @@ fn MiniBtn(
             if let Some(colour) = swatch {
                 span { class: "colour-bar", style: "background: {colour};" }
             }
-            if caret { span { class: "caret", "\u{25be}" } }
+            if caret { span { class: "caret", {crate::icons::icon("caret-down", 12)} } }
         }
     }
 }
