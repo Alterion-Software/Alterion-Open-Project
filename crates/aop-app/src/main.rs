@@ -151,8 +151,10 @@ fn main() {
                 .with_window_attributes(
                     dioxus_native::WindowAttributes::default().with_title(APP_NAME),
                 )
-                // Carried rather than hoped for. See `fonts::UI`.
-                .with_fonts(vec![crate::fonts::UI]),
+                // Carried rather than hoped for. See `fonts::UI`. 0.8 takes a
+                // font context directly, so the patched copy of this crate
+                // that used to be needed for it is gone.
+                .with_font_ctx(dioxus_native::build_single_font_ctx(crate::fonts::UI)),
         )],
     );
 }
