@@ -1024,6 +1024,76 @@ fn SplitPanes(
                     // drag. The grip is in the heading and the travelling is
                     // over the rows, which are two different boxes now, and
                     // this sheet is the one thing that covers both.
+                    // ordinary clipped boxes again.
+                    div { class: "pane left", style: "{left_cell}",
+                        div { class: "pane-head",
+                            div { class: "shift", style: "margin-left: -{shift.table}px;",
+                                {left_head}
+                            }
+                        }
+                        div {
+                            class: "pane-body",
+                            onwheel: move |event| wheel(event, &mut down, rows_len, panes),
+                            div {
+                                class: "shift",
+                                style: "margin: -{down().0}px 0 0 -{shift.table}px;",
+                                {left_body}
+                            }
+                        }
+                        div { class: "pane-rail",
+                            {thumb(false, shift.table, ports.table, far.table, Some(EventHandler::new(move |x| {
+                                rail_drag.set(Some((RailSide::Table, x, shifted().table)));
+                            })))}
+                        }
+                    }
+
+                    Splitter { on_grab: move |x| {
+                        let width = state.read().table_view_width();
+                        resize_from.set(Some((x, width)));
+                    } }
+
+                    div { class: "pane right",
+                        div { class: "pane-head",
+                            div { class: "shift", style: "margin-left: -{shift.chart}px;",
+                                {right_head}
+                            }
+                        }
+                        div {
+                            class: "pane-body",
+                            onwheel: move |event| wheel(event, &mut down, rows_len, panes),
+                            div {
+                                class: "shift",
+                                style: "margin: -{down().0}px 0 0 -{shift.chart}px;",
+                                {right_body}
+                            }
+                        }
+                        div { class: "pane-rail",
+                            {thumb(false, shift.chart, ports.chart, far.chart, Some(EventHandler::new(move |x| {
+                                rail_drag.set(Some((RailSide::Chart, x, shifted().chart)));
+                            })))}
+                        }
+                    }
+
+                    // The bar down the right, over both panes, because they
+                    // fill the split and there is no column left to give it.
+                    div { class: "vbar",
+                        {thumb(true, down().0, down().1, rows_len as f64 * gantt::ROW_H,
+                               Some(EventHandler::new(move |y| {
+                                   down_drag.set(Some((y, down().0)));
+                               })))}
+                    }
+
+                    // The sheets that carry a drag, and last of all.
+                    //
+                    // A sheet declared before the panes is behind them for the
+                    // purpose of deciding what the pointer is over: this
+                    // renderer answers that in tree order, and a z-index does
+                    // not change its mind. So the thumb, which is drawn after,
+                    // was taking every event the sheet was there to catch. The
+                    // drag only moved while the pointer had run ahead of the
+                    // thumb, and letting go over the thumb never reached the
+                    // sheet that clears it, so the plan carried on following
+                    // the mouse with nothing held down.
                     if column_drag().is_some() {
                         div {
                             class: "drag-shield col-resize",
@@ -1128,64 +1198,6 @@ fn SplitPanes(
                     // So nothing here scrolls itself. Both panes are moved by
                     // the same two numbers, which is a stronger guarantee than
                     // two scroll positions kept in step, and the boxes are
-                    // ordinary clipped boxes again.
-                    div { class: "pane left", style: "{left_cell}",
-                        div { class: "pane-head",
-                            div { class: "shift", style: "margin-left: -{shift.table}px;",
-                                {left_head}
-                            }
-                        }
-                        div {
-                            class: "pane-body",
-                            onwheel: move |event| wheel(event, &mut down, rows_len, panes),
-                            div {
-                                class: "shift",
-                                style: "margin: -{down().0}px 0 0 -{shift.table}px;",
-                                {left_body}
-                            }
-                        }
-                        div { class: "pane-rail",
-                            {thumb(false, shift.table, ports.table, far.table, Some(EventHandler::new(move |x| {
-                                rail_drag.set(Some((RailSide::Table, x, shifted().table)));
-                            })))}
-                        }
-                    }
-
-                    Splitter { on_grab: move |x| {
-                        let width = state.read().table_view_width();
-                        resize_from.set(Some((x, width)));
-                    } }
-
-                    div { class: "pane right",
-                        div { class: "pane-head",
-                            div { class: "shift", style: "margin-left: -{shift.chart}px;",
-                                {right_head}
-                            }
-                        }
-                        div {
-                            class: "pane-body",
-                            onwheel: move |event| wheel(event, &mut down, rows_len, panes),
-                            div {
-                                class: "shift",
-                                style: "margin: -{down().0}px 0 0 -{shift.chart}px;",
-                                {right_body}
-                            }
-                        }
-                        div { class: "pane-rail",
-                            {thumb(false, shift.chart, ports.chart, far.chart, Some(EventHandler::new(move |x| {
-                                rail_drag.set(Some((RailSide::Chart, x, shifted().chart)));
-                            })))}
-                        }
-                    }
-
-                    // The bar down the right, over both panes, because they
-                    // fill the split and there is no column left to give it.
-                    div { class: "vbar",
-                        {thumb(true, down().0, down().1, rows_len as f64 * gantt::ROW_H,
-                               Some(EventHandler::new(move |y| {
-                                   down_drag.set(Some((y, down().0)));
-                               })))}
-                    }
                 }
             }
         }
@@ -1228,18 +1240,6 @@ fn SoloGrid() -> Element {
 
     rsx! {
         div { class: "split solo",
-            if column_drag().is_some() {
-                div {
-                    class: "drag-shield col-resize",
-                    onmousemove: move |event| {
-                        if let Some((column, from_x, from_width)) = column_drag() {
-                            let moved = event.client_coordinates().x - from_x;
-                            state.write().set_column_width(column, from_width + moved);
-                        }
-                    },
-                    onmouseup: move |_| column_drag.set(None),
-                }
-            }
             div { class: "pane",
                 div { class: "pane-head",
                     div { class: "shift", style: "margin-left: -{shift.table}px;",
@@ -1266,6 +1266,20 @@ fn SoloGrid() -> Element {
                        Some(EventHandler::new(move |y| {
                            down_drag.set(Some((y, down().0)));
                        })))}
+            }
+
+            // Last, so the pointer finds it. See the note in `SplitPanes`.
+            if column_drag().is_some() {
+                div {
+                    class: "drag-shield col-resize",
+                    onmousemove: move |event| {
+                        if let Some((column, from_x, from_width)) = column_drag() {
+                            let moved = event.client_coordinates().x - from_x;
+                            state.write().set_column_width(column, from_width + moved);
+                        }
+                    },
+                    onmouseup: move |_| column_drag.set(None),
+                }
             }
             if rail_drag().is_some() {
                 div {
@@ -1868,3 +1882,37 @@ fn run_action(state: &mut Signal<AppState>, action: keymap::Action) {
 /// Zoom levels are exposed here so the status bar and ribbon agree on order.
 #[allow(dead_code)]
 const ZOOM_ORDER: [Zoom; 4] = Zoom::ORDER;
+
+#[cfg(test)]
+mod shield_order_tests {
+    /// The sheets that carry a drag have to be declared after everything they
+    /// are meant to cover.
+    ///
+    /// This renderer decides what the pointer is over in tree order, and a
+    /// z-index does not change its mind. A sheet written before the panes is
+    /// therefore behind them: the scrollbar thumb, drawn after, took every
+    /// event the sheet existed to catch, so the drag only moved while the
+    /// pointer had run ahead of the thumb, and letting go over the thumb never
+    /// reached the sheet that clears the drag, leaving the plan following a
+    /// mouse with nothing held down.
+    #[test]
+    fn a_drag_sheet_comes_after_what_it_covers() {
+        let source = include_str!("main.rs");
+        for shell in ["fn SplitPanes(", "fn SoloGrid("] {
+            let at = source.find(shell).expect(shell);
+            let body = &source[at..];
+            let end = body.find("\n}\n").unwrap_or(body.len());
+            let body = &body[..end];
+            let last_pane = body.rfind("class: \"vbar\"").expect("the bar down the right");
+            for sheet in ["column_drag().is_some()", "rail_drag().is_some()", "down_drag().is_some()"] {
+                if let Some(at) = body.find(sheet) {
+                    assert!(
+                        at > last_pane,
+                        "{shell}: the sheet for `{sheet}` is declared before the panes, \
+                         so the pointer will never reach it"
+                    );
+                }
+            }
+        }
+    }
+}
