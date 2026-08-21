@@ -2157,6 +2157,14 @@ button { font: inherit; color: inherit; }
      wide the window is. */
   flex: 0 1 auto;
   min-width: 120px;
+  /* Clipped, because it can now be squeezed narrower than what is inside it.
+     While this pane was `flex: none` it was always exactly as wide as the grid
+     it holds and nothing could spill; giving the chart a floor made this pane
+     shrinkable, and a shrinkable box holding a fixed width child paints that
+     child straight out through its own edge unless it is told not to.
+     The scrolling belongs to `.grid-pane` inside, which is the thing that
+     knows how far there is to scroll. */
+  overflow: hidden;
   background: var(--surface);
 }
 
@@ -4505,5 +4513,36 @@ mod pane_floor_tests {
             !block.contains("flex: none"),
             "the table pane has to be shrinkable for the chart's floor to hold"
         );
+    }
+}
+
+#[cfg(test)]
+mod pane_clip_tests {
+    use super::*;
+
+    /// The rule for a class, taken from the start of a line so a qualified
+    /// selector containing the same class cannot be picked up instead.
+    fn rule(selector: &str) -> &'static str {
+        let at = CSS.find(&format!("\n{selector}")).expect(selector) + 1;
+        &CSS[at..at + CSS[at..].find('}').expect("a closing brace")]
+    }
+
+    #[test]
+    fn a_pane_that_can_shrink_also_clips() {
+        // These two go together and the pairing is easy to break: a pane made
+        // shrinkable without being clipped paints its contents out through its
+        // own edge and across whatever is beside it, which is what happened
+        // the moment the chart was given a floor.
+        for selector in [".pane-left {", ".chart-pane {"] {
+            let block = rule(selector);
+            let shrinkable = !block.contains("flex: none");
+            if shrinkable {
+                assert!(
+                    block.contains("overflow: hidden") || block.contains("overflow: auto"),
+                    "{selector} can be squeezed narrower than its contents, so it has \
+                     to clip them"
+                );
+            }
+        }
     }
 }
