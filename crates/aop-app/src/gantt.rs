@@ -1774,8 +1774,37 @@ pub fn TimelineBand() -> Element {
                     }
                 }
             },
+            // And measured on arrival as well, because `onresize` is an event
+            // not every renderer sends. Where it is not sent the band never
+            // learns its width and draws itself at the fallback, which is a
+            // band far narrower than the room it has.
+            //
+            // Asked again until there is something to measure: mounting
+            // happens before layout, so the first answer is honestly zero.
+            onmounted: move |event| async move {
+                for _ in 0..24u32 {
+                    match event.get_client_rect().await {
+                        Ok(rect) if rect.width() > 1.0 => {
+                            let seen = rect.width().round();
+                            if (band_width() - seen).abs() >= 1.0 {
+                                measured.set(Some(seen));
+                            }
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                }
+            },
             div { class: "timeline-caption", "{caption}" }
-            svg { width: "{width}", height: "{height}", view_box: "0 0 {width} {height}", font_family: palette.font(),
+            // No viewBox. It gives the contents their own coordinate space, and
+            // a space that does not match the element is scaled to fit it, so a
+            // band drawn at a stale width is not merely narrow, it is magnified
+            // until a date reads like a headline. Without one the contents are
+            // drawn at their own size whatever the element turns out to be,
+            // and being narrow is the worst that can happen.
+            svg { width: "{width}", height: "{height}", font_family: palette.font(),
                 style: "width: {width}px; height: {height}px; flex: none;",
                 line { x1: "{BAND_LEFT}", y1: "16", x2: "{width - BAND_RIGHT}", y2: "16",
                     stroke: palette.paint("--line"), stroke_width: "1" }

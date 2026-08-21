@@ -98,6 +98,23 @@ pub struct Panel {
     pub on_close: EventHandler<()>,
 }
 
+impl Panel {
+    /// Whether two panels would draw identically.
+    ///
+    /// Everything except the callbacks, which are rebuilt on every describe
+    /// and so never compare equal, and which cannot differ while the rest is
+    /// the same anyway: they close over the same component's signals.
+    fn looks_the_same_as(&self, other: &Panel) -> bool {
+        self.owner == other.owner
+            && self.at == other.at
+            && self.min_width == other.min_width
+            && self.width == other.width
+            && self.chosen == other.chosen
+            && self.empty == other.empty
+            && self.rows == other.rows
+    }
+}
+
 /// The panel currently over the window.
 #[derive(Clone, Copy)]
 pub struct Layer(Signal<Option<Panel>>);
@@ -111,7 +128,17 @@ impl Layer {
     ///
     /// Replacing rather than refusing: opening a second menu while one is open
     /// should show the second, which is what every other application does.
+    ///
+    /// Silent when nothing has actually changed. A panel is rebuilt every time
+    /// the effect that describes it runs, and it carries fresh `EventHandler`s
+    /// each time, so it never compares equal to the one already up even when
+    /// every visible part of it is identical. Setting the signal regardless
+    /// re-renders this layer for nothing, and doing that often enough starves
+    /// the frame the interface is drawn in.
     pub fn put(&mut self, panel: Panel) {
+        if self.0.read().as_ref().is_some_and(|up| up.looks_the_same_as(&panel)) {
+            return;
+        }
         self.0.set(Some(panel));
     }
 
