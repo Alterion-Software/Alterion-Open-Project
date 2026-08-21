@@ -403,7 +403,7 @@ pub fn TaskGrid() -> Element {
                                         format_work(*work_minutes),
                                     );
                                     rsx! {
-                                        tr { key: "band{line}", class: "row band",
+                                        tr { key: "band-{line}", class: "row band",
                                             td {
                                                 colspan: "{span_all}",
                                                 style: "height: {ROW_H}px; padding-left: {indent}px;",
@@ -443,7 +443,16 @@ pub fn TaskGrid() -> Element {
 
                                     rsx! {
                                         tr {
-                                            key: "row{index}",
+                                            // Keyed by the task's own id, not by
+                                            // where it happens to sit. A positional
+                                            // key means the same key stands for a
+                                            // different task the moment two rows
+                                            // change places, so a reorder is a
+                                            // wholesale rebuild rather than a move,
+                                            // and rebuilding a list this deeply
+                                            // nested is what walks a template path
+                                            // into a node that is not there.
+                                            key: "task-{task.id}",
                                             class: "{class}",
                                             style: "{row_style}",
 
@@ -503,7 +512,11 @@ pub fn TaskGrid() -> Element {
 
                                                     rsx! {
                                                         td {
-                                                            key: "c{position}",
+                                                            // By field, not by position: a
+                                                            // column moved or hidden must
+                                                            // not make every cell after it
+                                                            // a different node.
+                                                            key: "cell-{field:?}",
                                                             class: "{cell_class}",
                                                             style: "height: {ROW_H}px; width: {column.width}px;",
 
