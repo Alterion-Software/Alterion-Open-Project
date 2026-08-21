@@ -842,6 +842,47 @@ fn SplitPanes(
         let s = state.read();
         (s.table_view_width(), s.pane_focus, s.layout_rows().len())
     };
+    // A zoom changes what a pixel of the chart means.
+    //
+    // Where a pane is scrolled to is held in pixels, and rezooming the chart
+    // makes it a different number of pixels wide. The old offset then points
+    // at a different date, and zooming out far enough points it past the end
+    // of the plan altogether, which is a pane showing bare canvas.
+    //
+    // So the offset is carried across as a share of the plan rather than as a
+    // count of pixels: the same date stays at the left edge, which is what
+    // rezooming is supposed to do. Read with `peek` rather than by calling,
+    // because an effect that subscribes to what it writes runs forever.
+    let mut carried = use_signal(Reach::default);
+    use_effect(move || {
+        let now = reach();
+        let before = *carried.peek();
+        if (before.chart - now.chart).abs() < 1.0 && (before.table - now.table).abs() < 1.0 {
+            return;
+        }
+        let was = *shifted.peek();
+        let chart = if before.chart > 1.0 && now.chart > 1.0 {
+            was.chart * now.chart / before.chart
+        } else {
+            was.chart
+        };
+        let next = Shifted {
+            // The table's columns do not rescale when they are resized, they
+            // just take more or less room, so its offset is only held inside
+            // what there is to scroll.
+            table: was.table.clamp(0.0, (now.table - 1.0).max(0.0)),
+            chart: chart.clamp(0.0, (now.chart - 1.0).max(0.0)),
+        };
+        carried.set(now);
+        if next != was {
+            shifted.set(next);
+            // The chart draws the stretch of timescale it believes is on
+            // screen, and that belief is now out of date too.
+            let seen = *chart_scroll.peek();
+            chart_scroll.set(PaneScroll { left: next.chart, ..seen });
+        }
+    });
+
     let shift = shifted();
     let far = reach();
     // How wide each pane is, for sizing the scrollbar thumbs. Taken from the

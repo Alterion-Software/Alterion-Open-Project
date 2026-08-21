@@ -2202,7 +2202,19 @@ button { font: inherit; color: inherit; }
 /* A pane is cut off at its own edge and its contents are slid under it by the
    strip at the bottom. The heading and the rows are slid by the same number,
    which is what keeps a column title over its column. */
-.shift-clip { flex: 1 1 auto; min-width: 0; overflow: hidden; }
+/* A basis of zero, not `auto`.
+
+   `auto` means "start from the size of my contents", and the contents are the
+   whole table: a thousand pixels of columns inside a pane six hundred wide.
+   The box then wants to be as wide as the table, and a clipping box that is as
+   wide as what it holds clips nothing, which is why the last columns were
+   being painted over the splitter and across the chart. A basis of zero asks
+   for the room that is left instead, which is the pane, and then the clip has
+   something to do.
+
+   This is the second time this exact line has cost a day. The chart pane was
+   `flex: 1 1 auto` for the same reason and laid itself out over the table. */
+.shift-clip { flex: 1 1 0; min-width: 0; overflow: hidden; }
 /* Slid by a transform, not by a margin.
 
    A margin is a layout property: moving it re-runs the layout of everything
@@ -5027,5 +5039,32 @@ mod pinned_heading_tests {
             rule(".thumb.live {").contains("pointer-events: auto"),
             "the one that carries a drag has to be able to catch it"
         );
+    }
+}
+
+#[cfg(test)]
+mod clip_box_tests {
+    use super::*;
+
+    fn rule(selector: &str) -> &'static str {
+        let at = CSS.find(&format!("\n{selector}")).expect(selector) + 1;
+        &CSS[at..at + CSS[at..].find('}').expect("a closing brace")]
+    }
+
+    #[test]
+    fn a_box_that_exists_to_clip_is_not_sized_by_what_it_holds() {
+        // `flex: 1 1 auto` takes its starting size from its contents. For a box
+        // whose whole job is to be smaller than its contents, that is a box
+        // that never clips anything. It has cost this build a day twice: once
+        // as the chart pane laying itself out over the table, once as the
+        // table's last columns painted across the chart.
+        for selector in [".shift-clip {", ".chart-cell {"] {
+            let block = rule(selector);
+            assert!(
+                block.contains("flex: 1 1 0"),
+                "{selector} is there to be smaller than its contents, so it \
+                 cannot start from their size"
+            );
+        }
     }
 }

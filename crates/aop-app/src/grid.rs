@@ -410,7 +410,15 @@ pub fn TaskGrid(part: Part) -> Element {
                     // what `blitz_dom` reports as `invalid key` before taking
                     // the process down. A row of no height costs nothing and
                     // keeps the shape still.
-                    tr { key: "spacer-above", class: "row-spacer", style: "height: {window.above}px;" }
+                    tr { key: "spacer-above", class: "row-spacer",
+                        // With a cell in it. A row of a table is as tall as its
+                        // cells and no taller: a `tr` holding nothing has
+                        // nothing for a height to apply to, so the rows this
+                        // stands in for went unaccounted and everything drawn
+                        // below it rode up by that much, which is the top rows
+                        // sliding under the heading as soon as you scrolled.
+                        td { colspan: "{columns.len()}", style: "height: {window.above}px;" }
+                    }
 
                     for (offset, row) in rows[window.first..window.end].iter().enumerate() {
                         {
@@ -616,7 +624,9 @@ pub fn TaskGrid(part: Part) -> Element {
                         }
                     }
 
-                    tr { key: "spacer-below", class: "row-spacer", style: "height: {window.below}px;" }
+                    tr { key: "spacer-below", class: "row-spacer",
+                        td { colspan: "{columns.len()}", style: "height: {window.below}px;" }
+                    }
 
                     // The blank row at the bottom, where typing creates a task.
                     {
