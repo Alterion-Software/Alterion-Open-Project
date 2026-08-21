@@ -536,6 +536,26 @@ fn App() -> Element {
             class: "app",
             tabindex: "0",
             onkeydown: move |event| handle_shortcut(&mut state, event),
+            // Measured once, when there is something to measure.
+            //
+            // `onresize` below is how the window's size is learned as it
+            // changes, and it is the only way it was ever learned, which meant
+            // that until somebody dragged an edge the application believed the
+            // window was zero by zero. Every panel that places itself against
+            // the window then agreed there was room nowhere and went to the
+            // corner. `crate::placement` treats that as unknown rather than as
+            // tiny, but unknown still means no panel can turn away from an
+            // edge it is about to cross.
+            //
+            // A resize is also an event not every renderer sends. Measuring
+            // this element when it appears asks a question instead of waiting
+            // to be told, and it is answered on every renderer that can
+            // measure anything at all.
+            onmounted: move |event| async move {
+                if let Ok(rect) = event.get_client_rect().await {
+                    viewport.set((rect.width(), rect.height()));
+                }
+            },
             onresize: move |event| {
                 if let Ok(size) = event.get_content_box_size() {
                     let (was_w, was_h) = viewport();
