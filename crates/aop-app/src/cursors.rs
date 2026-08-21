@@ -37,7 +37,7 @@ use aop_core::grouping::GroupRow;
 
 use crate::cloud::live::{Cell, Peer, Pointer};
 use crate::cloud::{Account, oauth};
-use crate::gantt::{HEADER_H, ROW_H};
+use crate::gantt::ROW_H;
 use crate::state::AppState;
 use crate::theme::use_palette;
 
@@ -86,7 +86,11 @@ fn line_of(rows: &[GroupRow], row: i64) -> Option<usize> {
         .position(|line| matches!(line, GroupRow::Task(index) if *index == row))
 }
 
-/// Where a peer's pointer lands in the table, in the pane's own coordinates.
+/// Where a peer's pointer lands in the table, in the rows' own coordinates.
+///
+/// No heading to step over any more. The column titles and the timescale are
+/// in a row of the split above the one that scrolls, so the first pixel of the
+/// box these are placed in is the first pixel of the first row.
 fn in_table(state: &AppState, rows: &[GroupRow], at: Pointer) -> Option<(f64, f64)> {
     let Pointer::Table { row, column } = at else {
         return None;
@@ -96,7 +100,7 @@ fn in_table(state: &AppState, rows: &[GroupRow], at: Pointer) -> Option<(f64, f6
     // which is exactly why the column travels as a number and not as an x.
     let column = usize::from(column).min(state.columns.len().saturating_sub(1));
     let x: f64 = state.columns.iter().take(column).map(|c| c.width).sum();
-    Some((x + 7.0, HEADER_H + line as f64 * ROW_H + ROW_H / 2.0))
+    Some((x + 7.0, line as f64 * ROW_H + ROW_H / 2.0))
 }
 
 /// Where a peer's open cell lands in the table: its box, in the pane's own
@@ -111,7 +115,7 @@ fn cell_box(state: &AppState, rows: &[GroupRow], at: Cell) -> Option<(f64, f64, 
     let column = usize::from(at.column);
     let width = state.columns.get(column)?.width;
     let x: f64 = state.columns.iter().take(column).map(|c| c.width).sum();
-    Some((x, HEADER_H + line as f64 * ROW_H, width))
+    Some((x, line as f64 * ROW_H, width))
 }
 
 /// Where a peer's pointer lands on the chart, in the pane's own coordinates.
@@ -123,7 +127,7 @@ fn in_chart(state: &AppState, rows: &[GroupRow], at: Pointer) -> Option<(f64, f6
     // The scale comes from the plan, so two copies of the same plan work the
     // same origin out and the minutes mean the same thing on both.
     let x = minutes as f64 / 1440.0 * state.chart_scale().px_per_day;
-    Some((x, HEADER_H + line as f64 * ROW_H + ROW_H / 2.0))
+    Some((x, line as f64 * ROW_H + ROW_H / 2.0))
 }
 
 /// One peer and where their pointer lands, in a pane's own coordinates.

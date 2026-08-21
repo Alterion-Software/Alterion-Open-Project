@@ -14,7 +14,7 @@ use aop_core::{format_work, Align, ConstraintType, Field, TaskMode};
 
 use crate::icons::icon;
 use crate::gantt::{HEADER_H, ROW_H};
-use crate::viewport::PaneScroll;
+use crate::viewport::{ColumnDrag, GridScroll, Part, Reach};
 use crate::state::{format_date, AppState, Column, Dialog, DropWhere};
 
 /// Where in a row's height the pointer sits decides how a drop is applied.
@@ -228,7 +228,7 @@ fn CellEditor(row: usize, column: Column, initial: String) -> Element {
 }
 
 #[component]
-pub fn TaskGrid() -> Element {
+pub fn TaskGrid(part: Part) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let s = state.read();
     let project = &s.project;
@@ -237,15 +237,17 @@ pub fn TaskGrid() -> Element {
     // The table is as wide as its columns; the pane showing it may be narrower,
     // in which case it scrolls.
     let table_width: f64 = columns.iter().map(|c| c.width).sum();
-    // Wide as the splitter put it, unless the chart is hidden, in which case
-    // the table is the whole workspace and should say so. Written here rather
-    // than in the stylesheet because an inline width wins over any rule, so a
-    // rule could not have taken it back.
-    let pane_style = if s.pane_focus == crate::state::PaneFocus::TableOnly {
-        "width: 100%;".to_string()
-    } else {
-        format!("width: {}px;", s.table_view_width())
-    };
+    // How wide the pane is, is no longer this component's business. It draws
+    // its columns at their own width and the split clips and shifts it; what
+    // this does say is how far there is to go, so the strip along the bottom
+    // can offer the whole of it.
+    let mut reach = use_context::<Signal<Reach>>();
+    use_effect(use_reactive!(|table_width| {
+        let now = reach();
+        if now.table != table_width {
+            reach.set(Reach { table: table_width, ..now });
+        }
+    }));
     let editing = s.editing;
     let show_wbs = s.show_outline_number;
     let currency = project.currency_symbol.clone();
@@ -265,7 +267,14 @@ pub fn TaskGrid() -> Element {
     let drop_target = s.drop_target;
 
     // Which column is being resized, where the drag started and its width then.
-    let mut resizing = use_signal(|| None::<(usize, f64, f64)>);
+    //
+    // Held by the split rather than here. The grip that starts the drag is in
+    // the heading and the rows the pointer then travels over are in the body,
+    // and since those are now two boxes in two rows of the split, a signal
+    // private to either one would only be half the drag. The sheet that
+    // catches the movement is the split's too, for the same reason: it has to
+    // be able to cover both.
+    let mut resizing = use_context::<Signal<ColumnDrag>>();
 
     // Where this planner's pointer is, for the others in a live session. Kept
     // out of the plan's state so that moving a mouse across the table does not
@@ -274,44 +283,23 @@ pub fn TaskGrid() -> Element {
 
     // Only the rows inside the scrolled viewport are drawn; the rest are stood
     // in for by a spacer, so the pane still scrolls its full height.
-    let mut scroll = use_signal(PaneScroll::default);
+    //
+    // The scrolling itself belongs to the split now, because both panes ride
+    // one scroll container, which is what makes their rows stay level without
+    // anything having to be kept in step. What arrives here is only the answer
+    // to "which rows are on screen", and it is only written when that answer
+    // changes.
+    let scroll = use_context::<GridScroll>().0;
     let rows_len = rows.len();
     let window = scroll().window(rows_len);
 
-    rsx! {
-        // While a column is being resized the whole window listens, so moving
-        // the pointer faster than the grip can follow never drops the drag.
-        if resizing().is_some() {
-            div {
-                class: "drag-shield col-resize",
-                onmousemove: move |event| {
-                    if let Some((column, from_x, from_width)) = resizing() {
-                        let moved = event.client_coordinates().x - from_x;
-                        state.write().set_column_width(column, from_width + moved);
-                    }
-                },
-                onmouseup: move |_| resizing.set(None),
-            }
-        }
-
-        div {
-            class: "grid-pane",
-            style: "{pane_style}",
-            onscroll: move |event| {
-                let data = event.data();
-                let seen = PaneScroll {
-                    top: data.scroll_top(),
-                    height: data.client_height() as f64,
-                    left: data.scroll_left(),
-                    width: data.client_width() as f64,
-                };
-                // Writing on every scroll event would redraw the pane even when
-                // the same rows are still the ones on screen.
-                if scroll().window(rows_len) != seen.window(rows_len) {
-                    scroll.set(seen);
-                }
-            },
-
+    // The heading and the rows are the same table drawn twice, once into each
+    // row of the split. Splitting them is what pins the heading: it is not in
+    // the box that scrolls, so there is nothing for it to scroll away from.
+    // They are still worked out together, here, so a column width can never be
+    // one number in the titles and another in the cells.
+    let head = rsx! {
+        div { class: "grid-head", style: "width: {table_width}px;",
             table { class: "{grid_class}", style: "width: {table_width}px;",
                 // No colgroup. `table-layout: fixed` reads widths from the
                 // first row when there is no usable one, and the header cells
@@ -373,7 +361,13 @@ pub fn TaskGrid() -> Element {
                         }
                     }
                 }
+            }
+        }
+    };
 
+    let body = rsx! {
+        div { class: "grid-body", style: "width: {table_width}px;",
+            table { class: "{grid_class}", style: "width: {table_width}px;",
                 tbody {
                     // Always here, at whatever height the rows above need,
                     // rather than appearing when that height is more than
@@ -498,7 +492,7 @@ pub fn TaskGrid() -> Element {
                                                 state.write().open_task_menu(index, point.x, point.y);
                                             },
 
-                                            for (position, column) in columns.iter().enumerate() {
+                                            for (_position, column) in columns.iter().enumerate() {
                                                 {
                                                     let field = column.field;
                                                     let editor = editor_for(field);
@@ -651,11 +645,16 @@ pub fn TaskGrid() -> Element {
                 }
             }
 
-            // Inside the pane and after the table, so the pane's own scrolling
+            // Inside the body and after the table, so the split's scrolling
             // carries other people's pointers along with the rows they are on
             // and clips the ones that have scrolled off.
             crate::cursors::TableCursors {}
         }
+    };
+
+    match part {
+        Part::Head => head,
+        Part::Body => body,
     }
 }
 

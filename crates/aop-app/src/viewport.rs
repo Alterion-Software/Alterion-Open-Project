@@ -7,6 +7,7 @@
 //! rest replaced by a single spacer of the height they would have taken. The
 //! pane scrolls exactly as before; it just has far less in it.
 
+use dioxus::prelude::Signal;
 use crate::gantt::ROW_H;
 
 /// How many rows to draw beyond each edge of the viewport.
@@ -290,3 +291,66 @@ mod tests {
         assert!(!w.spans(0, 1), "this one is wholly above");
     }
 }
+
+/// Which half of a split pane a component is being asked to draw.
+///
+/// The heading and the rows of one pane are the same component seen twice,
+/// because they are worked out from the same numbers and drawing them apart
+/// would be two places to keep the column widths in step. They are rendered
+/// into different rows of the split, though, and that is the whole point: a
+/// heading that lives outside the scrolling box cannot scroll away from the
+/// rows it names, so it is pinned by where it sits rather than by asking to
+/// stay behind. `position: sticky` was the other way of saying this, and here
+/// it makes the heading a layer of its own and paints it over the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// The column titles, or the timescale.
+    Head,
+    /// The rows, or the bars.
+    Body,
+}
+
+/// How far each pane has been scrolled sideways, to the pixel.
+///
+/// Read by the split itself and by nothing else. The panes are not sideways
+/// scroll containers: a scroll container puts its bar at the far edge of its
+/// contents, and the contents here are a plan long enough that the bar would
+/// be somewhere below the bottom of the window. So the bar is a strip of its
+/// own along the bottom of each pane, and what it reports is applied to the
+/// heading and the rows as a shift. Both move by the same amount from the same
+/// number, which is what keeps a column title over its column.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Shifted {
+    pub table: f64,
+    pub chart: f64,
+}
+
+/// How wide each pane's contents are, so the strip along the bottom knows how
+/// far there is to go.
+///
+/// Written by the panes, read by the split. A pane knows its own width and the
+/// split does not: the table's is the sum of its columns, the chart's is the
+/// length of the plan at the current zoom.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Reach {
+    pub table: f64,
+    pub chart: f64,
+}
+
+impl Default for Reach {
+    fn default() -> Self {
+        Reach { table: ASSUMED_WIDTH, chart: ASSUMED_WIDTH }
+    }
+}
+
+/// Which column is being dragged wider, where the drag started and how wide it
+/// was then.
+pub type ColumnDrag = Option<(usize, f64, f64)>;
+
+/// Which rows the table is showing. Written by the split, read by the table.
+#[derive(Clone, Copy)]
+pub struct GridScroll(pub Signal<PaneScroll>);
+
+/// Which rows and which stretch of the timescale the chart is showing.
+#[derive(Clone, Copy)]
+pub struct ChartScroll(pub Signal<PaneScroll>);

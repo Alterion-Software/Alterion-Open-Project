@@ -14,7 +14,7 @@ use aop_core::draw::{place, snap_vertical, ChartMap, Drawing, Placement, ShapeKi
 use aop_core::grouping::GroupRow;
 use aop_core::{LinkType, Project, TaskId, WorkCalendar};
 
-use crate::viewport::{PaneScroll, RowWindow, SpanWindow};
+use crate::viewport::{ChartScroll, Part, Reach, RowWindow, SpanWindow};
 use crate::state::{AppState, BarDragKind, Dialog, DrawDragKind, ViewKind, Zoom};
 use crate::theme::Palette;
 
@@ -413,6 +413,9 @@ pub fn GanttChart(
     rows: Option<Vec<usize>>,
     /// Whether the chart can be edited. A report is a picture.
     interactive: bool,
+    /// The timescale, or the bars. Drawn into different rows of the split so
+    /// that the timescale is above the scrolling box rather than inside it.
+    part: Part,
 ) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let s = state.read();
@@ -500,7 +503,21 @@ pub fn GanttChart(
     // Only the rows inside the scrolled viewport are drawn. The body keeps its
     // full height, so every bar stays where it belongs and the pane scrolls
     // exactly as it did; what changes is how much of it exists at once.
-    let mut scroll = use_signal(PaneScroll::default);
+    // Written by the split, which owns the scrolling for both panes so their
+    // rows cannot drift apart, and only when the answer to "what is on screen"
+    // has changed.
+    // How far there is to scroll sideways. The split cannot work this out: it
+    // is the length of the plan at the current zoom, which only the chart
+    // knows. The strip along the bottom of the pane is sized from it.
+    let mut reach = use_context::<Signal<Reach>>();
+    use_effect(use_reactive!(|width| {
+        let now = reach();
+        if interactive && now.chart != width {
+            reach.set(Reach { chart: width, ..now });
+        }
+    }));
+
+    let scroll = use_context::<ChartScroll>().0;
     let rows_len = rows.len();
     let seen = scroll();
     // A report is never scrolled, so there is no viewport to window against:
@@ -508,7 +525,10 @@ pub fn GanttChart(
     // with pieces of itself missing.
     let (window, span) = if interactive {
         (
-            RowWindow::new(seen.top - HEADER_H, seen.height, rows_len),
+            // No head to subtract any more. The timescale is not in the box
+            // that scrolls, so the first pixel of the scroll is the first
+            // pixel of the first row.
+            RowWindow::new(seen.top, seen.height, rows_len),
             // The same idea sideways: a year of day columns is thousands of
             // pixels of gridline and tick label, and the pane shows a
             // screenful of it.
@@ -549,11 +569,70 @@ pub fn GanttChart(
             .filter(|at| shape_shows(*at, &span, &window))
     };
 
-    rsx! {
+    let head = rsx! {
+            // ---- pinned timescale ---------------------------------------
+            //
+            // Boxes, not an SVG. A tick is a rectangle with a label in it and
+            // a rule down its left edge, which is what a div already is, and
+            // drawing it as one takes the whole timescale out of the class of
+            // fault that has cost this build most of a day: a stylesheet does
+            // not reach inside an inline SVG here, nothing inside one is
+            // clipped by an ancestor's `overflow`, and a viewBox against a
+            // stale width magnifies everything it holds. None of those exist
+            // for an ordinary element.
+            div { class: "chart-head", style: "width: {width}px; height: {HEADER_H}px;",
+                div { class: "tl-tier tl-tier-major", style: "height: {TIER_H}px;",
+                    for (index, tick) in major.iter().enumerate().filter(|(_, t)| {
+                        let x = scale.x_date(t.from);
+                        span.overlaps(x, x + (t.to - t.from).num_days() as f64 * scale.px_per_day)
+                    }) {
+                        {
+                            let x = scale.x_date(tick.from);
+                            let w = (tick.to - tick.from).num_days() as f64 * scale.px_per_day;
+                            let label = fit(&tick.label, w);
+                            rsx! {
+                                div {
+                                    key: "mj{index}",
+                                    class: "tl-cell",
+                                    style: "left: {x}px; width: {w}px; height: {TIER_H}px;",
+                                    "{label}"
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "tl-tier tl-tier-minor",
+                    style: "top: {TIER_H}px; height: {HEADER_H - TIER_H}px;",
+                    for (index, tick) in minor.iter().enumerate().filter(|(_, t)| {
+                        let x = scale.x_date(t.from);
+                        span.overlaps(x, x + (t.to - t.from).num_days() as f64 * scale.px_per_day)
+                    }) {
+                        {
+                            let x = scale.x_date(tick.from);
+                            let w = (tick.to - tick.from).num_days() as f64 * scale.px_per_day;
+                            let weekend = !project.calendar.is_working_day(tick.from);
+                            let class = if weekend { "tl-cell weekend" } else { "tl-cell" };
+                            let label = fit(&tick.label, w);
+                            rsx! {
+                                div {
+                                    key: "mn{index}",
+                                    class: "{class}",
+                                    style: "left: {x}px; width: {w}px; height: {HEADER_H - TIER_H}px;",
+                                    "{label}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+    };
+
+    let body = rsx! {
         div {
             // A report sizes to the chart instead of being a pane the chart is
             // scrolled inside, so the whole chain is on the page at once.
-            class: if interactive { "chart-pane" } else { "chart-pane report" },
+            class: if interactive { "chart-body" } else { "chart-body report" },
+            style: "width: {width}px;",
             oncontextmenu: move |event| {
                 if !interactive {
                     return;
@@ -613,90 +692,7 @@ pub fn GanttChart(
                 s.cancel_bar_drag();
                 s.cancel_draw_drag();
             },
-            onscroll: move |event| {
-                if !interactive {
-                    return;
-                }
-                let data = event.data();
-                let now = PaneScroll {
-                    top: data.scroll_top(),
-                    height: data.client_height() as f64,
-                    left: data.scroll_left(),
-                    width: data.client_width() as f64,
-                };
-                // Redraw only when the scroll has actually brought something
-                // else into view, not on every frame of the scroll itself. The
-                // sideways margin is wide enough that this is most frames.
-                let before = scroll();
-                let same = RowWindow::new(before.top - HEADER_H, before.height, rows_len)
-                    == RowWindow::new(now.top - HEADER_H, now.height, rows_len)
-                    && before.span() == now.span();
-                if !same {
-                    scroll.set(now);
-                }
-            },
-
-            // The canvas carries the content width. Putting it on the pane
-            // would stop the pane from scrolling, because a scroll container
-            // cannot be wider than its own content.
-            div { class: "chart-canvas", style: "min-width: {width}px;",
-
-            // ---- pinned timescale ---------------------------------------
-            //
-            // Boxes, not an SVG. A tick is a rectangle with a label in it and
-            // a rule down its left edge, which is what a div already is, and
-            // drawing it as one takes the whole timescale out of the class of
-            // fault that has cost this build most of a day: a stylesheet does
-            // not reach inside an inline SVG here, nothing inside one is
-            // clipped by an ancestor's `overflow`, and a viewBox against a
-            // stale width magnifies everything it holds. None of those exist
-            // for an ordinary element.
-            div { class: "chart-head", style: "width: {width}px; height: {HEADER_H}px;",
-                div { class: "tl-tier tl-tier-major", style: "height: {TIER_H}px;",
-                    for (index, tick) in major.iter().enumerate().filter(|(_, t)| {
-                        let x = scale.x_date(t.from);
-                        span.overlaps(x, x + (t.to - t.from).num_days() as f64 * scale.px_per_day)
-                    }) {
-                        {
-                            let x = scale.x_date(tick.from);
-                            let w = (tick.to - tick.from).num_days() as f64 * scale.px_per_day;
-                            let label = fit(&tick.label, w);
-                            rsx! {
-                                div {
-                                    key: "mj{index}",
-                                    class: "tl-cell",
-                                    style: "left: {x}px; width: {w}px; height: {TIER_H}px;",
-                                    "{label}"
-                                }
-                            }
-                        }
-                    }
-                }
-                div { class: "tl-tier tl-tier-minor",
-                    style: "top: {TIER_H}px; height: {HEADER_H - TIER_H}px;",
-                    for (index, tick) in minor.iter().enumerate().filter(|(_, t)| {
-                        let x = scale.x_date(t.from);
-                        span.overlaps(x, x + (t.to - t.from).num_days() as f64 * scale.px_per_day)
-                    }) {
-                        {
-                            let x = scale.x_date(tick.from);
-                            let w = (tick.to - tick.from).num_days() as f64 * scale.px_per_day;
-                            let weekend = !project.calendar.is_working_day(tick.from);
-                            let class = if weekend { "tl-cell weekend" } else { "tl-cell" };
-                            let label = fit(&tick.label, w);
-                            rsx! {
-                                div {
-                                    key: "mn{index}",
-                                    class: "{class}",
-                                    style: "left: {x}px; width: {w}px; height: {HEADER_H - TIER_H}px;",
-                                    "{label}"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
+            div { class: "chart-canvas", style: "width: {width}px;",
             // ---- chart body ---------------------------------------------
             svg { class: "chart-svg", width: "{width}", height: "{body_h}",
                 view_box: "0 0 {width} {body_h}", font_family: palette.font(),
@@ -1173,6 +1169,11 @@ pub fn GanttChart(
             }
             }
         }
+    };
+
+    match part {
+        Part::Head => head,
+        Part::Body => body,
     }
 }
 

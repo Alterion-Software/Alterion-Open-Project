@@ -51,6 +51,7 @@ use aop_core::APP_NAME;
 
 use crate::icons::icon;
 use crate::state::{AppState, BackstagePage, Column, PaneFocus, ViewKind, Zoom};
+use crate::viewport::{ChartScroll, ColumnDrag, GridScroll, PaneScroll, Part, Reach, Shifted};
 
 /// Work around a WebKitGTK renderer that blanks the window on some machines.
 ///
@@ -792,61 +793,6 @@ fn watch_for_account_changes(mut state: Signal<AppState>) {
 #[cfg(not(feature = "desktop"))]
 fn watch_for_account_changes(_state: Signal<AppState>) {}
 
-/// Keeps the table and the chart scrolled to the same row.
-///
-/// Each pane owns its horizontal scrollbar, which means each is its own scroll
-/// container, so the vertical positions have to be linked explicitly.
-#[component]
-fn SyncPaneScroll() -> Element {
-    use_effect(move || {
-        document::eval(
-            r#"
-            (function () {
-              const grid = document.querySelector('.grid-pane');
-              const chart = document.querySelector('.chart-pane');
-              if (!grid || !chart) return;
-              if (grid.dataset.aopSynced === '1') return;
-              grid.dataset.aopSynced = '1';
-
-              let echo = false;
-              const link = (from, to) => from.addEventListener('scroll', () => {
-                if (echo) return;
-                echo = true;
-                to.scrollTop = from.scrollTop;
-                echo = false;
-              }, { passive: true });
-
-              link(grid, chart);
-              link(chart, grid);
-
-              // A plan is a long list, and one wheel notch moving three rows
-              // makes getting down it feel like work. The panes are linked
-              // above, so boosting either one carries the other with it.
-              const SPEED = 1.8;
-              const boost = (pane) => pane.addEventListener('wheel', (event) => {
-                // Leave zoom and sideways scrolling alone: those are other
-                // gestures that happen to arrive on the same event.
-                if (event.ctrlKey || event.shiftKey) return;
-                if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
-                // deltaMode counts lines (1) or pages (2) rather than pixels
-                // on some devices, so it is converted before being scaled.
-                const unit = event.deltaMode === 1
-                  ? 16
-                  : event.deltaMode === 2 ? pane.clientHeight : 1;
-                event.preventDefault();
-                pane.scrollTop += event.deltaY * unit * SPEED;
-              }, { passive: false });
-
-              boost(grid);
-              boost(chart);
-            })();
-            "#,
-        );
-    });
-
-    rsx! {}
-}
-
 /// Two internal windows side by side: a tab bar, a draggable splitter, and
 /// each pane able to take the whole frame.
 ///
@@ -860,17 +806,42 @@ fn SplitPanes(
     left_name: String,
     left_subtitle: String,
     right_name: String,
-    left: Element,
-    right: Element,
+    left_head: Element,
+    left_body: Element,
+    right_head: Element,
+    right_body: Element,
 ) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     // The grip stays under the pointer however the panes are scrolled, so the
     // drag is tracked from where it started rather than from the grip itself.
     let mut resize_from = use_signal(|| None::<(f64, f64)>);
+    let mut column_drag = use_context::<Signal<ColumnDrag>>();
 
-    let (grid_width, focus) = {
+    // Everything about scrolling lives here now, because both panes ride one
+    // scroll container and neither of them owns it.
+    let mut shifted = use_signal(Shifted::default);
+    let reach = use_context::<Signal<Reach>>();
+    let mut grid_scroll = use_context::<GridScroll>().0;
+    let mut chart_scroll = use_context::<ChartScroll>().0;
+
+    let (grid_width, focus, rows_len) = {
         let s = state.read();
-        (s.table_view_width(), s.pane_focus)
+        (s.table_view_width(), s.pane_focus, s.layout_rows().len())
+    };
+    let shift = shifted();
+    let far = reach();
+
+    // The left column of all three rows is one width, so a column title, the
+    // cells under it and the strip at the bottom are all cut off at the same
+    // place. The five pixels are the splitter, which is part of the column.
+    let left_cell = if focus == PaneFocus::TableOnly {
+        "flex: 1 1 auto;".to_string()
+    } else {
+        format!(
+            "width: {}px; flex: 0 1 auto; min-width: {}px;",
+            grid_width + SPLITTER_W,
+            crate::state::AppState::MIN_PANE
+        )
     };
 
     let mut split_class = String::from("split");
@@ -902,7 +873,6 @@ fn SplitPanes(
         div { class: "panes",
             // The two panes scroll sideways on their own, but their rows have
             // to stay level, so their vertical scroll is tied together.
-            SyncPaneScroll {}
             div { class: "pane-bar",
                 if focus != PaneFocus::ChartOnly {
                     // Matched to the pane below it, which means matching how
@@ -967,21 +937,271 @@ fn SplitPanes(
                         }
                     },
 
-                    div { class: "pane-left",
-                        {left}
+                    // While a column is being widened the whole split listens,
+                    // so a pointer moving faster than the grip cannot drop the
+                    // drag. The grip is in the heading and the travelling is
+                    // over the rows, which are two different boxes now, and
+                    // this sheet is the one thing that covers both.
+                    if column_drag().is_some() {
                         div {
-                            class: "splitter",
-                            onmousedown: move |event| {
-                                event.prevent_default();
-                                event.stop_propagation();
-                                let width = state.read().table_view_width();
-                                resize_from.set(Some((event.client_coordinates().x, width)));
+                            class: "drag-shield col-resize",
+                            onmousemove: move |event| {
+                                if let Some((column, from_x, from_width)) = column_drag() {
+                                    let moved = event.client_coordinates().x - from_x;
+                                    state.write().set_column_width(column, from_width + moved);
+                                }
                             },
+                            onmouseup: move |_| column_drag.set(None),
                         }
                     }
-                    {right}
+
+                    // ---- the headings -----------------------------------
+                    //
+                    // Above the box that scrolls, not inside it, which is the
+                    // whole of how they stay put. Asking them to stay behind
+                    // instead, with `position: sticky`, makes each one a layer
+                    // of its own here and paints it over the window.
+                    div { class: "split-heads",
+                        div { class: "pane-left", style: "{left_cell}",
+                            div { class: "shift-clip",
+                                div { class: "shift", style: "margin-left: -{shift.table}px;",
+                                    {left_head}
+                                }
+                            }
+                            Splitter { on_grab: move |x| {
+                                let width = state.read().table_view_width();
+                                resize_from.set(Some((x, width)));
+                            } }
+                        }
+                        div { class: "chart-cell",
+                            div { class: "shift-clip",
+                                div { class: "shift", style: "margin-left: -{shift.chart}px;",
+                                    {right_head}
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- the rows ---------------------------------------
+                    //
+                    // One scroll container holding both panes. That is what
+                    // makes their rows stay level: not two positions kept in
+                    // step, but one position. Keeping two in step is not open
+                    // to us anyway, since scrolling a box from code reports
+                    // itself unsupported on this renderer.
+                    div {
+                        class: "split-bodies",
+                        onscroll: move |event| {
+                            let data = event.data();
+                            let top = data.scroll_top();
+                            let height = data.client_height() as f64;
+                            // Written only when a different set of rows is on
+                            // screen. Every frame of a scroll would redraw both
+                            // panes to show the same rows again.
+                            let was = grid_scroll();
+                            let now = PaneScroll { top, height, ..was };
+                            if was.window(rows_len) != now.window(rows_len) {
+                                grid_scroll.set(now);
+                            }
+                            let was = chart_scroll();
+                            let now = PaneScroll { top, height, ..was };
+                            if was.window(rows_len) != now.window(rows_len) {
+                                chart_scroll.set(now);
+                            }
+                        },
+                        div { class: "pane-left", style: "{left_cell}",
+                            div { class: "shift-clip",
+                                div { class: "shift", style: "margin-left: -{shift.table}px;",
+                                    {left_body}
+                                }
+                            }
+                            Splitter { on_grab: move |x| {
+                                let width = state.read().table_view_width();
+                                resize_from.set(Some((x, width)));
+                            } }
+                        }
+                        div { class: "chart-cell",
+                            div { class: "shift-clip",
+                                div { class: "shift", style: "margin-left: -{shift.chart}px;",
+                                    {right_body}
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- the sideways bars -------------------------------
+                    //
+                    // A strip of its own along the bottom of each pane rather
+                    // than the pane scrolling itself. A box that scrolls puts
+                    // its bar at the far edge of what it holds, and what these
+                    // hold is a plan hundreds of rows deep, so the bar would be
+                    // somewhere below the bottom of the window. Here it is
+                    // always where it can be reached, and always showing.
+                    div { class: "split-rails",
+                        div { class: "pane-left", style: "{left_cell}",
+                            Rail {
+                                content: far.table,
+                                on_slide: move |(left, width)| {
+                                    let now = shifted();
+                                    if now.table != left {
+                                        shifted.set(Shifted { table: left, ..now });
+                                    }
+                                    let was = grid_scroll();
+                                    grid_scroll.set(PaneScroll { left, width, ..was });
+                                },
+                            }
+                            div { class: "splitter ghost" }
+                        }
+                        div { class: "chart-cell",
+                            Rail {
+                                content: far.chart,
+                                on_slide: move |(left, width)| {
+                                    let now = shifted();
+                                    if now.chart != left {
+                                        shifted.set(Shifted { chart: left, ..now });
+                                    }
+                                    // The chart draws only the stretch of
+                                    // timescale on screen, and that is worked
+                                    // out from this. It is coarse on purpose:
+                                    // the window carries a margin either side,
+                                    // so it changes far less often than the
+                                    // scroll does.
+                                    let was = chart_scroll();
+                                    let now = PaneScroll { left, width, ..was };
+                                    if was.span() != now.span() {
+                                        chart_scroll.set(now);
+                                    }
+                                },
+                            }
+                        }
+                    }
                 }
             }
+        }
+    }
+}
+
+/// The table on its own, in the same three rows the split uses.
+///
+/// The task sheet is one window rather than two, but a heading that scrolls
+/// away is no better here than it is beside a chart, so it is built the same
+/// way: titles above the box that scrolls, rows inside it, and a strip along
+/// the bottom to move both sideways together.
+#[component]
+fn SoloGrid() -> Element {
+    let mut shifted = use_signal(Shifted::default);
+    let reach = use_context::<Signal<Reach>>();
+    let mut grid_scroll = use_context::<GridScroll>().0;
+    let mut column_drag = use_context::<Signal<ColumnDrag>>();
+    let mut state = use_context::<Signal<AppState>>();
+    let rows_len = state.read().layout_rows().len();
+    let shift = shifted();
+
+    rsx! {
+        div { class: "split solo",
+            if column_drag().is_some() {
+                div {
+                    class: "drag-shield col-resize",
+                    onmousemove: move |event| {
+                        if let Some((column, from_x, from_width)) = column_drag() {
+                            let moved = event.client_coordinates().x - from_x;
+                            state.write().set_column_width(column, from_width + moved);
+                        }
+                    },
+                    onmouseup: move |_| column_drag.set(None),
+                }
+            }
+            div { class: "split-heads",
+                div { class: "chart-cell",
+                    div { class: "shift-clip",
+                        div { class: "shift", style: "margin-left: -{shift.table}px;",
+                            grid::TaskGrid { part: Part::Head }
+                        }
+                    }
+                }
+            }
+            div {
+                class: "split-bodies",
+                onscroll: move |event| {
+                    let data = event.data();
+                    let was = grid_scroll();
+                    let now = PaneScroll {
+                        top: data.scroll_top(),
+                        height: data.client_height() as f64,
+                        ..was
+                    };
+                    if was.window(rows_len) != now.window(rows_len) {
+                        grid_scroll.set(now);
+                    }
+                },
+                div { class: "chart-cell",
+                    div { class: "shift-clip",
+                        div { class: "shift", style: "margin-left: -{shift.table}px;",
+                            grid::TaskGrid { part: Part::Body }
+                        }
+                    }
+                }
+            }
+            div { class: "split-rails",
+                div { class: "chart-cell",
+                    Rail {
+                        content: reach().table,
+                        on_slide: move |(left, width)| {
+                            let now = shifted();
+                            if now.table != left {
+                                shifted.set(Shifted { table: left, ..now });
+                            }
+                            let was = grid_scroll();
+                            grid_scroll.set(PaneScroll { left, width, ..was });
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How wide the splitter is. The left column of every row of the split
+/// includes it, so a title, a cell and a scrollbar all end at the same pixel.
+pub const SPLITTER_W: f64 = 5.0;
+
+/// The grip between the panes.
+///
+/// Drawn once per row of the split so that the line between the panes runs
+/// unbroken from the column titles to the scrollbars. Each one can be dragged,
+/// because a grip you can see and not pull is worse than no grip.
+#[component]
+fn Splitter(on_grab: EventHandler<f64>) -> Element {
+    rsx! {
+        div {
+            class: "splitter",
+            onmousedown: move |event| {
+                event.prevent_default();
+                event.stop_propagation();
+                on_grab.call(event.client_coordinates().x);
+            },
+        }
+    }
+}
+
+/// One pane's sideways scrollbar.
+///
+/// A box that scrolls and holds nothing but a rule as wide as the pane's
+/// contents. The renderer gives it a real bar with a real thumb that can be
+/// dragged, clicked beside and thrown a wheel at, and what it reports is
+/// handed back so the heading and the rows can be shifted by it. Drawing a
+/// thumb by hand would have meant knowing the strip's own width in pixels, and
+/// a window that has been resized since it was measured cannot be asked.
+#[component]
+fn Rail(content: f64, on_slide: EventHandler<(f64, f64)>) -> Element {
+    rsx! {
+        div {
+            class: "rail",
+            onscroll: move |event| {
+                let data = event.data();
+                on_slide.call((data.scroll_left(), data.client_width() as f64));
+            },
+            div { class: "rail-run", style: "width: {content}px;" }
         }
     }
 }
@@ -1037,6 +1257,13 @@ fn PaneTab(
 #[component]
 fn Workspace(view: ViewKind) -> Element {
     let mut state = use_context::<Signal<AppState>>();
+    // Provided above the panes rather than inside the split, so that a pane
+    // handed to the split as a finished element finds them whichever way the
+    // renderer decides to parent it.
+    use_context_provider(|| Signal::new(Reach::default()));
+    use_context_provider(|| Signal::new(ColumnDrag::None));
+    use_context_provider(|| GridScroll(Signal::new(PaneScroll::default())));
+    use_context_provider(|| ChartScroll(Signal::new(PaneScroll::default())));
     // The splitter and the pane widths belong to SplitPanes now; what is left
     // here is only what the single window views need.
     let (rows, filter) = {
@@ -1059,8 +1286,10 @@ fn Workspace(view: ViewKind) -> Element {
                 left_name: "Entry Table".to_string(),
                 left_subtitle: filter_note.clone(),
                 right_name: view.label().to_string(),
-                left: rsx! { grid::TaskGrid {} },
-                right: rsx! { gantt::GanttChart { rows: None, interactive: true } },
+                left_head: rsx! { grid::TaskGrid { part: Part::Head } },
+                left_body: rsx! { grid::TaskGrid { part: Part::Body } },
+                right_head: rsx! { gantt::GanttChart { rows: None, interactive: true, part: Part::Head } },
+                right_body: rsx! { gantt::GanttChart { rows: None, interactive: true, part: Part::Body } },
             }
         },
 
@@ -1083,13 +1312,20 @@ fn Workspace(view: ViewKind) -> Element {
                     left_name: "Critical Path".to_string(),
                     left_subtitle: format!("{steps} on the chain"),
                     right_name: "Chart".to_string(),
-                    left: rsx! {
-                        div { class: "grid-pane cp-report", style: "width: {width}px;",
+                    // The report has no heading of its own to pin: it is a
+                    // page, not a table, so its head row is empty and the
+                    // page fills the body.
+                    left_head: rsx! {},
+                    left_body: rsx! {
+                        div { class: "cp-report", style: "width: {width}px;",
                             views::ReportPage { kind: view }
                         }
                     },
-                    right: rsx! {
-                        gantt::GanttChart { rows: Some(chain), interactive: false }
+                    right_head: rsx! {
+                        gantt::GanttChart { rows: Some(chain.clone()), interactive: false, part: Part::Head }
+                    },
+                    right_body: rsx! {
+                        gantt::GanttChart { rows: Some(chain), interactive: false, part: Part::Body }
                     },
                 }
             }
@@ -1119,11 +1355,7 @@ fn Workspace(view: ViewKind) -> Element {
                 }
                 div { class: "pane-frame",
                     match view {
-                        ViewKind::TaskSheet => rsx! {
-                            div { class: "split",
-                                div { class: "pane-left", grid::TaskGrid {} }
-                            }
-                        },
+                        ViewKind::TaskSheet => rsx! { SoloGrid {} },
                         ViewKind::TaskUsage => rsx! { views::TaskUsage {} },
                         ViewKind::ResourceUsage => rsx! { views::ResourceUsage {} },
                         ViewKind::NetworkDiagram => rsx! { views::NetworkDiagram {} },
