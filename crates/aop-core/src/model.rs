@@ -1078,12 +1078,16 @@ impl Project {
             }
             counters[level] += 1;
         }
-        counters
+        let mut code = counters
             .iter()
             .take(task.outline_level as usize + 1)
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
-            .join(".")
+            .join(".");
+        // A trailing stop, so a top level code reads as a number in a list
+        // rather than as a bare digit sitting against the name beside it.
+        code.push('.');
+        code
     }
 
     /// Rows the grid should draw, honouring collapsed summaries.
@@ -1935,5 +1939,32 @@ mod link_tests {
         project.set_successor_text(a, "2FF+3d");
         assert_eq!(project.links.len(), 1, "edited, not doubled");
         assert_eq!(project.predecessor_text(b), "1FF+3 days");
+    }
+}
+
+#[cfg(test)]
+mod wbs_tests {
+    use super::*;
+
+    #[test]
+    fn a_top_level_code_is_a_number_and_a_stop() {
+        let mut project = Project::default();
+        for (n, (name, level)) in
+            [("One", 0), ("One A", 1), ("One B", 1), ("Two", 0)].iter().enumerate()
+        {
+            let mut task = Task::new(n as TaskId + 1, *name, 480);
+            task.outline_level = *level;
+            project.tasks.push(task);
+        }
+        assert_eq!(project.wbs(0), "1.");
+        assert_eq!(project.wbs(1), "1.1.");
+        assert_eq!(project.wbs(2), "1.2.");
+        assert_eq!(project.wbs(3), "2.");
+    }
+
+    #[test]
+    fn a_row_that_is_not_there_has_no_code_rather_than_a_lone_stop() {
+        let project = Project::default();
+        assert_eq!(project.wbs(0), "");
     }
 }

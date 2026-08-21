@@ -1272,6 +1272,9 @@ button { font: inherit; color: inherit; }
   padding: 6px 16px;
   cursor: default;
   font: inherit;
+  /* A button is as wide as its label. Left to wrap it becomes two short lines
+     in a tall box, which is what "Import holidays from a file" turned into. */
+  white-space: nowrap;
 }
 
 .btn:hover { background: var(--surface-4); border-color: var(--accent-line); }

@@ -639,7 +639,9 @@ mod tests {
         let project = sample();
         // Row 2 of the simple template is the kickoff meeting, one day long.
         assert_eq!(Field::Id.value(&project, 1, "%d/%m/%y"), "2");
-        assert_eq!(Field::Wbs.value(&project, 1, "%d/%m/%y"), "1.1");
+        // Ends in a stop, so a top level code reads as a number in a list
+        // rather than a bare digit against the name beside it.
+        assert_eq!(Field::Wbs.value(&project, 1, "%d/%m/%y"), "1.1.");
         assert_eq!(Field::Duration.value(&project, 1, "%d/%m/%y"), "1 day");
         assert_eq!(Field::Summary.value(&project, 0, "%d/%m/%y"), "Yes");
         assert_eq!(Field::Summary.value(&project, 1, "%d/%m/%y"), "No");
