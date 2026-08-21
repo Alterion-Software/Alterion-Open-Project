@@ -1615,8 +1615,6 @@ button { font: inherit; color: inherit; }
 }
 
 .field-group {
-  position: sticky;
-  top: 0;
   background: var(--surface-2);
   border-bottom: 1px solid var(--line);
   padding: 7px 12px;
@@ -2247,10 +2245,19 @@ button { font: inherit; color: inherit; }
 
 .grid { border-collapse: collapse; table-layout: fixed; font-size: 12px; width: 100%; }
 
+/* Not sticky on this renderer.
+
+   Sticky positioning makes an element a stacking context here, and a stacking
+   context is painted as its own layer, outside the clip its pane established.
+   So a pinned table heading and a pinned timescale did not stay inside their
+   panel at all: they were drawn over the top of everything, which is what
+   "the headers are overlaid and nothing is clipped" turned out to mean.
+
+   Staying in the flow costs the pinning: a heading scrolls away with its rows
+   rather than staying at the top. That is a smaller loss than a heading lying
+   across the rest of the window, and the real fix is structural, putting the
+   heading outside the scrolling box rather than asking it to stay behind. */
 .grid th {
-  position: sticky;
-  top: 0;
-  z-index: 3;
   overflow: visible;
   background: var(--grid-header);
   /* The same hairlines the body cells draw, so the head reads as the top of
@@ -2326,9 +2333,6 @@ button { font: inherit; color: inherit; }
   text-align: center;
   color: var(--ink-faint);
   font-size: 11px;
-  position: sticky;
-  left: 0;
-  z-index: 2;
   cursor: grab;
   user-select: none;
 }
@@ -2552,7 +2556,7 @@ button { font: inherit; color: inherit; }
 
 /* Sticky already makes the header a containing block, which is what lets the
    resize grip position itself against the cell's own edge. */
-.grid th { position: sticky; }
+/* see the note by `.grid th` above: sticky is a stacking context here */
 .grid th .th-inner {
   position: relative;
   display: flex;
@@ -2698,9 +2702,6 @@ button { font: inherit; color: inherit; }
 /* Holds the chart's own width so the pane above can scroll to it. */
 .chart-canvas { display: block; }
 .chart-head {
-  position: sticky;
-  top: 0;
-  z-index: 4;
   background: var(--grid-header);
   /* The two tiers stack, and each is a strip of absolutely placed cells, so
      the head has to be the box they are placed against. */
@@ -3251,8 +3252,6 @@ button { font: inherit; color: inherit; }
 .sheet { border-collapse: collapse; font-size: 12px; width: 100%; table-layout: fixed; }
 
 .sheet th {
-  position: sticky;
-  top: 0;
   background: var(--grid-header);
   border: 1px solid var(--grid-line);
   height: 34px;
@@ -4663,5 +4662,30 @@ mod fills_the_window_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stacking_tests {
+    use super::*;
+
+    #[test]
+    fn nothing_asks_to_be_sticky() {
+        // `position: sticky` makes an element a stacking context on this
+        // renderer, and a stacking context is painted as its own layer,
+        // outside whatever clip its pane established. A pinned table heading
+        // and a pinned timescale were therefore not pinned inside their panel,
+        // they were laid over the whole window, and no amount of `overflow`
+        // anywhere could have stopped it.
+        //
+        // If pinning is wanted back, it has to come from structure: the
+        // heading outside the scrolling box rather than asking it to stay
+        // behind while its rows move.
+        let count = CSS.matches("position: sticky").count();
+        assert_eq!(
+            count, 0,
+            "{count} rule(s) still ask to be sticky, which paints them over \
+             everything else on this renderer"
+        );
     }
 }
