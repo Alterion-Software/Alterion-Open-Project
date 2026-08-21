@@ -569,8 +569,20 @@ fn App() -> Element {
                 // stale, and `crate::placement` degrades to placing panels
                 // where they were asked for rather than turning them away from
                 // edges that have moved.
-                if let Ok(rect) = event.get_client_rect().await {
-                    viewport.set((rect.width(), rect.height()));
+                match event.get_client_rect().await {
+                    Ok(rect) => {
+                        applog::applog!(
+                            "window: measured {:.0} by {:.0}",
+                            rect.width(),
+                            rect.height()
+                        );
+                        viewport.set((rect.width(), rect.height()));
+                    }
+                    // Said out loud, because everything that places itself
+                    // against the window depends on this one answer, and a
+                    // window nobody has measured looks exactly like a window
+                    // with no room in it to any arithmetic that trusts it.
+                    Err(why) => applog::applog!("window: could not be measured: {why}"),
                 }
             },
             onresize: move |event| {

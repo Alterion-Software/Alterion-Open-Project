@@ -5815,7 +5815,17 @@ impl AppState {
         // right was possible where squeezing the table to nothing by dragging
         // left never was, which is the asymmetry: one pane had a floor and the
         // other did not.
-        let most = (workspace - Self::MIN_PANE).max(Self::MIN_PANE);
+        // A workspace of zero is a window nobody has measured, not a window
+        // with no room in it, and the two must not be confused: read the
+        // second way, the maximum collapses onto the minimum and the pane is
+        // pinned at 120 pixels with the handle refusing to move at all. An
+        // unknown width means no upper limit rather than the tightest
+        // possible one.
+        let most = if workspace > Self::MIN_PANE * 2.0 {
+            workspace - Self::MIN_PANE
+        } else {
+            f64::MAX
+        };
         self.table_pane_width = width.clamp(Self::MIN_PANE, most);
     }
 
@@ -9629,12 +9639,21 @@ mod splitter_tests {
     }
 
     #[test]
+    fn a_window_nobody_has_measured_does_not_pin_the_handle() {
+        // The failure this guards. A workspace of zero read as a real width
+        // makes the maximum equal the minimum, and the pane sticks at 120
+        // pixels with the splitter refusing to move. Unknown has to mean
+        // unknown, the same way it does in `crate::placement`.
+        let mut s = AppState::default();
+        s.set_table_width(640.0, 0.0);
+        assert_eq!(s.table_view_width(), 640.0);
+    }
+
+    #[test]
     fn a_window_too_narrow_for_two_panes_still_answers() {
-        // Nothing sensible can be shared here, and the old arithmetic would
-        // have produced a maximum below the minimum and panicked on the clamp.
         let mut s = AppState::default();
         s.set_table_width(400.0, 100.0);
-        assert_eq!(s.table_view_width(), AppState::MIN_PANE);
+        assert_eq!(s.table_view_width(), 400.0);
     }
 
     #[test]
