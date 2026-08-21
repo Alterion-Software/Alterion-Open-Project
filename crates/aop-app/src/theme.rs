@@ -763,7 +763,9 @@ button { font: inherit; color: inherit; }
 .dd .dd-caret { font-size: 8px; color: var(--ink-soft); flex: none; }
 
 .dd-list {
-  position: fixed;
+  /* Rendered at the root through `crate::floating`, so its parent is the
+     window and `absolute` reaches it. See `.ctx-scrim` for the full reason. */
+  position: absolute;
   z-index: 90;
   background: var(--surface-4);
   border: 1px solid var(--line);
@@ -2084,9 +2086,9 @@ button { font: inherit; color: inherit; }
   color: var(--ink-soft);
   flex: none;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
+  position: relative;
   border-right: 1px solid var(--line);
   /* The label inside is turned on its side and told not to wrap, so it is far
      wider than this bar until something turns it. A renderer that does not
@@ -2099,15 +2101,24 @@ button { font: inherit; color: inherit; }
   overflow: hidden;
 }
 
+/* Written across and then turned, rather than asked to be laid out
+   vertically. `writing-mode: vertical-rl` is one declaration and is not
+   implemented everywhere; a rotation is painted rather than laid out, so it
+   works wherever anything is drawn at all.
+   The label is laid out as an ordinary line, which needs the width of a line
+   and only has 22 pixels of bar, so it is taken out of the flow and given the
+   bar's height to be long in. `transform-origin: center` then turns it about
+   its own middle and it lands back inside. */
 .viewbar span {
-  font-size: 10px;
-  line-height: 1.15;
+  position: absolute;
+  width: 100vh;
   text-align: center;
-  width: 100%;
+  transform: rotate(-90deg);
+  transform-origin: center;
+  font-size: 10.5px;
+  letter-spacing: 0.8px;
+  white-space: nowrap;
 }
-
-/* The space between words, kept as height rather than a blank letter. */
-.viewbar span.gap { height: 5px; }
 
 .split {
   flex: 1 1 auto;
@@ -2122,6 +2133,16 @@ button { font: inherit; color: inherit; }
 
 .split.hide-table .pane-left { display: none; }
 .split.hide-chart .chart-pane { display: none; }
+
+/* Maximising one pane should look the same whichever pane it is, and it did
+   not. The chart is `flex: 1 1 auto` and simply took the space the table left
+   behind; the table is `flex: none` at the width the splitter gave it, so
+   hiding the chart left it exactly as wide as it was with a gap beside it.
+   Both grow now, and only while the other is hidden. */
+.split.hide-chart .pane-left,
+.split.hide-chart .grid-pane { flex: 1 1 auto; }
+/* Nothing to drag when there is nothing on the other side of it. */
+.split.hide-chart .splitter { display: none; }
 
 .pane-left {
   display: flex;
@@ -4354,18 +4375,29 @@ mod tests {
     /// Crude on purpose: the sheet is a string constant with no nesting, so a
     /// rule runs from its selector to the next `}` and nothing has to parse
     /// CSS to find it.
-    fn rule_for(class: &str) -> Option<&'static str> {
-        let opened = CSS.find(&format!(".{class} {{"))?;
-        let rest = &CSS[opened..];
-        let closed = rest.find('}')?;
-        Some(&rest[..closed])
+    /// Every rule in the sheet whose selector ends in this class.
+    ///
+    /// Every one, not the first. A class is styled by more than one rule as
+    /// soon as anything qualifies it, and taking the first meant a rule added
+    /// above the main one silently became the only one this could see.
+    fn rules_for(class: &str) -> Vec<&'static str> {
+        let needle = format!(".{class} {{");
+        let mut found = Vec::new();
+        let mut from = 0;
+        while let Some(at) = CSS[from..].find(&needle) {
+            let opened = from + at;
+            let Some(closed) = CSS[opened..].find('}') else { break };
+            found.push(&CSS[opened..opened + closed]);
+            from = opened + closed;
+        }
+        found
     }
 
     /// Whether any of a class list is positioned the way it needs to be.
     fn is_placed(classes: &str, how: &str) -> bool {
         classes
             .split_whitespace()
-            .filter_map(rule_for)
+            .flat_map(rules_for)
             .any(|rule| rule.contains(how))
     }
 
@@ -4407,7 +4439,7 @@ mod tests {
             // drops. None of these has a positioned ancestor to hang from.
             (crate::popups::ANCHORED_CLASS, "position: absolute"),
             ("ctx-stack", "position: absolute"),
-            ("dd-list", "position: fixed"),
+            ("dd-list", "position: absolute"),
             // Against a pane instead, which is the whole point: a peer's
             // pointer is written in that pane's own scrolling coordinates, so
             // it has to be absolute inside it rather than fixed to the window.

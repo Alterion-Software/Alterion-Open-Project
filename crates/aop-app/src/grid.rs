@@ -237,7 +237,15 @@ pub fn TaskGrid() -> Element {
     // The table is as wide as its columns; the pane showing it may be narrower,
     // in which case it scrolls.
     let table_width: f64 = columns.iter().map(|c| c.width).sum();
-    let pane_width = s.table_view_width();
+    // Wide as the splitter put it, unless the chart is hidden, in which case
+    // the table is the whole workspace and should say so. Written here rather
+    // than in the stylesheet because an inline width wins over any rule, so a
+    // rule could not have taken it back.
+    let pane_style = if s.pane_focus == crate::state::PaneFocus::TableOnly {
+        "width: 100%;".to_string()
+    } else {
+        format!("width: {}px;", s.table_view_width())
+    };
     let editing = s.editing;
     let show_wbs = s.show_outline_number;
     let currency = project.currency_symbol.clone();
@@ -288,7 +296,7 @@ pub fn TaskGrid() -> Element {
 
         div {
             class: "grid-pane",
-            style: "width: {pane_width}px;",
+            style: "{pane_style}",
             onscroll: move |event| {
                 let data = event.data();
                 let seen = PaneScroll {

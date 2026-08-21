@@ -615,16 +615,7 @@ fn App() -> Element {
             div {
                 class: "workspace",
                 oncontextmenu: move |event| event.prevent_default(),
-                div { class: "viewbar",
-                    // A letter to a line rather than a line turned on its
-                    // side. `writing-mode: vertical-rl` says this in one
-                    // declaration and is not implemented everywhere, and
-                    // where it is not the label lies flat and runs out of a
-                    // bar 22 pixels wide. Stacking needs nothing but a column.
-                    for (index, letter) in view.label().chars().enumerate() {
-                        span { key: "v{index}", class: if letter == ' ' { "gap" } else { "" }, "{letter}" }
-                    }
-                }
+                div { class: "viewbar", span { "{view.label()}" } }
                 Workspace { view }
             }
 
@@ -872,9 +863,19 @@ fn SplitPanes(
             SyncPaneScroll {}
             div { class: "pane-bar",
                 if focus != PaneFocus::ChartOnly {
-                    // flex: none, or the bar would shrink this tab and it
-                    // would stop lining up with the pane below it.
-                    div { style: "width: {grid_width}px; flex: none; display: flex;",
+                    // Matched to the pane below it, which means matching how
+                    // that pane is sized: fixed at the splitter's width while
+                    // both are showing, and filling the workspace when the
+                    // table is the only thing in it. A tab that stayed fixed
+                    // while its pane grew would stop lining up, which is the
+                    // fault this comment used to describe in the other
+                    // direction.
+                    div {
+                        style: if focus == PaneFocus::TableOnly {
+                            "flex: 1 1 auto; display: flex;".to_string()
+                        } else {
+                            format!("width: {grid_width}px; flex: none; display: flex;")
+                        },
                         PaneTab {
                             name: left_name,
                             subtitle: left_subtitle,
