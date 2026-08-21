@@ -5809,24 +5809,22 @@ impl AppState {
     ///
     /// It deliberately does not resize any column: narrowing the pane scrolls
     /// the table instead, so the columns stay the width they were set to.
-    pub fn set_table_width(&mut self, width: f64, workspace: f64) {
-        // Both panes keep the same minimum, so the handle stops at the same
-        // distance from either end. Squeezing the chart to nothing by dragging
-        // right was possible where squeezing the table to nothing by dragging
-        // left never was, which is the asymmetry: one pane had a floor and the
-        // other did not.
-        // A workspace of zero is a window nobody has measured, not a window
-        // with no room in it, and the two must not be confused: read the
-        // second way, the maximum collapses onto the minimum and the pane is
-        // pinned at 120 pixels with the handle refusing to move at all. An
-        // unknown width means no upper limit rather than the tightest
-        // possible one.
-        let most = if workspace > Self::MIN_PANE * 2.0 {
-            workspace - Self::MIN_PANE
-        } else {
-            f64::MAX
-        };
-        self.table_pane_width = width.clamp(Self::MIN_PANE, most);
+    pub fn set_table_width(&mut self, width: f64) {
+        // Only a floor here, and the ceiling is left to the layout.
+        //
+        // Giving the chart a floor by arithmetic meant knowing how wide the
+        // workspace is, and the only way to learn that is to measure the
+        // window, which answers zero before the first layout and an
+        // intermediate size for a while after it. Both wrong answers were
+        // tried: zero pinned the handle at the minimum, and treating zero as
+        // "no limit" let the table swallow the chart.
+        //
+        // The two panes are already flex items side by side, and a flex item
+        // with a `min-width` cannot be squeezed past it by a sibling. So both
+        // panes carry the same `min-width` in the sheet, the constraint is
+        // exactly mirrored by construction, and nothing has to know how wide
+        // the window is.
+        self.table_pane_width = width.max(Self::MIN_PANE);
     }
 
     /// The least either pane is allowed to be squeezed to.
@@ -9624,42 +9622,30 @@ mod splitter_tests {
     use super::*;
 
     #[test]
-    fn the_handle_stops_the_same_distance_from_either_end() {
+    fn the_table_keeps_its_own_floor() {
         let mut s = AppState::default();
-        let room = 1000.0;
-
-        // Dragged hard left: the table keeps its minimum.
-        s.set_table_width(-500.0, room);
+        s.set_table_width(-500.0);
         assert_eq!(s.table_view_width(), AppState::MIN_PANE);
-
-        // Dragged hard right: the chart keeps the same one, which is the half
-        // that was missing. Before this the table could take everything.
-        s.set_table_width(5_000.0, room);
-        assert_eq!(s.table_view_width(), room - AppState::MIN_PANE);
     }
 
     #[test]
-    fn a_window_nobody_has_measured_does_not_pin_the_handle() {
-        // The failure this guards. A workspace of zero read as a real width
-        // makes the maximum equal the minimum, and the pane sticks at 120
-        // pixels with the splitter refusing to move. Unknown has to mean
-        // unknown, the same way it does in `crate::placement`.
+    fn nothing_here_caps_it_because_the_layout_does() {
+        // The ceiling used to live here and needed the window's width, which
+        // is zero before the first layout and an intermediate size for a while
+        // after. Both wrong answers were shipped: zero pinned the handle at
+        // the minimum, and reading zero as "no limit" let the table swallow
+        // the chart. Both panes carry the same `min-width` in the sheet now,
+        // so the constraint is mirrored by construction and this function has
+        // no opinion about how far right the handle can go.
         let mut s = AppState::default();
-        s.set_table_width(640.0, 0.0);
-        assert_eq!(s.table_view_width(), 640.0);
-    }
-
-    #[test]
-    fn a_window_too_narrow_for_two_panes_still_answers() {
-        let mut s = AppState::default();
-        s.set_table_width(400.0, 100.0);
-        assert_eq!(s.table_view_width(), 400.0);
+        s.set_table_width(9_000.0);
+        assert_eq!(s.table_view_width(), 9_000.0);
     }
 
     #[test]
     fn an_ordinary_drag_is_left_alone() {
         let mut s = AppState::default();
-        s.set_table_width(420.0, 1600.0);
+        s.set_table_width(420.0);
         assert_eq!(s.table_view_width(), 420.0);
     }
 }

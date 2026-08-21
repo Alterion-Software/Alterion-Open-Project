@@ -2151,8 +2151,12 @@ button { font: inherit; color: inherit; }
 .pane-left {
   display: flex;
   align-items: stretch;
-  flex: none;
-  min-width: 0;
+  /* Shrinkable, so the chart's own minimum can push back on it, and floored
+     at the same width the chart is floored at. The two constraints are then
+     mirrored by construction rather than by arithmetic that has to know how
+     wide the window is. */
+  flex: 0 1 auto;
+  min-width: 120px;
   background: var(--surface);
 }
 
@@ -2586,10 +2590,12 @@ button { font: inherit; color: inherit; }
 
 .chart-pane {
   flex: 1 1 auto;
+  /* The other half of the mirror. Without this the chart shrinks to nothing
+     and the table takes the window. */
+  min-width: 120px;
   position: relative;
   background: var(--surface);
   overflow: auto;
-  min-width: 0;
 }
 
 /* The chart standing in for a report figure. A report is a picture of one
@@ -4460,3 +4466,44 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod pane_floor_tests {
+    use super::*;
+
+    #[test]
+    fn both_panes_are_floored_at_the_same_width() {
+        // The mirror, and the only place it now lives. If these two ever
+        // differ, the splitter stops at a different distance from each end and
+        // no test of the drag itself would notice, because the drag no longer
+        // has an opinion about it.
+        fn floor(selector: &str) -> &'static str {
+            // Anchored to the start of a line, because a qualified rule
+            // contains the plain one: `.split.hide-table .pane-left {` matches
+            // a search for `.pane-left {` and comes first. That is the second
+            // time a lookup in this file has taken the wrong rule for a class,
+            // and both times the test failed rather than the application, which
+            // is the right way round.
+            let at = CSS.find(&format!("\n{selector}")).expect(selector) + 1;
+            let block = &CSS[at..at + CSS[at..].find('}').expect("a closing brace")];
+            let mark = block.find("min-width:").expect("a min-width");
+            let rest = &block[mark + "min-width:".len()..];
+            let end = rest.find(';').expect("a semicolon");
+            rest[..end].trim()
+        }
+        assert_eq!(floor(".pane-left {"), floor(".chart-pane {"));
+    }
+
+    #[test]
+    fn the_table_pane_can_be_pushed_back_on() {
+        // A floor on the chart does nothing unless the table can give way. It
+        // was `flex: none`, which cannot, so the chart's minimum would have
+        // been ignored and the table would still have taken the window.
+        let at = CSS.find(".pane-left {").expect(".pane-left");
+        let block = &CSS[at..at + CSS[at..].find('}').expect("a closing brace")];
+        assert!(
+            !block.contains("flex: none"),
+            "the table pane has to be shrinkable for the chart's floor to hold"
+        );
+    }
+}
