@@ -2203,6 +2203,13 @@ button { font: inherit; color: inherit; }
    strip at the bottom. The heading and the rows are slid by the same number,
    which is what keeps a column title over its column. */
 .shift-clip { flex: 1 1 auto; min-width: 0; overflow: hidden; }
+/* Slid by a transform, not by a margin.
+
+   A margin is a layout property: moving it re-runs the layout of everything
+   inside, and what is inside is a table of fifty rows and eight columns. Once
+   per frame of a drag, that is what made scrolling sideways feel like it was
+   catching. A transform is a paint property; the boxes stay exactly where they
+   were and only the painting moves. */
 .shift { display: flex; align-items: stretch; }
 
 /* Always there, whether or not there is anywhere to go, so the bottom edge of

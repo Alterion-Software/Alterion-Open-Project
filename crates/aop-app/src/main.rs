@@ -1046,7 +1046,7 @@ fn SplitPanes(
                     div { class: "split-heads",
                         div { class: "pane-left", style: "{left_cell}",
                             div { class: "shift-clip",
-                                div { class: "shift", style: "margin-left: -{shift.table}px;",
+                                div { class: "shift", style: "transform: translateX(-{shift.table}px);",
                                     {left_head}
                                 }
                             }
@@ -1057,7 +1057,7 @@ fn SplitPanes(
                         }
                         div { class: "chart-cell",
                             div { class: "shift-clip",
-                                div { class: "shift", style: "margin-left: -{shift.chart}px;",
+                                div { class: "shift", style: "transform: translateX(-{shift.chart}px);",
                                     {right_head}
                                 }
                             }
@@ -1096,7 +1096,7 @@ fn SplitPanes(
                         },
                         div { class: "pane-left", style: "{left_cell}",
                             div { class: "shift-clip",
-                                div { class: "shift", style: "margin-left: -{shift.table}px;",
+                                div { class: "shift", style: "transform: translateX(-{shift.table}px);",
                                     {left_body}
                                 }
                             }
@@ -1107,7 +1107,7 @@ fn SplitPanes(
                         }
                         div { class: "chart-cell",
                             div { class: "shift-clip",
-                                div { class: "shift", style: "margin-left: -{shift.chart}px;",
+                                div { class: "shift", style: "transform: translateX(-{shift.chart}px);",
                                     {right_body}
                                 }
                             }
@@ -1202,7 +1202,7 @@ fn SoloGrid() -> Element {
             div { class: "split-heads",
                 div { class: "chart-cell",
                     div { class: "shift-clip",
-                        div { class: "shift", style: "margin-left: -{shift.table}px;",
+                        div { class: "shift", style: "transform: translateX(-{shift.table}px);",
                             grid::TaskGrid { part: Part::Head }
                         }
                     }
@@ -1224,7 +1224,7 @@ fn SoloGrid() -> Element {
                 },
                 div { class: "chart-cell",
                     div { class: "shift-clip",
-                        div { class: "shift", style: "margin-left: -{shift.table}px;",
+                        div { class: "shift", style: "transform: translateX(-{shift.table}px);",
                             grid::TaskGrid { part: Part::Body }
                         }
                     }

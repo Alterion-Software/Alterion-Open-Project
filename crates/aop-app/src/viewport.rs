@@ -120,7 +120,13 @@ pub struct SpanWindow {
 impl SpanWindow {
     /// How far past each edge to keep drawing, so a sideways scroll does not
     /// arrive at bare canvas.
-    const MARGIN: f64 = 400.0;
+    ///
+    /// Wide, and deliberately so. Crossing the edge of this window is a full
+    /// rebuild of the chart, and during a drag of the scrollbar the pointer
+    /// crosses it every `MARGIN` pixels of travel. At four hundred that was
+    /// several rebuilds in one flick of the wrist, which is what a drag that
+    /// catches and jumps is made of.
+    pub(crate) const MARGIN: f64 = 1400.0;
 
     pub fn new(scroll_left: f64, viewport: f64) -> Self {
         SpanWindow {
@@ -271,8 +277,12 @@ mod tests {
     fn the_timescale_window_covers_the_pane_and_a_margin() {
         let span = SpanWindow::new(1000.0, 800.0);
         assert!(span.holds(1000.0) && span.holds(1800.0), "the pane itself");
-        assert!(span.holds(700.0), "and the margin before it");
-        assert!(!span.holds(100.0), "but not the far side of the plan");
+        assert!(span.holds(1000.0 - SpanWindow::MARGIN / 2.0), "and the margin before it");
+        // Bounded, not endless: written against the margin rather than a
+        // distance of its own, so widening the margin does not quietly turn
+        // this into a test that the window holds everything.
+        assert!(!span.holds(1000.0 - SpanWindow::MARGIN - 1.0), "but not the far side of the plan");
+        assert!(!span.holds(1800.0 + SpanWindow::MARGIN + 1.0), "nor the far end of it");
     }
 
     #[test]

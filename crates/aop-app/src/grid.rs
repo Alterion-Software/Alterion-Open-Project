@@ -690,7 +690,7 @@ pub fn TaskGrid(part: Part) -> Element {
     }
 }
 
-/// A piece of text cut to the room it has, with an ellipsis if it was cut.
+/// A piece of text cut to the room it has.
 ///
 /// Cut here rather than clipped by the renderer. `overflow: hidden` is what a
 /// stylesheet would say, and it costs a painting layer per cell; the renderer
@@ -704,20 +704,17 @@ pub fn TaskGrid(part: Part) -> Element {
 /// so out either way on a proportional face. That is the trade: a cut that is
 /// approximately in the right place everywhere, against an exact one in the
 /// first four hundred cells and none at all after that.
+///
+/// Cut plainly, with nothing added to mark it. An ellipsis costs a character
+/// of the room there already was not enough of.
 fn shorten(text: &str, room: f64) -> String {
     if !overflows(text, room) {
         return text.to_string();
     }
     const CHAR_W: f64 = 6.2;
     const PADDING: f64 = 12.0;
-    // One character back for the ellipsis itself.
-    let fits = (((room - PADDING) / CHAR_W).floor() as isize - 1).max(0) as usize;
-    if fits == 0 {
-        return String::new();
-    }
-    let mut out: String = text.chars().take(fits).collect();
-    out.push('\u{2026}');
-    out
+    let fits = ((room - PADDING) / CHAR_W).floor().max(0.0) as usize;
+    text.chars().take(fits).collect()
 }
 
 /// Whether a piece of text is too long for the room it has.
@@ -1041,10 +1038,11 @@ mod shorten_tests {
     }
 
     #[test]
-    fn text_that_does_not_fit_is_cut_and_says_so() {
-        let cut = shorten("CCT tool (Data Migration) Part of Fusion TIF", 120.0);
-        assert!(cut.ends_with('\u{2026}'), "a cut has to be visible as one");
-        assert!(cut.chars().count() < "CCT tool (Data Migration) Part of Fusion TIF".chars().count());
+    fn text_that_does_not_fit_is_cut() {
+        let whole = "CCT tool (Data Migration) Part of Fusion TIF";
+        let cut = shorten(whole, 120.0);
+        assert!(cut.chars().count() < whole.chars().count());
+        assert!(whole.starts_with(&cut), "cut, not rewritten");
         // And it has to actually fit, or the whole exercise is pointless.
         assert!(!overflows(&cut, 120.0));
     }
@@ -1063,6 +1061,6 @@ mod shorten_tests {
         let name = "r\u{e9}sum\u{e9} r\u{e9}sum\u{e9} r\u{e9}sum\u{e9}";
         let cut = shorten(name, 40.0);
         assert!(cut.chars().count() < name.chars().count());
-        assert!(cut.ends_with('\u{2026}'));
+        assert!(name.starts_with(&cut));
     }
 }
