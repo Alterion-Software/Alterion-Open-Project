@@ -123,7 +123,9 @@ static PALETTE: [Token; 43] = [
     // The one token in the palette that names another rather than a value, and
     // the reason the resolver follows a name instead of reading a field.
     Token::colour("--focus", "var(--accent)", "var(--accent)"),
-    Token::colour("--grid-line", "#222a2b", "#e3ebeb"),
+    // The same line the panels are outlined with. It was a shade darker than
+    // that, which on this surface read as no line at all.
+    Token::colour("--grid-line", "#27302f", "#d2dedd"),
     Token::colour("--grid-header", "#171d1e", "#f2f7f7"),
     Token::colour("--nonworking", "rgba(216, 231, 232, 0.032)", "rgba(16, 32, 31, 0.038)"),
     // ---- chart --------------------------------------------------------
@@ -2405,11 +2407,21 @@ button { font: inherit; color: inherit; }
 
 /* The row table's own copy of the heading: there so that the width of a column
    is settled once, drawn nowhere. Flattened rather than pulled up out of view,
-   because a pull-up is one number that has to match another and this is not. */
+   because a pull-up is one number that has to match another and this is not.
+
+   Flattened downwards only. Sideways it keeps the padding and the two side
+   borders the visible heading has, because the renderer's fixed table layout
+   adds a cell's padding and border to the width it was given rather than
+   counting them inside it. Take them off one copy and its columns come out
+   fourteen pixels narrower each than the other's, and the two tables walk
+   apart across the width of the plan: by the fifth column the titles were
+   sitting the best part of a column to the right of their own cells. */
 .grid thead.ghost th {
   height: 0;
-  padding: 0;
-  border: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-top-width: 0;
+  border-bottom-width: 0;
   font-size: 0;
   line-height: 0;
   overflow: hidden;

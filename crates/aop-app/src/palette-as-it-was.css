@@ -36,7 +36,9 @@
   --selection-line: rgba(129, 181, 181, 0.55);
   --focus: var(--accent);
 
-  --grid-line: #222a2b;
+  /* Deliberately moved to the panel outline: a shade darker read as no
+     line at all on this surface. */
+  --grid-line: #27302f;
   --grid-header: #171d1e;
   --nonworking: rgba(216, 231, 232, 0.032);
 
@@ -95,7 +97,7 @@
   --selection-line: rgba(47, 95, 94, 0.5);
   --focus: var(--accent);
 
-  --grid-line: #e3ebeb;
+  --grid-line: #d2dedd;
   --grid-header: #f2f7f7;
   --nonworking: rgba(16, 32, 31, 0.038);
 
