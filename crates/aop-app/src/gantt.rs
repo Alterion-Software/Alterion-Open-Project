@@ -642,11 +642,17 @@ pub fn GanttChart(
             div { class: "chart-canvas", style: "min-width: {width}px;",
 
             // ---- pinned timescale ---------------------------------------
-            div { class: "chart-head",
-                svg { class: "chart-svg", width: "{width}", height: "{HEADER_H}",
-                    view_box: "0 0 {width} {HEADER_H}", font_family: palette.font(),
-                    style: "width: {width}px; height: {HEADER_H}px; flex: none;",
-                    rect { x: "0", y: "0", width: "{width}", height: "{HEADER_H}", fill: palette.paint("--grid-header") }
+            //
+            // Boxes, not an SVG. A tick is a rectangle with a label in it and
+            // a rule down its left edge, which is what a div already is, and
+            // drawing it as one takes the whole timescale out of the class of
+            // fault that has cost this build most of a day: a stylesheet does
+            // not reach inside an inline SVG here, nothing inside one is
+            // clipped by an ancestor's `overflow`, and a viewBox against a
+            // stale width magnifies everything it holds. None of those exist
+            // for an ordinary element.
+            div { class: "chart-head", style: "width: {width}px; height: {HEADER_H}px;",
+                div { class: "tl-tier tl-tier-major", style: "height: {TIER_H}px;",
                     for (index, tick) in major.iter().enumerate().filter(|(_, t)| {
                         let x = scale.x_date(t.from);
                         span.overlaps(x, x + (t.to - t.from).num_days() as f64 * scale.px_per_day)
@@ -656,18 +662,18 @@ pub fn GanttChart(
                             let w = (tick.to - tick.from).num_days() as f64 * scale.px_per_day;
                             let label = fit(&tick.label, w);
                             rsx! {
-                                g { key: "mj{index}",
-                                    line { x1: "{x}", y1: "0", x2: "{x}", y2: "{TIER_H}",
-                                        stroke: palette.paint("--line"), stroke_width: "1" }
-                                    text { class: "tl-major", x: "{x + w / 2.0}", y: "13", font_size: "10",
-                                        text_anchor: "middle", fill: palette.paint("--ink"),
-                                        "{label}" }
+                                div {
+                                    key: "mj{index}",
+                                    class: "tl-cell",
+                                    style: "left: {x}px; width: {w}px; height: {TIER_H}px;",
+                                    "{label}"
                                 }
                             }
                         }
                     }
-                    line { x1: "0", y1: "{TIER_H}", x2: "{width}", y2: "{TIER_H}",
-                        stroke: palette.paint("--line"), stroke_width: "1" }
+                }
+                div { class: "tl-tier tl-tier-minor",
+                    style: "top: {TIER_H}px; height: {HEADER_H - TIER_H}px;",
                     for (index, tick) in minor.iter().enumerate().filter(|(_, t)| {
                         let x = scale.x_date(t.from);
                         span.overlaps(x, x + (t.to - t.from).num_days() as f64 * scale.px_per_day)
@@ -676,22 +682,18 @@ pub fn GanttChart(
                             let x = scale.x_date(tick.from);
                             let w = (tick.to - tick.from).num_days() as f64 * scale.px_per_day;
                             let weekend = !project.calendar.is_working_day(tick.from);
-                            let class = if weekend { "tl-minor weekend" } else { "tl-minor" };
-                            let tint = if weekend { "--ink-faint" } else { "--ink-soft" };
+                            let class = if weekend { "tl-cell weekend" } else { "tl-cell" };
                             let label = fit(&tick.label, w);
                             rsx! {
-                                g { key: "mn{index}",
-                                    line { x1: "{x}", y1: "{TIER_H}", x2: "{x}", y2: "{HEADER_H}",
-                                        stroke: palette.paint("--line"), stroke_width: "1" }
-                                    text { class: "{class}", x: "{x + w / 2.0}", y: "{TIER_H + 13.0}", font_size: "10",
-                                        text_anchor: "middle", fill: palette.paint(tint),
-                                        "{label}" }
+                                div {
+                                    key: "mn{index}",
+                                    class: "{class}",
+                                    style: "left: {x}px; width: {w}px; height: {HEADER_H - TIER_H}px;",
+                                    "{label}"
                                 }
                             }
                         }
                     }
-                    line { x1: "0", y1: "{HEADER_H - 0.5}", x2: "{width}", y2: "{HEADER_H - 0.5}",
-                        stroke: palette.paint("--line"), stroke_width: "1" }
                 }
             }
 

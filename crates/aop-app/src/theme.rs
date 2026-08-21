@@ -2697,7 +2697,43 @@ button { font: inherit; color: inherit; }
 
 /* Holds the chart's own width so the pane above can scroll to it. */
 .chart-canvas { display: block; }
-.chart-head { position: sticky; top: 0; z-index: 4; background: var(--grid-header); }
+.chart-head {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  background: var(--grid-header);
+  /* The two tiers stack, and each is a strip of absolutely placed cells, so
+     the head has to be the box they are placed against. */
+  position: relative;
+  border-bottom: 1px solid var(--line);
+  flex: none;
+}
+
+/* One tier of the timescale: a strip the cells are placed inside. */
+.tl-tier {
+  position: absolute;
+  left: 0;
+  right: 0;
+}
+.tl-tier-major { top: 0; border-bottom: 1px solid var(--line); }
+
+/* One tick. A rule down its left edge and its label centred in what is left,
+   which is the whole of what the drawn version was doing. */
+.tl-cell {
+  position: absolute;
+  top: 0;
+  box-sizing: border-box;
+  border-left: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--ink-soft);
+}
+.tl-tier-major .tl-cell { color: var(--ink); }
+.tl-cell.weekend { color: var(--ink-faint); }
 .chart-svg { display: block; }
 
 .tl-major, .tl-minor { font-size: 10px; fill: var(--ink-soft); }
