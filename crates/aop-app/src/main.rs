@@ -537,6 +537,13 @@ fn App() -> Element {
         div {
             class: "app",
             tabindex: "0",
+            // Focused at start up, because every keyboard shortcut in this
+            // application is handled by the `onkeydown` below and a key press
+            // goes to whatever holds focus. In a webview the document has it
+            // by default; elsewhere nothing does until something asks, and
+            // nothing asking is indistinguishable from every shortcut being
+            // broken.
+            autofocus: true,
             onkeydown: move |event| handle_shortcut(&mut state, event),
             // Measured once, when there is something to measure.
             //
