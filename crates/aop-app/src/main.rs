@@ -569,20 +569,43 @@ fn App() -> Element {
                 // stale, and `crate::placement` degrades to placing panels
                 // where they were asked for rather than turning them away from
                 // edges that have moved.
-                match event.get_client_rect().await {
-                    Ok(rect) => {
-                        applog::applog!(
-                            "window: measured {:.0} by {:.0}",
-                            rect.width(),
-                            rect.height()
-                        );
-                        viewport.set((rect.width(), rect.height()));
+                // Asked again until there is something to measure. `onmounted`
+                // fires when the element exists, which is before it has been
+                // laid out, so the first answer is honestly zero by zero. That
+                // is not an error and it is not a size either, and everything
+                // that places itself against the window depends on telling the
+                // two apart.
+                //
+                // A handful of attempts rather than a standing poll:
+                // `get_client_rect` takes the document's `RefCell` and panics
+                // if it lands while an event is being handled, so this stops
+                // the moment it has an answer and never asks again.
+                for attempt in 0..24u32 {
+                    match event.get_client_rect().await {
+                        Ok(rect) if rect.width() > 0.0 && rect.height() > 0.0 => {
+                            applog::applog!(
+                                "window: measured {:.0} by {:.0} on attempt {}",
+                                rect.width(),
+                                rect.height(),
+                                attempt + 1
+                            );
+                            viewport.set((rect.width(), rect.height()));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(why) => {
+                            applog::applog!("window: could not be measured: {why}");
+                            break;
+                        }
                     }
-                    // Said out loud, because everything that places itself
-                    // against the window depends on this one answer, and a
-                    // window nobody has measured looks exactly like a window
-                    // with no room in it to any arithmetic that trusts it.
-                    Err(why) => applog::applog!("window: could not be measured: {why}"),
+                    if attempt == 23 {
+                        applog::applog!(
+                            "window: still nothing to measure after 24 tries, so \
+                             panels will be placed where they are asked for and \
+                             will not turn away from an edge"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
                 }
             },
             onresize: move |event| {

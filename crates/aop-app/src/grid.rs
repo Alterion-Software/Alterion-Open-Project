@@ -375,9 +375,17 @@ pub fn TaskGrid() -> Element {
                 }
 
                 tbody {
-                    if window.above > 0.0 {
-                        tr { class: "row-spacer", style: "height: {window.above}px;" }
-                    }
+                    // Always here, at whatever height the rows above need,
+                    // rather than appearing when that height is more than
+                    // nothing. A child that comes and goes changes the shape
+                    // of the list it is in, and this list is also wholly
+                    // replaced whenever a different plan is opened. Dioxus
+                    // addresses nodes by a path through the template it
+                    // expects, and a path into a child that is not there is
+                    // what `blitz_dom` reports as `invalid key` before taking
+                    // the process down. A row of no height costs nothing and
+                    // keeps the shape still.
+                    tr { key: "spacer-above", class: "row-spacer", style: "height: {window.above}px;" }
 
                     for (offset, row) in rows[window.first..window.end].iter().enumerate() {
                         {
@@ -569,9 +577,7 @@ pub fn TaskGrid() -> Element {
                         }
                     }
 
-                    if window.below > 0.0 {
-                        tr { class: "row-spacer", style: "height: {window.below}px;" }
-                    }
+                    tr { key: "spacer-below", class: "row-spacer", style: "height: {window.below}px;" }
 
                     // The blank row at the bottom, where typing creates a task.
                     {
