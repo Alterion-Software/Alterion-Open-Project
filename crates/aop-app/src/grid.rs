@@ -305,11 +305,10 @@ pub fn TaskGrid() -> Element {
             },
 
             table { class: "{grid_class}", style: "width: {table_width}px;",
-                colgroup {
-                    for (index, column) in columns.iter().enumerate() {
-                        col { key: "c{index}", style: "width: {column.width}px;" }
-                    }
-                }
+                // No colgroup. `table-layout: fixed` reads widths from the
+                // first row when there is no usable one, and the header cells
+                // carry them, so the group was saying the same thing twice.
+                // Saying it twice is what a renderer gets to disagree about.
 
                 thead {
                     tr {

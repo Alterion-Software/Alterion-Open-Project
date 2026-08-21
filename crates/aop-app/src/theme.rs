@@ -1051,7 +1051,7 @@ button { font: inherit; color: inherit; }
   max-width: 740px;
   margin-bottom: 20px;
 }/* Flex has no track list, so the basis lives on the children. */
-.stat-row > * { flex: 1 1 112px; }
+.stat-row > * { flex: 1 1 112px; max-width: 180px; }
 
 
 .stat-tile {
@@ -1094,7 +1094,7 @@ button { font: inherit; color: inherit; }
   gap: 14px;
   max-width: 740px;
 }/* Flex has no track list, so the basis lives on the children. */
-.info-cards > * { flex: 1 1 300px; }
+.info-cards > * { flex: 1 1 300px; max-width: 440px; }
 
 
 .info-card {
@@ -1171,7 +1171,7 @@ button { font: inherit; color: inherit; }
   gap: 16px;
   width: 100%;
 }/* Flex has no track list, so the basis lives on the children. */
-.tpl-grid > * { flex: 1 1 212px; }
+.tpl-grid > * { flex: 1 1 212px; max-width: 320px; }
 
 
 .tpl-card {
@@ -1349,7 +1349,7 @@ button { font: inherit; color: inherit; }
   gap: 10px;
   max-width: 1100px;
 }/* Flex has no track list, so the basis lives on the children. */
-.imp-cols > * { flex: 1 1 210px; }
+.imp-cols > * { flex: 1 1 210px; max-width: 300px; }
 
 
 .imp-col {
@@ -2279,12 +2279,18 @@ button { font: inherit; color: inherit; }
 /* Symbols in a cell are centred on the row, not sat on the text baseline,
    which is what made them look a pixel or two high. */
 .grid td.c-mid > span,
+/* Centred without being told to stop being a table cell.
+   `display: inline-flex` on a `td` takes it out of the table's column model.
+   A browser hides that by generating an anonymous cell around it, so the
+   column survives and nobody notices. A renderer that does not generate one
+   simply has a row with a cell missing: the header kept nine columns, every
+   body row had eight, and the whole table sat one column to the left of its
+   own headings, with the row numbers gone.
+   `vertical-align` is how a table cell centres its contents, and it is the
+   header's own pattern too, which flexes a span inside the cell rather than
+   the cell itself. */
 .grid td.rownum {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  height: 100%;
+  vertical-align: middle;
   line-height: 1;
 }
 
