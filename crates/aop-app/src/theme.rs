@@ -2194,10 +2194,16 @@ button { font: inherit; color: inherit; }
   z-index: 3;
   overflow: visible;
   background: var(--grid-header);
-  border-width: 1px;
+  /* The same hairlines the body cells draw, so the head reads as the top of
+     the table rather than a bar sitting above it.
+     One `border-width` rather than a `border-top: 0` after the longhands: a
+     shorthand resets every longhand it does not mention, including
+     `border-top-color`, and the initial value of that is `currentColor`. On a
+     header whose text is near-white against an almost-black surface, that is
+     how a hairline turns into a chalk line. */
+  border-width: 0 1px 1px 1px;
   border-style: solid;
   border-color: var(--grid-line);
-  border-top: 0;
   height: 38px;
   font-weight: 500;
   font-size: 11px;

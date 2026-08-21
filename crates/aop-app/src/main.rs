@@ -287,6 +287,9 @@ fn App() -> Element {
     // it on the plan's state would redraw the window on every letter.
     let drafting = use_context_provider(|| crate::state::Drafting(Signal::new(None))).0;
     let mut viewport = use_context_provider(|| Signal::new(crate::state::Viewport::default()));
+    // The root element, kept so the window can be measured whenever it is
+    // worth asking rather than only once. See the `onmounted` below.
+    let mut root = use_signal(|| None::<std::rc::Rc<MountedData>>);
     use_context_provider(crate::floating::Layer::new);
 
     // Snapshot the plan on a timer so that a crash, a kill, or a power cut
@@ -348,6 +351,22 @@ fn App() -> Element {
             // would be torn down and started again on every keystroke.
             let (at, draft) = (*pointing.peek(), drafting.peek().clone());
             TURNS.note(format_args!("turn {turn}, pointer {at:?}"));
+
+            // Ask the window how big it is, about once a second. Menus and
+            // pickers place themselves against it, and a window resized after
+            // start up would otherwise leave them turning away from edges that
+            // have moved. Cheap, and not on every turn: this loop runs eight
+            // times a second and a window does not change size that fast.
+            if turn.is_multiple_of(8)
+                && let Some(root) = root.peek().clone()
+                && let Ok(rect) = root.get_client_rect().await
+            {
+                let (w, h) = (rect.width(), rect.height());
+                let (was_w, was_h) = *viewport.peek();
+                if (w - was_w).abs() >= 2.0 || (h - was_h).abs() >= 2.0 {
+                    viewport.set((w, h));
+                }
+            }
             let (held, due, unanswered) = {
                 let live = state.read();
                 if live.live.is_none() {
@@ -553,10 +572,13 @@ fn App() -> Element {
             // this element when it appears asks a question instead of waiting
             // to be told, and it is answered on every renderer that can
             // measure anything at all.
-            onmounted: move |event| async move {
-                if let Ok(rect) = event.get_client_rect().await {
-                    viewport.set((rect.width(), rect.height()));
-                }
+            onmounted: move |event| {
+                // Kept, not just read. Measuring once tells the application how
+                // big the window was when it opened, which is wrong the moment
+                // anybody resizes it, and `onresize` is a event blitz does not
+                // send. Holding the handle means the same question can be asked
+                // again, which the loop below does.
+                root.set(Some(event.data()));
             },
             onresize: move |event| {
                 if let Ok(size) = event.get_content_box_size() {
