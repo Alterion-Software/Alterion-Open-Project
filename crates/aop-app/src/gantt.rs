@@ -1863,10 +1863,16 @@ pub fn TimelineBand() -> Element {
                         // applied and these labels were drawn at whatever they
                         // inherited, which is why the band came out looking
                         // like a headline whenever it was rebuilt.
-                        let label_style = if band.inside {
-                            format!("font-size: 10px; fill: {label_ink};")
+                        // As attributes, not through `style`. Everything that
+                        // has actually taken effect inside an SVG here has been
+                        // an attribute on the element; a `style` is one more
+                        // route this renderer does not follow into one, which
+                        // is why stating the size in it changed nothing and the
+                        // label still came out as a headline.
+                        let label_fill = if band.inside {
+                            label_ink.clone()
                         } else {
-                            format!("font-size: 10px; fill: {};", palette.paint("--ink-soft"))
+                            palette.paint("--ink-soft").to_string()
                         };
                         rsx! {
                             g { key: "tb{band.index}",
@@ -1883,7 +1889,8 @@ pub fn TimelineBand() -> Element {
                                 if !band.label.is_empty() {
                                     text {
                                         x: "{label_x}", y: "{y + 9.5}",
-                                        class: "{label_class}", style: "{label_style}",
+                                        class: "{label_class}",
+                                        font_size: "10", fill: "{label_fill}",
                                         "{band.label}"
                                     }
                                 }

@@ -569,7 +569,9 @@ button { font: inherit; color: inherit; }
   align-items: stretch;
   background: var(--surface);
   border-bottom: 1px solid var(--line);
-  height: 94px;
+  /* Tall enough for a two line caption under the tallest button. At 94 a
+     long label pushed the group's own title off the bottom of the bar. */
+  height: 102px;
   flex: none;
   overflow: hidden;
 }
