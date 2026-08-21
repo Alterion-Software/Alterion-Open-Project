@@ -5813,9 +5813,16 @@ impl AppState {
         self.table_pane_width = width.clamp(120.0, 2000.0);
     }
 
-    /// The visible width of the table pane, never wider than the columns need.
+    /// The visible width of the table pane.
+    ///
+    /// Whatever the splitter was dragged to, and not capped at the width the
+    /// columns happen to need. Capping it there made the handle travel much
+    /// further one way than the other: the table could be squeezed to almost
+    /// nothing but never widened past its own content, so the two panes did
+    /// not expand alike. Past the last column the pane simply shows the space,
+    /// which is what dragging a divider that far is asking for.
     pub fn table_view_width(&self) -> f64 {
-        self.table_pane_width.min(self.grid_width())
+        self.table_pane_width
     }
 
     /// Add a column before `at`, the way Insert Column works.

@@ -310,7 +310,16 @@ pub fn ComboBox(
                 return;
             }
             let (ax, ay) = anchor();
-            let options = options.clone();
+            // Narrowed to what has been typed. The list is whatever fonts the
+            // machine has, which runs to several hundred, and finding one by
+            // scrolling is not finding it. Letters in order rather than a
+            // substring, so `tnr` reaches Times New Roman.
+            let typed = draft();
+            let options: Vec<Choice> = options
+                .iter()
+                .filter(|choice| fuzzy_matches(&choice.label, &typed))
+                .cloned()
+                .collect();
             floating.put(mine, rsx! {
             div {
                 class: "ctx-scrim",
@@ -323,6 +332,9 @@ pub fn ComboBox(
                 class: "dd-list",
                 style: "left: {ax.max(4.0)}px; top: {ay.max(4.0)}px; min-width: {width.max(120.0)}px;",
                 onclick: move |event| event.stop_propagation(),
+                if options.is_empty() {
+                    div { class: "dd-empty", "No font matches that" }
+                }
                 for choice in options.iter() {
                     {
                         let picked = choice.value == draft();
@@ -420,4 +432,78 @@ pub fn copy_to_clipboard(value: &str) {
              document.body.removeChild(box);
            }})({encoded});"#
     ));
+}
+
+/// Whether a typed fragment matches a name, letters in order but not adjacent.
+///
+/// The font list holds whatever the machine has, which on a developer's
+/// machine is several hundred families. Finding one by scrolling is not
+/// finding it. Typing `tnr` should reach Times New Roman, and `dejavus` should
+/// reach DejaVu Sans, which is what matching in order rather than as a
+/// substring buys: the letters have to appear, in that order, and nothing says
+/// they have to be next to each other.
+///
+/// Case is ignored, and so is anything that is not a letter or a digit, so a
+/// space or a hyphen in either the query or the name is never the reason a
+/// font cannot be found.
+pub fn fuzzy_matches(name: &str, query: &str) -> bool {
+    let mut wanted = query
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase());
+    let mut next = match wanted.next() {
+        None => return true, // nothing typed matches everything
+        Some(c) => c,
+    };
+    for letter in name.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()) {
+        if letter == next {
+            match wanted.next() {
+                None => return true,
+                Some(c) => next = c,
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod fuzzy_tests {
+    use super::fuzzy_matches;
+
+    #[test]
+    fn initials_reach_a_font_nobody_wants_to_scroll_to() {
+        assert!(fuzzy_matches("Times New Roman", "tnr"));
+        assert!(fuzzy_matches("DejaVu Sans Mono", "dvsm"));
+    }
+
+    #[test]
+    fn a_run_of_letters_still_works_the_obvious_way() {
+        assert!(fuzzy_matches("Liberation Serif", "serif"));
+        assert!(fuzzy_matches("Noto Sans", "noto"));
+    }
+
+    #[test]
+    fn spaces_and_hyphens_never_stand_in_the_way() {
+        assert!(fuzzy_matches("Noto Sans", "notosans"));
+        assert!(fuzzy_matches("Noto Sans", "noto sans"));
+        assert!(fuzzy_matches("IBM Plex Mono", "ibm-plex"));
+    }
+
+    #[test]
+    fn the_letters_have_to_be_in_that_order() {
+        assert!(!fuzzy_matches("Times New Roman", "rnt"));
+        assert!(!fuzzy_matches("Arial", "arialx"));
+    }
+
+    #[test]
+    fn nothing_typed_offers_everything() {
+        assert!(fuzzy_matches("Arial", ""));
+        assert!(fuzzy_matches("Arial", "   "));
+    }
+
+    #[test]
+    fn case_is_not_the_reason_a_font_cannot_be_found() {
+        assert!(fuzzy_matches("Times New Roman", "TIMES"));
+        assert!(fuzzy_matches("times new roman", "TnR"));
+    }
 }

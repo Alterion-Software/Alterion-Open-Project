@@ -836,6 +836,7 @@ button { font: inherit; color: inherit; }
 }
 
 .combo-caret:hover { background: var(--hover); color: var(--accent-bright); }
+.dd-empty { padding: 7px 10px; color: var(--ink-faint); font-size: 12px; }
 .dd-item.on { color: var(--accent-bright); }
 .dd-item .tick { width: 12px; flex: none; color: var(--accent); }
 
