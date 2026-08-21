@@ -2367,7 +2367,26 @@ button { font: inherit; color: inherit; }
 .chart-body { flex: none; position: relative; }
 
 
-.grid { border-collapse: collapse; table-layout: fixed; font-size: 12px; width: 100%; }
+/* Separate borders, not collapsed.
+
+   Collapsing merges the border between two cells into one and draws it at the
+   shared edge, and this renderer only does half of that: the edges between
+   columns came out, the edges between rows did not, so the table had verticals
+   and no horizontals. Separate borders leave each cell to draw its own, and
+   each cell draws exactly two of them, its right and its bottom, so a shared
+   edge is still one line and not two.
+
+   It has to be the same two on every cell in the table, heading and all: the
+   renderer adds a cell's border to the width it was given, so a heading with a
+   left border and a body without one is a heading a pixel wider per column
+   than its own cells. */
+.grid {
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  font-size: 12px;
+  width: 100%;
+}
 
 /* Not sticky on this renderer.
 
@@ -2391,7 +2410,7 @@ button { font: inherit; color: inherit; }
      `border-top-color`, and the initial value of that is `currentColor`. On a
      header whose text is near-white against an almost-black surface, that is
      how a hairline turns into a chalk line. */
-  border-width: 0 1px 1px 1px;
+  border-width: 0 1px 1px 0;
   border-style: solid;
   border-color: var(--grid-line);
   height: 37px;
@@ -2429,7 +2448,7 @@ button { font: inherit; color: inherit; }
 .grid thead.ghost th * { display: none; }
 
 .grid td {
-  border-width: 1px;
+  border-width: 0 1px 1px 0;
   border-style: solid;
   border-color: var(--grid-line);
   height: 22px;
