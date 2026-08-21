@@ -573,7 +573,7 @@ button { font: inherit; color: inherit; }
   border-bottom: 1px solid var(--line);
   /* Tall enough for a two line caption under the tallest button. At 94 a
      long label pushed the group's own title off the bottom of the bar. */
-  height: 102px;
+  height: 107px;
   flex: none;
   overflow: hidden;
 }
@@ -2209,13 +2209,20 @@ button { font: inherit; color: inherit; }
   border-top: 1px solid var(--line);
 }
 
-/* Slid by a transform, not by a margin.
+/* Slid by a margin, not by a transform.
 
-   A margin is a layout property: moving it re-runs the layout of everything
-   inside, and what is inside is a table of fifty rows and eight columns. Once
-   per frame of a drag, that is what made scrolling feel like it was catching.
-   A transform is a paint property; the boxes stay where they are and only the
-   painting moves. */
+   A transform would be the cheaper of the two: a margin is a layout property
+   and moving it re-runs the layout of what is inside, while a transform only
+   moves the painting. But a transformed box is not clipped by its parent on
+   this renderer. `.pane-body` says `overflow: hidden` and wraps this directly,
+   with nothing in between and no transform of its own, and the chart was still
+   painted straight across the table beside it. A clip that fails one level up
+   from the box that declares it is not a clip.
+
+   So the offset is a margin, and the cost is a relayout per frame of a drag.
+   That is what the sideways scroll catching was; the other half of it, the
+   chart being rebuilt several times per drag, is fixed by the window margin
+   being wide. */
 .shift { display: flex; align-items: stretch; }
 
 /* The bar down the right, over both panes, because they fill the split and
@@ -2943,12 +2950,15 @@ button { font: inherit; color: inherit; }
 
 /* A milestone is a moment, not a stretch, so it is a fixed diamond centred on
    its date rather than a bar with a width. */
+/* Cut to a diamond rather than turned into one. A transformed box escapes its
+   parent's clip on this renderer, and this one sits inside a strip that has to
+   cut its contents off; a clip path is a shape, not a movement, so the strip
+   still gets to do its job. */
 .tl-blip.marker {
   width: 10px;
   height: 10px;
   margin-left: -5px;
-  border-radius: 1px;
-  transform: rotate(45deg);
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
 }
 
 .tl-blip-label {
@@ -4995,5 +5005,27 @@ mod clip_box_tests {
                  cannot start from their size"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod escaping_clip_tests {
+    use super::*;
+
+    #[test]
+    fn nothing_that_has_to_be_clipped_is_moved_by_a_transform() {
+        // A transformed box is painted outside its parent's clip here. The
+        // panes are clipped boxes holding something larger than themselves, so
+        // whatever moves their contents about has to be a property the clip
+        // still applies to. It cost a day to find, twice, because the symptom
+        // is the chart painted across the table rather than anything that
+        // looks like a transform.
+        let at = CSS.find("\n.shift {").expect(".shift");
+        let block = &CSS[at..at + CSS[at..].find('}').expect("a closing brace")];
+        assert!(
+            !block.contains("transform:"),
+            "the sliding box may not be moved by a transform, or it escapes \
+             the pane that is supposed to be cutting it off"
+        );
     }
 }

@@ -1199,14 +1199,18 @@ fn fit(label: &str, width: f64) -> String {
 
 fn milestone_marker(x: f64, y: f64, fill: &str) -> Element {
     let size = 5.5;
-    let points = format!(
-        "{x},{} {},{y} {x},{} {},{y}",
+    // A path, not a polygon. Every other shape in this chart is a rect, a line
+    // or a path, and those all appear; the diamond was the one polygon and it
+    // was the one shape nobody could see. Written as the same four corners,
+    // closed, which is all a polygon is anyway.
+    let d = format!(
+        "M{x},{} L{},{y} L{x},{} L{},{y} Z",
         y - size,
         x + size,
         y + size,
         x - size
     );
-    rsx! { polygon { points: "{points}", fill: "{fill}" } }
+    rsx! { path { d: "{d}", fill: "{fill}" } }
 }
 
 /// Project draws a summary as a flat spanning bar with a downward spike at

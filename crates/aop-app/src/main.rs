@@ -847,36 +847,36 @@ fn SplitPanes(
     };
     // A zoom changes what a pixel of the chart means.
     //
-    // Where a pane is scrolled to is held in pixels, and rezooming the chart
-    // makes it a different number of pixels wide. The old offset then points
-    // at a different date, and zooming out far enough points it past the end
-    // of the plan altogether, which is a pane showing bare canvas.
+    // Where a pane is scrolled to is held in pixels, and rezooming makes the
+    // chart a different number of pixels wide, so the old offset points at a
+    // different date, or past the end of the plan altogether, which is a pane
+    // showing bare canvas.
     //
-    // So the offset is carried across as a share of the plan rather than as a
-    // count of pixels: the same date stays at the left edge, which is what
-    // rezooming is supposed to do. Read with `peek` rather than by calling,
-    // because an effect that subscribes to what it writes runs forever.
+    // Rezooming takes the chart back to the start of the plan. That is what was
+    // asked for and it is the honest answer for a timescale: a zoom is a change
+    // of what you are looking at, not a nudge sideways, and the beginning is
+    // the one place that means the same thing at every zoom.
+    //
+    // Read with `peek` rather than by calling: an effect that subscribes to
+    // what it writes runs forever.
     let mut carried = use_signal(Reach::default);
     use_effect(move || {
         let now = reach();
         let before = *carried.peek();
-        if (before.chart - now.chart).abs() < 1.0 && (before.table - now.table).abs() < 1.0 {
+        let rezoomed = (before.chart - now.chart).abs() >= 1.0;
+        let recolumned = (before.table - now.table).abs() >= 1.0;
+        if !rezoomed && !recolumned {
             return;
         }
-        let was = *shifted.peek();
-        let chart = if before.chart > 1.0 && now.chart > 1.0 {
-            was.chart * now.chart / before.chart
-        } else {
-            was.chart
-        };
-        let next = Shifted {
-            // The table's columns do not rescale when they are resized, they
-            // just take more or less room, so its offset is only held inside
-            // what there is to scroll.
-            table: was.table.clamp(0.0, (now.table - 1.0).max(0.0)),
-            chart: chart.clamp(0.0, (now.chart - 1.0).max(0.0)),
-        };
         carried.set(now);
+        let was = *shifted.peek();
+        // The table's columns do not rescale when one is widened, they just
+        // take more or less room, so its offset is only held in range.
+        let table_port = state.peek().table_view_width();
+        let next = Shifted {
+            table: was.table.clamp(0.0, (now.table - table_port).max(0.0)),
+            chart: if rezoomed { 0.0 } else { was.chart },
+        };
         if next != was {
             shifted.set(next);
             // The chart draws the stretch of timescale it believes is on
@@ -885,24 +885,6 @@ fn SplitPanes(
             chart_scroll.set(PaneScroll { left: next.chart, ..seen });
         }
     });
-
-    // How much of the plan is on screen, in pixels.
-    //
-    // An estimate, from the window less everything stacked above and below the
-    // panes. It used to come from the scroll container's own report of its
-    // height, and there is no scroll container any more; measuring the box
-    // instead means `get_client_rect`, which takes the document's `RefCell`
-    // and is the call that was killing the process. What hangs on it is how
-    // big the thumb is drawn and how far the last row can be pulled up, and
-    // both are forgiving of being a little out.
-    {
-        let (_, tall) = use_context::<Signal<crate::state::Viewport>>()();
-        let port = (tall - CHROME_H).max(120.0);
-        if (down().1 - port).abs() >= 1.0 {
-            let at = down().0;
-            down.set((at, port));
-        }
-    }
 
     let panes = (use_context::<GridScroll>(), use_context::<ChartScroll>());
 
@@ -1149,7 +1131,7 @@ fn SplitPanes(
                     // ordinary clipped boxes again.
                     div { class: "pane left", style: "{left_cell}",
                         div { class: "pane-head",
-                            div { class: "shift", style: "transform: translateX(-{shift.table}px);",
+                            div { class: "shift", style: "margin-left: -{shift.table}px;",
                                 {left_head}
                             }
                         }
@@ -1158,7 +1140,7 @@ fn SplitPanes(
                             onwheel: move |event| wheel(event, &mut down, rows_len, panes),
                             div {
                                 class: "shift",
-                                style: "transform: translate(-{shift.table}px, -{down().0}px);",
+                                style: "margin: -{down().0}px 0 0 -{shift.table}px;",
                                 {left_body}
                             }
                         }
@@ -1176,7 +1158,7 @@ fn SplitPanes(
 
                     div { class: "pane right",
                         div { class: "pane-head",
-                            div { class: "shift", style: "transform: translateX(-{shift.chart}px);",
+                            div { class: "shift", style: "margin-left: -{shift.chart}px;",
                                 {right_head}
                             }
                         }
@@ -1185,7 +1167,7 @@ fn SplitPanes(
                             onwheel: move |event| wheel(event, &mut down, rows_len, panes),
                             div {
                                 class: "shift",
-                                style: "transform: translate(-{shift.chart}px, -{down().0}px);",
+                                style: "margin: -{down().0}px 0 0 -{shift.chart}px;",
                                 {right_body}
                             }
                         }
@@ -1260,7 +1242,7 @@ fn SoloGrid() -> Element {
             }
             div { class: "pane",
                 div { class: "pane-head",
-                    div { class: "shift", style: "transform: translateX(-{shift.table}px);",
+                    div { class: "shift", style: "margin-left: -{shift.table}px;",
                         grid::TaskGrid { part: Part::Head }
                     }
                 }
@@ -1269,7 +1251,7 @@ fn SoloGrid() -> Element {
                     onwheel: move |event| wheel(event, &mut down, rows_len, panes),
                     div {
                         class: "shift",
-                        style: "transform: translate(-{shift.table}px, -{down().0}px);",
+                        style: "margin: -{down().0}px 0 0 -{shift.table}px;",
                         grid::TaskGrid { part: Part::Body }
                     }
                 }
