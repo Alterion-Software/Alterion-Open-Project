@@ -489,7 +489,7 @@ pub fn TaskGrid() -> Element {
                                                         td {
                                                             key: "c{position}",
                                                             class: "{cell_class}",
-                                                            style: "height: {ROW_H}px;",
+                                                            style: "height: {ROW_H}px; width: {column.width}px;",
 
                                                             // Which column the cursor is on, for the commands
                                                             // that act on a column rather than a whole row.
@@ -594,7 +594,7 @@ pub fn TaskGrid() -> Element {
                                             td {
                                                 key: "n{position}",
                                                 class: "{cell_class}",
-                                                style: "height: {ROW_H}px;",
+                                                style: "height: {ROW_H}px; width: {column.width}px;",
                                                 onclick: move |_| {
                                                     if is_name {
                                                         state.write().editing = Some((new_row, Column::Name));

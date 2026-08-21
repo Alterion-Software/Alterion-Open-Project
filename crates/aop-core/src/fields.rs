@@ -200,8 +200,13 @@ impl Field {
     ];
 
     /// The columns a new plan opens with, the Project Entry table.
-    pub const ENTRY_TABLE: [Field; 9] = [
-        Field::Id,
+    /// What the entry table shows out of the box.
+    ///
+    /// No `Id` column. The row-number gutter is Project's, and this is the
+    /// slot the outline number belongs in, so leaving a number there by
+    /// default would put the wrong number in the right place. Anybody who
+    /// wants it can add it back from the column menu.
+    pub const ENTRY_TABLE: [Field; 8] = [
         Field::Indicators,
         Field::TaskMode,
         Field::Name,

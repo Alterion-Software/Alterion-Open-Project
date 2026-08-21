@@ -74,15 +74,6 @@ pub enum LinkEnd {
 }
 
 impl LinkEnd {
-    /// The grid column this end writes to, which is also the cell the typed
-    /// form commits through.
-    fn column(self) -> Column {
-        match self {
-            LinkEnd::Predecessors => Column::Predecessors,
-            LinkEnd::Successors => Column::Successors,
-        }
-    }
-
     fn heading(self, task: &str) -> String {
         match self {
             LinkEnd::Predecessors => format!("Predecessors of {task}"),
@@ -242,24 +233,6 @@ pub fn LinkPicker(row: usize, end: LinkEnd) -> Element {
         w.refresh_cell_draft();
     };
 
-    // Seeded with what the cell already says, so typing edits rather than
-    // starts from nothing.
-    let mut typed = use_signal(|| {
-        let s = state.read();
-        s.project
-            .tasks
-            .get(row)
-            .map(|task| match end {
-                LinkEnd::Predecessors => s.project.predecessor_text(task.id),
-                LinkEnd::Successors => s.project.successor_text(task.id),
-            })
-            .unwrap_or_default()
-    });
-    let mut commit = move || {
-        let text = typed();
-        state.write().commit_cell(row, end.column(), &text);
-    };
-
     rsx! {
         div { class: "picker",
             div { class: "ctxheader", "{heading}" }
@@ -346,20 +319,6 @@ pub fn LinkPicker(row: usize, end: LinkEnd) -> Element {
             }
 
             div { class: "hint", "{end.explanation()}" }
-
-            // Typing is faster than hunting for a row once you know the number,
-            // so the same cell text Project accepts is accepted here.
-            div { class: "pred-type",
-                label { "Or type it" }
-                input {
-                    class: "bs-input",
-                    placeholder: "3, 5FS+2d, 7SS",
-                    value: "{typed}",
-                    oninput: move |event| typed.set(event.value()),
-                    onkeydown: move |event| if event.key() == Key::Enter { commit() },
-                }
-                button { class: "btn", onclick: move |_| commit(), "Set" }
-            }
 
             div { class: "pred-foot",
                 span { class: "recent-path", {end.tally(chosen)} }
