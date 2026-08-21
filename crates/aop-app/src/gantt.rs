@@ -1782,14 +1782,29 @@ pub fn TimelineBand() -> Element {
             // Asked again until there is something to measure: mounting
             // happens before layout, so the first answer is honestly zero.
             onmounted: move |event| async move {
+                // Sampled until the answer stops changing, not until it is
+                // merely non-zero. Layout settles in stages here, so the first
+                // width that is not zero is often an intermediate one, and a
+                // band that believes it is 630 pixels wide inside an 830 pixel
+                // panel simply stops two hundred pixels short.
+                let mut steady = 0u32;
+                let mut last = 0.0f64;
                 for _ in 0..24u32 {
                     match event.get_client_rect().await {
                         Ok(rect) if rect.width() > 1.0 => {
                             let seen = rect.width().round();
+                            if (seen - last).abs() < 1.0 {
+                                steady += 1;
+                            } else {
+                                steady = 0;
+                                last = seen;
+                            }
                             if (band_width() - seen).abs() >= 1.0 {
                                 measured.set(Some(seen));
                             }
-                            break;
+                            if steady >= 2 {
+                                break;
+                            }
                         }
                         Ok(_) => {}
                         Err(_) => break,

@@ -384,7 +384,14 @@ body {
 .app {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  /* Sized against its parent, not against `100vh`. A viewport unit asks the
+     renderer how big the window is, which is the same measurement that has
+     been answering with an intermediate layout all along, so the application
+     was laid out 1775 by 1000 inside a 1920 by 1080 window with dead space
+     down two sides. `#main` above is already 100% of the window, so taking
+     100% of that asks nobody anything. */
+  width: 100%;
+  height: 100%;
   overflow: hidden;
   /* No OS decorations, so the app draws its own edge. */
   border: 1px solid #202a2a;
@@ -1854,7 +1861,9 @@ button { font: inherit; color: inherit; }
 /* print preview */
 /* The document on the left, where it is going on the right. The preview takes
    the room because it is the thing being judged. */
-.print-layout { display: flex; gap: 22px; align-items: stretch; min-height: 0; }
+/* Fills what the backstage page gives it, so the preview inside can be sized
+   against this rather than against the window. */
+.print-layout { display: flex; gap: 22px; align-items: stretch; min-height: 0; flex: 1 1 auto; height: 100%; }
 .print-preview { flex: 1 1 auto; min-width: 0; display: flex; }
 .print-settings {
   width: 300px;
@@ -1937,7 +1946,10 @@ button { font: inherit; color: inherit; }
   flex: 1 1 auto;
   width: 100%;
   min-width: 0;
-  height: calc(100vh - 210px);
+  /* Filling the row rather than a fraction of the window. `100vh` asks the
+     renderer how tall the window is, which is answered late here, so a preview
+     sized that way is the wrong height until it is not. */
+  height: 100%;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #f2f5f5;
@@ -2118,7 +2130,11 @@ button { font: inherit; color: inherit; }
    its own middle and it lands back inside. */
 .viewbar span {
   position: absolute;
-  width: 100vh;
+  /* Long enough for any view's name once turned, and a fixed number rather
+     than a viewport one: `100vh` would be exactly right and depends on a
+     measurement this renderer answers late. The bar clips, so being longer
+     than needed costs nothing. */
+  width: 320px;
   text-align: center;
   transform: rotate(-90deg);
   transform-origin: center;
@@ -4580,5 +4596,36 @@ mod tab_bar_tests {
             rest[..rest.find(';').expect("a semicolon")].trim()
         }
         assert_eq!(floor(rule(".pane-tab.grow {")), floor(rule(".chart-pane {")));
+    }
+}
+
+#[cfg(test)]
+mod fills_the_window_tests {
+    use super::*;
+
+    #[test]
+    fn nothing_is_sized_against_the_viewport() {
+        // Viewport units ask the renderer how big the window is, and this
+        // application cannot get a straight answer to that: the same question
+        // has returned an intermediate layout every time it has been asked
+        // today. Anything sized in `vh` or `vw` inherits that.
+        //
+        // The one exception is a maximum rather than a size: a panel saying it
+        // will not grow past most of the window is still right when the answer
+        // is late, because it only ever clamps.
+        for (index, line) in CSS.lines().enumerate() {
+            let declaration = line.trim();
+            let sizing = declaration.starts_with("width:")
+                || declaration.starts_with("height:")
+                || declaration.starts_with("min-width:")
+                || declaration.starts_with("min-height:");
+            if sizing && (declaration.contains("vh") || declaration.contains("vw")) {
+                panic!(
+                    "line {}: {declaration} is sized against the viewport, which \
+                     this renderer measures late. Size against the parent.",
+                    index + 1
+                );
+            }
+        }
     }
 }
