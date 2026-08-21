@@ -304,7 +304,15 @@ pub fn TaskGrid(part: Part) -> Element {
     // titles drifting off their columns was. It is pulled up out of sight by
     // its own height there, so it costs no room. The copy above is the one you
     // see, and its grips are the ones that resize a column.
-    let heading = |ghost: bool| rsx! {
+    let heading = |ghost: bool| {
+        // No height at all for the copy that is only there to settle the
+        // widths. It has to be said here rather than in the stylesheet: the
+        // height is written on the cell itself, and a style written on an
+        // element beats any rule, so a rule saying "no height" was simply
+        // overruled and the row table wore a band of empty as tall as a
+        // heading.
+        let tall = if ghost { 0.0 } else { HEADER_H };
+        rsx! {
                 thead { class: if ghost { "ghost" } else { "" },
                     tr {
                         for (index, column) in columns.iter().enumerate() {
@@ -315,7 +323,7 @@ pub fn TaskGrid(part: Part) -> Element {
                                         key: "h{index}",
                                         class: "{align_class(field.align())}",
                                         title: "{field.label()}: {field.description()}",
-                                        style: "height: {HEADER_H}px; width: {column.width}px;",
+                                        style: "height: {tall}px; width: {column.width}px;",
                                         oncontextmenu: move |event| {
                                             event.prevent_default();
                                             let point = event.client_coordinates();
@@ -360,6 +368,7 @@ pub fn TaskGrid(part: Part) -> Element {
                         }
                     }
                 }
+        }
     };
 
     let head = rsx! {
@@ -525,6 +534,29 @@ pub fn TaskGrid(part: Part) -> Element {
                                                         cell_class.push_str(" rownum");
                                                     }
                                                     let value = field.value(project, index, pattern);
+                                                    // Clipped only if there is
+                                                    // something to clip. See
+                                                    // `overflows`: a clip is a
+                                                    // painting layer, layers
+                                                    // are rationed, and a
+                                                    // table that asks for one
+                                                    // per cell spends the
+                                                    // whole ration before the
+                                                    // rest of the window has
+                                                    // had any.
+                                                    let text = if field == Field::Name {
+                                                        task.name.as_str()
+                                                    } else {
+                                                        value.as_str()
+                                                    };
+                                                    let room = if field == Field::Name {
+                                                        column.width - 24.0 - task.outline_level as f64 * 12.0
+                                                    } else {
+                                                        column.width
+                                                    };
+                                                    if overflows(text, room) {
+                                                        cell_class.push_str(" tight");
+                                                    }
 
                                                     rsx! {
                                                         td {
@@ -678,6 +710,28 @@ pub fn TaskGrid(part: Part) -> Element {
         Part::Head => head,
         Part::Body => body,
     }
+}
+
+/// Whether a piece of text is too long for the room it has.
+///
+/// An estimate, from an average character width, and it only has to be roughly
+/// right. What hangs on it is whether the cell is given `overflow: hidden`,
+/// and that is not free: the renderer paints every clipping box as a layer of
+/// its own and keeps only a thousand of them. A table drawing ninety rows of
+/// eight columns asks for seven hundred and forty before anything else in the
+/// window has had one, and once the ration runs out the renderer stops
+/// clipping silently. Everything painted after that point spills: table cells
+/// over the splitter and into the chart, a dropdown's list outside its own
+/// box, a menu outside its panel. One symptom, in three places that had
+/// nothing to do with each other.
+///
+/// So a cell is only clipped when its text would actually come out of it,
+/// which on an ordinary screenful is a handful of cells rather than all of
+/// them.
+fn overflows(text: &str, room: f64) -> bool {
+    const CHAR_W: f64 = 6.2;
+    const PADDING: f64 = 12.0;
+    text.chars().count() as f64 * CHAR_W > room - PADDING
 }
 
 /// The column widths, stated once per table.
@@ -927,5 +981,34 @@ mod tests {
             .count();
         assert_eq!(task_indices(&layout).len(), leaves);
         assert!(layout.len() > leaves, "the bands take lines of their own");
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+
+    #[test]
+    fn a_cell_with_room_to_spare_is_not_clipped() {
+        // This is the whole point. A clip is a painting layer and the renderer
+        // keeps a thousand; a table that asks for one per cell spends the lot
+        // and everything painted afterwards stops being clipped at all.
+        assert!(!overflows("3 days", 90.0));
+        assert!(!overflows("Mon 13/10/25", 110.0));
+        assert!(!overflows("", 20.0));
+    }
+
+    #[test]
+    fn a_cell_whose_text_would_come_out_of_it_is_clipped() {
+        assert!(overflows("CCT tool (Data Migration) Part of Fusion TIF", 120.0));
+        assert!(overflows("Liesl Hollander", 60.0));
+    }
+
+    #[test]
+    fn a_column_narrower_than_its_padding_still_answers() {
+        // No arithmetic that can go negative and wrap: the answer for a column
+        // with no room at all is "yes, clip it".
+        assert!(overflows("a", 0.0));
+        assert!(overflows("a", 6.0));
     }
 }

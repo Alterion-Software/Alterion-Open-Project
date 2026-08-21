@@ -1960,7 +1960,7 @@ button { font: inherit; color: inherit; }
 
 .timeline {
   background: var(--surface);
-  border-bottom: 1px solid var(--grid-line);
+  border-bottom: 1px solid var(--line);
   flex: none;
   display: flex;
   flex-direction: column;
@@ -2211,7 +2211,7 @@ button { font: inherit; color: inherit; }
   height: 11px;
   position: relative;
   background: var(--surface-2);
-  border-top: 1px solid var(--grid-line);
+  border-top: 1px solid var(--line);
 }
 
 /* The bar down the right, over the rows. Fourteen pixels of track, drawn on
@@ -2224,7 +2224,7 @@ button { font: inherit; color: inherit; }
   right: 0;
   width: 11px;
   background: var(--surface-2);
-  border-left: 1px solid var(--grid-line);
+  border-left: 1px solid var(--line);
 }
 
 /* The part that says where you are.
@@ -2307,11 +2307,11 @@ button { font: inherit; color: inherit; }
 .splitter {
   position: relative;
   width: 5px;
-  /* The same line the table draws between its columns. A divider between two
-     panes and a divider between two columns are the same kind of thing, and
-     using the panel outline colour here made the split read as a heavier
-     break than it is. */
-  background: var(--grid-line);
+  /* Back to the panel outline, which is the lighter of the two. Matching the
+     table's own column lines made the split between the two panes disappear
+     into them: a divider between panes is a heavier thing than a divider
+     between columns, and it should read as one. */
+  background: var(--line);
   cursor: col-resize;
   flex: none;
   align-self: stretch;
@@ -2422,11 +2422,21 @@ button { font: inherit; color: inherit; }
   border-color: var(--grid-line);
   height: 22px;
   padding: 0 6px;
-  overflow: hidden;
   white-space: nowrap;
-  text-overflow: ellipsis;
   color: var(--ink);
 }
+
+/* Only a cell whose text would come out of it is clipped, and it is asked for
+   in Rust, per cell, rather than by every cell here.
+
+   A clipping box is painted as a layer of its own and the renderer keeps a
+   thousand of them. A table drawing ninety rows of eight columns asks for
+   seven hundred and forty before the rest of the window has had one, and when
+   the ration runs out clipping stops silently: everything painted after that
+   spills. That is one fault wearing three faces, and all three were reported
+   as separate bugs. Table cells over the splitter and into the chart, a
+   dropdown's list outside its own box, and a menu outside its panel. */
+.grid td.tight { overflow: hidden; text-overflow: ellipsis; }
 
 /* The gridline choices, as classes on the table so one toggle repaints
    without every cell carrying its own style. */
@@ -2920,7 +2930,7 @@ button { font: inherit; color: inherit; }
   right: 50px;
   bottom: 2px;
   height: 1px;
-  background: var(--grid-line);
+  background: var(--line);
 }
 
 .tl-edge {

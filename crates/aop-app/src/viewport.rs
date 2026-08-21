@@ -33,11 +33,13 @@ const BLOCK: usize = 16;
 
 /// The height to assume before a pane has told us its own.
 ///
-/// A pane reports its height with its first scroll or mount event, which is
-/// after the first paint. Guessing high means that first paint draws some rows
-/// nobody can see, which is wasteful but invisible; guessing low would leave a
-/// gap at the bottom of the pane until something moved.
-pub const ASSUMED_HEIGHT: f64 = 1400.0;
+/// A pane reports its height with its first scroll, which is after the first
+/// paint. Guessing low would leave a gap at the bottom of the pane until
+/// something moved, so this guesses high, but not as high as it used to: at
+/// fourteen hundred the first paint drew ninety rows, and rows are the biggest
+/// consumer of the renderer's ration of clipping layers. Nine hundred covers
+/// any window this application is usable in and draws two thirds as many.
+pub const ASSUMED_HEIGHT: f64 = 900.0;
 
 /// The width to assume before a pane has told us its own. See `ASSUMED_HEIGHT`.
 pub const ASSUMED_WIDTH: f64 = 2400.0;
