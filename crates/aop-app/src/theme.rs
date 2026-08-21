@@ -2207,7 +2207,7 @@ button { font: inherit; color: inherit; }
   overflow-x: scroll;
   overflow-y: hidden;
   background: var(--surface-2);
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--grid-line);
 }
 .rail-run { height: 1px; }
 
@@ -2271,7 +2271,11 @@ button { font: inherit; color: inherit; }
 .splitter {
   position: relative;
   width: 5px;
-  background: var(--line);
+  /* The same line the table draws between its columns. A divider between two
+     panes and a divider between two columns are the same kind of thing, and
+     using the panel outline colour here made the split read as a heavier
+     break than it is. */
+  background: var(--grid-line);
   cursor: col-resize;
   flex: none;
   align-self: stretch;
@@ -2827,8 +2831,82 @@ button { font: inherit; color: inherit; }
 
 /* Timeline band labels. One beside its bar reads as ordinary text; one within
    a bar sits on the bar's own colour, so it takes the dark ink instead. */
-.band-label { font-size: 10px; fill: var(--ink-soft); }
-.band-label.in { fill: var(--on-accent); font-weight: 600; }
+/* ---------- the timeline strip ---------- */
+
+/* Everything in it is placed against this box and sized as a share of it, so
+   nothing here ever needs to know how wide the strip is in pixels. That is the
+   point: asking cost the process its life, because measuring an element takes
+   the document's `RefCell` and the answer only settles some frames after the
+   element appears, so it had to be asked for again on a timer, and a timer
+   that wakes mid-render panics. A percentage is worked out at layout, every
+   layout, including the one after the window is resized. */
+.tl-strip { position: relative; width: 100%; }
+
+/* The plan itself, inset from both ends of the strip: the left clears the word
+   painted over the corner, the right leaves room for the closing date. Every
+   band inside is placed as a percentage of THIS box, so the inset costs
+   nothing in arithmetic and cannot be got wrong at a different window size. */
+.tl-lanes {
+  position: absolute;
+  left: 68px;
+  right: 50px;
+  top: 0;
+  bottom: 0;
+}
+
+/* The rule the plan runs along, under the two dates. */
+.tl-axis {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 16px;
+  height: 1px;
+  background: var(--line);
+}
+
+.tl-edge {
+  position: absolute;
+  top: 1px;
+  font-size: 10px;
+  color: var(--ink-soft);
+}
+/* Clear of the word "Timeline", which is painted over this corner of the strip
+   rather than taking a line of its own. */
+.tl-edge.start { left: 62px; }
+.tl-edge.end { right: 0; }
+
+/* One phase. Placed and sized as a share of the strip; only its height and its
+   corners are in pixels, because those do not depend on how long the plan is. */
+.tl-blip {
+  position: absolute;
+  height: 13px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  box-sizing: border-box;
+}
+
+/* A milestone is a moment, not a stretch, so it is a fixed diamond centred on
+   its date rather than a bar with a width. */
+.tl-blip.marker {
+  width: 10px;
+  height: 10px;
+  margin-left: -5px;
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
+
+.tl-blip-label {
+  position: absolute;
+  height: 13px;
+  line-height: 13px;
+  font-size: 10px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+  /* The label is a caption on the band, never a thing to catch a pointer. */
+  pointer-events: none;
+  margin-left: 5px;
+}
+.tl-blip-label.in { font-weight: 600; margin-left: 5px; }
 
 /* ---------- reports ---------- */
 

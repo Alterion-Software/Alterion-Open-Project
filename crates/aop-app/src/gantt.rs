@@ -1524,13 +1524,9 @@ fn rubber_band(kind: ShapeKind, x: f64, y: f64, dx: f64, dy: f64, palette: Palet
 
 // ---------------------------------------------------------------- timeline
 
-/// Left and right padding inside the timeline band.
-///
-/// The left padding also has to clear the band's own caption, which is drawn
-/// over the strip rather than in it; too small and the first date label reads
-/// straight through the word "Timeline".
-const BAND_LEFT: f64 = 68.0;
-const BAND_RIGHT: f64 = 50.0;
+// The bands run the full width of the strip. What used to be inset here, in
+// pixels, was room for the two date labels at the ends; those sit on the line
+// above the bands instead, so there is nothing left to reserve.
 
 /// Clearance between two bands sharing a line. Small on purpose: bands should
 /// only drop to another line when they genuinely overlap.
@@ -1617,15 +1613,25 @@ pub struct Band {
 /// outside. A bar carries its name within it when there is room, and beside it
 /// when there is not, which is what stops a short task from losing its name
 /// altogether.
-pub fn measure_band(index: usize, left: f64, right: f64, name: &str, marker: bool) -> Band {
+pub fn measure_band(
+    index: usize,
+    left: f64,
+    right: f64,
+    name: &str,
+    marker: bool,
+    // How many pixels the strip is across, so a label measured in pixels can be
+    // compared with a band measured as a fraction of it. An estimate is enough:
+    // this decides which line a band is packed onto, never where it is drawn.
+    across: f64,
+) -> Band {
     let label = name.trim().to_string();
-    let label_w = label.chars().count() as f64 * BAND_CHAR_W;
+    let label_w = label.chars().count() as f64 * BAND_CHAR_W / across.max(1.0);
 
-    let inside = !marker && !label.is_empty() && label_w + BAND_LABEL_PAD <= right - left;
+    let inside = !marker && !label.is_empty() && label_w + BAND_LABEL_PAD / across.max(1.0) <= right - left;
     let span_right = if label.is_empty() || inside {
         right
     } else {
-        right + BAND_LABEL_GAP + label_w
+        right + (BAND_LABEL_GAP / across.max(1.0)) + label_w
     };
 
     Band {
@@ -1662,34 +1668,43 @@ pub fn pack_lanes(spans: &[(f64, f64)]) -> (Vec<usize>, usize) {
     (lanes, used)
 }
 
-/// Map an instant onto the timeline band.
+/// Where an instant falls along the timeline band, as a fraction of it.
 ///
-/// Pulled out of the component so it can be tested: two tasks that run back to
-/// back must land on exactly the same x, with no gap for the night between
-/// them.
-pub fn timeline_x(
+/// A fraction rather than a pixel, because the band is laid out in percentages
+/// and never learns its own width. Pulled out of the component so it can be
+/// tested: two tasks that run back to back must land on exactly the same
+/// point, with no gap for the night between them.
+pub fn timeline_fraction(
     calendar: &WorkCalendar,
     first_day: NaiveDate,
     total_days: f64,
-    width: f64,
     at: NaiveDateTime,
 ) -> f64 {
-    let usable = width - BAND_LEFT - BAND_RIGHT;
-    BAND_LEFT + calendar.day_offset(first_day, at) / total_days.max(1.0) * usable
+    (calendar.day_offset(first_day, at) / total_days.max(1.0)).clamp(0.0, 1.0)
 }
 
 /// The Timeline band above the workspace, showing the plan at a glance.
+///
+/// Boxes placed by percentage, not an SVG drawn at a measured width.
+///
+/// It used to ask the renderer how wide it was, at mount and then again on a
+/// timer until the answer settled. That is what "the timeline fails to load"
+/// turned out to mean: measuring an element takes the document's `RefCell`
+/// unconditionally, and a timer that wakes while a render is in flight panics
+/// with "RefCell already borrowed" and takes the whole process with it. On a
+/// plan of any size there is always a render in flight, so the bigger the
+/// plan the more certain the crash.
+///
+/// A percentage needs no measuring. A phase that runs a third of the way
+/// through the plan is at `left: 33%`, and the renderer works out what that
+/// comes to when it lays the strip out, every time, including after a resize.
+/// There is nothing to go stale, nothing to sample, and nothing to ask.
 #[component]
 pub fn TimelineBand() -> Element {
     let state = use_context::<Signal<AppState>>();
     let s = state.read();
     let project = &s.project;
     let palette = s.theme.palette();
-
-    // The pane reports its width once it is laid out. Until then a plausible
-    // width keeps the first paint from being nonsense.
-    let mut measured = use_signal(|| None::<f64>);
-    let band_width = move || measured().unwrap_or(1400.0);
 
     if project.tasks.is_empty() {
         return rsx! {
@@ -1702,10 +1717,6 @@ pub fn TimelineBand() -> Element {
         };
     }
 
-    // The band is drawn at its real pixel size. Stretching a fixed coordinate
-    // space to fit the pane would scale the glyphs sideways with it, which is
-    // what makes the labels look wrong before anything else does.
-    let width = band_width().max(600.0);
     let start = project.start_date;
     let finish = project.finish_date.max(start + Duration::days(1));
     // The band is measured in whole days so consecutive tasks touch, matching
@@ -1713,8 +1724,23 @@ pub fn TimelineBand() -> Element {
     let first_day = start.date();
     let last_day = finish.date() + Duration::days(1);
     let total_days = (last_day - first_day).num_days().max(1) as f64;
-    let x = |at: NaiveDateTime| {
-        timeline_x(&project.calendar, first_day, total_days, width, at)
+    // Where an instant falls along the strip, as a fraction of it.
+    let at = |when: NaiveDateTime| {
+        timeline_fraction(&project.calendar, first_day, total_days, when)
+    };
+
+    // Only for deciding whether a label fits inside its own band and how much
+    // room it needs beside it when it does not. The window's width is known
+    // and stays known through a resize, so this is a fair estimate; and being
+    // an estimate is all it has to be, because it decides which line a band is
+    // packed onto and never where the band is drawn.
+    let across = {
+        let (width, _) = use_context::<Signal<crate::state::Viewport>>()();
+        // The window, less the strip's own padding and the two insets the
+        // plan is drawn between. It has to be the width of the box the bands
+        // actually live in, or a label reserves the wrong share of it.
+        let lanes_across = width - 20.0 - 68.0 - 50.0;
+        if lanes_across > 1.0 { lanes_across } else { 1000.0 }
     };
 
     // The top level of the outline is what a timeline is for.
@@ -1722,12 +1748,13 @@ pub fn TimelineBand() -> Element {
         .filter(|&i| project.tasks[i].outline_level == 0)
         .map(|index| {
             let task = &project.tasks[index];
-            let left = x(task.scheduled.start);
+            let left = at(task.scheduled.start);
             if project.is_marker(index) {
-                measure_band(index, left - BAND_DIAMOND, left + BAND_DIAMOND, &task.name, true)
+                let half = BAND_DIAMOND / across;
+                measure_band(index, left - half, left + half, &task.name, true, across)
             } else {
-                let right = x(task.scheduled.finish).max(left + 3.0);
-                measure_band(index, left, right, &task.name, false)
+                let right = at(task.scheduled.finish).max(left + 3.0 / across);
+                measure_band(index, left, right, &task.name, false, across)
             }
         })
         .collect();
@@ -1767,74 +1794,25 @@ pub fn TimelineBand() -> Element {
         div {
             class: "timeline",
             style: "height: {height + 8.0}px;",
-            onresize: move |event| {
-                if let Ok(size) = event.get_content_box_size() {
-                    let seen = size.width.round();
-                    // Redraw only on a real change in width, not on every
-                    // frame of a window drag.
-                    if (band_width() - seen).abs() >= 1.0 {
-                        measured.set(Some(seen));
-                    }
-                }
-            },
-            // And measured on arrival as well, because `onresize` is an event
-            // not every renderer sends. Where it is not sent the band never
-            // learns its width and draws itself at the fallback, which is a
-            // band far narrower than the room it has.
-            //
-            // Asked again until there is something to measure: mounting
-            // happens before layout, so the first answer is honestly zero.
-            onmounted: move |event| async move {
-                // Sampled until the answer stops changing, not until it is
-                // merely non-zero. Layout settles in stages here, so the first
-                // width that is not zero is often an intermediate one, and a
-                // band that believes it is 630 pixels wide inside an 830 pixel
-                // panel simply stops two hundred pixels short.
-                let mut steady = 0u32;
-                let mut last = 0.0f64;
-                for _ in 0..24u32 {
-                    match event.get_client_rect().await {
-                        Ok(rect) if rect.width() > 1.0 => {
-                            let seen = rect.width().round();
-                            if (seen - last).abs() < 1.0 {
-                                steady += 1;
-                            } else {
-                                steady = 0;
-                                last = seen;
-                            }
-                            if (band_width() - seen).abs() >= 1.0 {
-                                measured.set(Some(seen));
-                            }
-                            if steady >= 2 {
-                                break;
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-                }
-            },
             div { class: "timeline-caption", "{caption}" }
-            // No viewBox. It gives the contents their own coordinate space, and
-            // a space that does not match the element is scaled to fit it, so a
-            // band drawn at a stale width is not merely narrow, it is magnified
-            // until a date reads like a headline. Without one the contents are
-            // drawn at their own size whatever the element turns out to be,
-            // and being narrow is the worst that can happen.
-            svg { width: "{width}", height: "{height}", font_family: palette.font(),
-                style: "width: {width}px; height: {height}px; flex: none;",
-                line { x1: "{BAND_LEFT}", y1: "16", x2: "{width - BAND_RIGHT}", y2: "16",
-                    stroke: palette.paint("--line"), stroke_width: "1" }
-                text { x: "{BAND_LEFT}", y: "11", class: "tl-minor", font_size: "10", fill: palette.paint("--ink-soft"),
-                    "{crate::state::format_date(start)}" }
-                text { x: "{width - BAND_RIGHT}", y: "11", class: "tl-minor", text_anchor: "end", font_size: "10", fill: palette.paint("--ink-soft"),
-                    "{crate::state::format_date(finish)}" }
+            div { class: "tl-strip", style: "height: {height}px;",
+                div { class: "tl-edge start", "{crate::state::format_date(start)}" }
+                div { class: "tl-edge end", "{crate::state::format_date(finish)}" }
+
+                // The plan runs inside this, not inside the strip. It is inset
+                // from both ends to clear the word painted over the corner and
+                // the two dates, which is what the old drawing did with a pair
+                // of pixel margins baked into every coordinate. Here the inset
+                // is the box, so a percentage inside it is still a percentage
+                // of the plan and nothing has to know how wide anything is.
+                div { class: "tl-lanes",
+                div { class: "tl-axis" }
 
                 for (slot, (band, lane)) in placed.into_iter().enumerate() {
                     {
-                        let w = (band.right - band.left).max(3.0);
                         let y = top + lane as f64 * lane_h;
+                        let left = band.left * 100.0;
+                        let width = ((band.right - band.left) * 100.0).max(0.2);
                         let critical =
                             s.show_critical && aop_core::issues::shows_as_critical(project, band.index);
                         // Each band takes its own shade of the plan's colour so
@@ -1848,61 +1826,57 @@ pub fn TimelineBand() -> Element {
                         // A darker edge of the same colour gives the block an
                         // outline without a border colour of its own.
                         let edge = shade(&fill, -0.35);
-                        // A label that sits beside its band starts clear of it;
-                        // one that sits within starts just inside the edge.
-                        let label_x = if band.inside {
-                            band.left + 5.0
-                        } else {
-                            band.right + BAND_LABEL_GAP
-                        };
-                        let label_class = if band.inside { "band-label in" } else { "band-label" };
+                        let marker = project.is_marker(band.index);
                         // Pale shades need dark ink, dark shades need pale.
-                        let label_ink = if band.inside { shade(&fill, -0.75) } else { String::new() };
-                        // Size and colour on the element, not from the class.
-                        // A stylesheet class does not reach inside an inline
-                        // SVG here, so `.band-label { font-size: 10px }` never
-                        // applied and these labels were drawn at whatever they
-                        // inherited, which is why the band came out looking
-                        // like a headline whenever it was rebuilt.
-                        // As attributes, not through `style`. Everything that
-                        // has actually taken effect inside an SVG here has been
-                        // an attribute on the element; a `style` is one more
-                        // route this renderer does not follow into one, which
-                        // is why stating the size in it changed nothing and the
-                        // label still came out as a headline.
-                        let label_fill = if band.inside {
-                            label_ink.clone()
+                        let ink = if band.inside {
+                            shade(&fill, -0.75)
                         } else {
                             palette.paint("--ink-soft").to_string()
                         };
+                        // A label within its band starts just inside the edge;
+                        // one beside it starts just clear of the right edge.
+                        let label_style = if band.inside {
+                            format!("left: {left}%; top: {y}px; color: {ink};")
+                        } else {
+                            format!(
+                                "left: {}%; top: {y}px; color: {ink};",
+                                (band.right * 100.0).min(100.0)
+                            )
+                        };
+                        let label_class = if band.inside { "tl-blip-label in" } else { "tl-blip-label" };
                         rsx! {
-                            g { key: "tb{band.index}",
-                                if project.is_marker(band.index) {
-                                    {milestone_marker(band.left + BAND_DIAMOND, y + 6.0, &project.bar_styles.milestone)}
-                                } else {
-                                    rect {
-                                        x: "{band.left}", y: "{y}",
-                                        width: "{w}", height: "13", rx: "3",
-                                        fill: "{fill}",
-                                        stroke: "{edge}", stroke_width: "1",
-                                    }
+                            if marker {
+                                div {
+                                    key: "tm{band.index}",
+                                    class: "tl-blip marker",
+                                    style: "left: {left + width / 2.0}%; top: {y + 1.0}px; \
+                                            background: {project.bar_styles.milestone};",
                                 }
-                                if !band.label.is_empty() {
-                                    text {
-                                        x: "{label_x}", y: "{y + 9.5}",
-                                        class: "{label_class}",
-                                        font_size: "10", fill: "{label_fill}",
-                                        "{band.label}"
-                                    }
+                            } else {
+                                div {
+                                    key: "tb{band.index}",
+                                    class: "tl-blip",
+                                    style: "left: {left}%; width: {width}%; top: {y}px; \
+                                            background: {fill}; border-color: {edge};",
+                                }
+                            }
+                            if !band.label.is_empty() {
+                                div {
+                                    key: "tl{band.index}",
+                                    class: "{label_class}",
+                                    style: "{label_style}",
+                                    "{band.label}"
                                 }
                             }
                         }
                     }
                 }
+                }
             }
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -2104,7 +2078,7 @@ mod tests {
     fn a_markers_name_is_part_of_what_it_occupies() {
         // The name is drawn beside the diamond, so packing by the diamond
         // alone is what lets the next band be drawn straight over the name.
-        let marker = measure_band(0, 95.0, 105.0, "Compliance checklist created", true);
+        let marker = measure_band(0, 95.0, 105.0, "Compliance checklist created", true, 1.0);
         assert!(!marker.inside, "a marker never carries its name within it");
         assert!(
             marker.span.1 > 105.0 + 100.0,
@@ -2115,8 +2089,8 @@ mod tests {
 
     #[test]
     fn a_band_packed_after_a_marker_clears_its_name() {
-        let marker = measure_band(0, 95.0, 105.0, "Compliance checklist created", true);
-        let bar = measure_band(1, 120.0, 400.0, "Phase 7: Dashboards", false);
+        let marker = measure_band(0, 95.0, 105.0, "Compliance checklist created", true, 1.0);
+        let bar = measure_band(1, 120.0, 400.0, "Phase 7: Dashboards", false, 1.0);
         let (lanes, used) = pack_lanes(&[marker.span, bar.span]);
         assert_eq!(used, 2, "the bar starts inside the marker's name");
         assert_ne!(lanes[0], lanes[1]);
@@ -2124,7 +2098,7 @@ mod tests {
 
     #[test]
     fn a_name_that_fits_its_bar_is_drawn_within_it() {
-        let bar = measure_band(0, 0.0, 400.0, "Phase 9: Mobile App", false);
+        let bar = measure_band(0, 0.0, 400.0, "Phase 9: Mobile App", false, 1.0);
         assert!(bar.inside);
         assert_eq!(bar.span, (0.0, 400.0), "an inside name needs no extra room");
     }
@@ -2132,7 +2106,7 @@ mod tests {
     #[test]
     fn a_name_too_long_for_its_bar_moves_beside_it() {
         // Rather than elide the name down to nothing on a narrow bar.
-        let bar = measure_band(0, 0.0, 20.0, "Phase 2: Core Infrastructure", false);
+        let bar = measure_band(0, 0.0, 20.0, "Phase 2: Core Infrastructure", false, 1.0);
         assert!(!bar.inside);
         assert!(bar.span.1 > 20.0);
         assert_eq!(bar.label, "Phase 2: Core Infrastructure", "nothing is cut");
@@ -2140,8 +2114,8 @@ mod tests {
 
     #[test]
     fn bands_that_do_not_overlap_share_a_line() {
-        let a = measure_band(0, 0.0, 100.0, "A", false);
-        let b = measure_band(1, 200.0, 300.0, "B", false);
+        let a = measure_band(0, 0.0, 100.0, "A", false, 1.0);
+        let b = measure_band(1, 200.0, 300.0, "B", false, 1.0);
         let (lanes, used) = pack_lanes(&[a.span, b.span]);
         assert_eq!(used, 1);
         assert_eq!(lanes[0], lanes[1]);
@@ -2152,11 +2126,10 @@ mod tests {
         let calendar = WorkCalendar::standard();
         let first_day = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
         let total_days = 19.0;
-        let width = 1400.0;
 
         // One task ends Wednesday 17:00, the next starts Thursday 08:00.
-        let ends = timeline_x(&calendar, first_day, total_days, width, at(2026, 9, 2, 17));
-        let starts = timeline_x(&calendar, first_day, total_days, width, at(2026, 9, 3, 8));
+        let ends = timeline_fraction(&calendar, first_day, total_days, at(2026, 9, 2, 17));
+        let starts = timeline_fraction(&calendar, first_day, total_days, at(2026, 9, 3, 8));
 
         assert_eq!(ends, starts, "the overnight break must not show as a gap");
     }
@@ -2166,11 +2139,11 @@ mod tests {
         let calendar = WorkCalendar::standard();
         let first_day = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
         let total_days = 19.0;
-        let width = 1400.0;
-        let day = (width - BAND_LEFT - BAND_RIGHT) / total_days;
+        // One day column, as a fraction of the whole strip.
+        let day = 1.0 / total_days;
 
-        let friday = timeline_x(&calendar, first_day, total_days, width, at(2026, 8, 21, 17));
-        let monday = timeline_x(&calendar, first_day, total_days, width, at(2026, 8, 24, 8));
+        let friday = timeline_fraction(&calendar, first_day, total_days, at(2026, 8, 21, 17));
+        let monday = timeline_fraction(&calendar, first_day, total_days, at(2026, 8, 24, 8));
 
         assert!(
             (monday - friday - 2.0 * day).abs() < 1e-6,

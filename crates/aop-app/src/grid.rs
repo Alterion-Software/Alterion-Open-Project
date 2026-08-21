@@ -301,10 +301,19 @@ pub fn TaskGrid(part: Part) -> Element {
     let head = rsx! {
         div { class: "grid-head", style: "width: {table_width}px;",
             table { class: "{grid_class}", style: "width: {table_width}px;",
-                // No colgroup. `table-layout: fixed` reads widths from the
-                // first row when there is no usable one, and the header cells
-                // carry them, so the group was saying the same thing twice.
-                // Saying it twice is what a renderer gets to disagree about.
+                // A colgroup, in both tables, saying the same widths.
+                //
+                // It used to be left out on the grounds that `table-layout:
+                // fixed` reads the widths from the first row and the heading
+                // cells already carried them, so the group would have been
+                // saying it twice. That stopped being true the moment the
+                // heading moved into a table of its own: the row table's first
+                // row is now the spacer standing in for the rows scrolled off
+                // above, and a spacer has no cells to read a width from. Fixed
+                // layout with nothing to read shares the width out evenly, and
+                // two tables sharing it out differently is a heading whose
+                // columns do not line up with the cells under it.
+                {colgroup(&columns)}
 
                 thead {
                     tr {
@@ -368,6 +377,7 @@ pub fn TaskGrid(part: Part) -> Element {
     let body = rsx! {
         div { class: "grid-body", style: "width: {table_width}px;",
             table { class: "{grid_class}", style: "width: {table_width}px;",
+                {colgroup(&columns)}
                 tbody {
                     // Always here, at whatever height the rows above need,
                     // rather than appearing when that height is more than
@@ -655,6 +665,20 @@ pub fn TaskGrid(part: Part) -> Element {
     match part {
         Part::Head => head,
         Part::Body => body,
+    }
+}
+
+/// The column widths, stated once per table.
+///
+/// Both halves of the grid are given the same one, so the titles and the cells
+/// cannot come to different conclusions about where a column ends.
+fn colgroup(columns: &[crate::state::ColumnSpec]) -> Element {
+    rsx! {
+        colgroup {
+            for (index, column) in columns.iter().enumerate() {
+                col { key: "col{index}", style: "width: {column.width}px;" }
+            }
+        }
     }
 }
 

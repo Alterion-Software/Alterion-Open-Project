@@ -288,6 +288,7 @@ fn App() -> Element {
     let drafting = use_context_provider(|| crate::state::Drafting(Signal::new(None))).0;
     let mut viewport = use_context_provider(|| Signal::new(crate::state::Viewport::default()));
     use_context_provider(crate::floating::Layer::new);
+    watch_the_window(viewport);
 
     // Snapshot the plan on a timer so that a crash, a kill, or a power cut
     // costs at most one interval of work rather than everything since the last
@@ -546,74 +547,21 @@ fn App() -> Element {
             // broken.
             autofocus: true,
             onkeydown: move |event| handle_shortcut(&mut state, event),
-            // Measured once, when there is something to measure.
-            //
-            // `onresize` below is how the window's size is learned as it
-            // changes, and it is the only way it was ever learned, which meant
-            // that until somebody dragged an edge the application believed the
-            // window was zero by zero. Every panel that places itself against
-            // the window then agreed there was room nowhere and went to the
-            // corner. `crate::placement` treats that as unknown rather than as
-            // tiny, but unknown still means no panel can turn away from an
-            // edge it is about to cross.
-            //
-            // A resize is also an event not every renderer sends. Measuring
-            // this element when it appears asks a question instead of waiting
-            // to be told, and it is answered on every renderer that can
-            // measure anything at all.
-            onmounted: move |event| async move {
-                // Measured here because `onresize` is an event blitz does not
-                // send, so without this the application never learns how big
-                // its own window is and every panel that places itself against
-                // the window goes to a corner.
-                //
-                // Measured only here, and that is a limit rather than a
-                // choice. Asking again later means asking from a background
-                // task, and `NodeHandle::doc_mut` takes the document's
-                // `RefCell` unconditionally: run while an event is being
-                // handled, it panics with "RefCell already borrowed" and takes
-                // the process with it. The crate says as much beside the
-                // method. So a window resized after start up leaves this
-                // stale, and `crate::placement` degrades to placing panels
-                // where they were asked for rather than turning them away from
-                // edges that have moved.
-                // Asked again until there is something to measure. `onmounted`
-                // fires when the element exists, which is before it has been
-                // laid out, so the first answer is honestly zero by zero. That
-                // is not an error and it is not a size either, and everything
-                // that places itself against the window depends on telling the
-                // two apart.
-                //
-                // A handful of attempts rather than a standing poll:
-                // `get_client_rect` takes the document's `RefCell` and panics
-                // if it lands while an event is being handled, so this stops
-                // the moment it has an answer and never asks again.
-                for attempt in 0..24u32 {
-                    match event.get_client_rect().await {
-                        Ok(rect) if rect.width() > 0.0 && rect.height() > 0.0 => {
-                            applog::applog!(
-                                "window: measured {:.0} by {:.0} on attempt {}",
-                                rect.width(),
-                                rect.height(),
-                                attempt + 1
-                            );
-                            viewport.set((rect.width(), rect.height()));
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(why) => {
-                            applog::applog!("window: could not be measured: {why}");
-                            break;
-                        }
-                    }
-                    if attempt == 23 {
+            // Measured on the webview build only, where an element can be
+            // measured safely. See `watch_the_window` for the other build.
+            onmounted: move |_event| async move {
+                #[cfg(feature = "desktop")]
+                match _event.get_client_rect().await {
+                    Ok(rect) if rect.width() > 0.0 && rect.height() > 0.0 => {
                         applog::applog!(
-                            "window: still nothing to measure after 24 tries, so \
-                             panels will be placed where they are asked for and \
-                             will not turn away from an edge"
+                            "window: measured {:.0} by {:.0}",
+                            rect.width(),
+                            rect.height()
                         );
+                        viewport.set((rect.width(), rect.height()));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    Ok(_) => {}
+                    Err(why) => applog::applog!("window: could not be measured: {why}"),
                 }
             },
             onresize: move |event| {
@@ -792,6 +740,64 @@ fn watch_for_account_changes(mut state: Signal<AppState>) {
 /// says what it last read until the next sign in.
 #[cfg(not(feature = "desktop"))]
 fn watch_for_account_changes(_state: Signal<AppState>) {}
+
+/// Keep the window's own size to hand, for everything that places itself
+/// against an edge.
+///
+/// Asked of the window rather than of the page. Measuring an element means
+/// `NodeHandle::get_client_rect`, which takes the document's `RefCell`
+/// unconditionally; a call that lands while a render is in flight panics with
+/// "RefCell already borrowed" and takes the process with it. The first ask is
+/// usually early enough to be safe, but the element has not been laid out that
+/// early and honestly answers zero, so the old code asked again on a timer,
+/// and a timer wakes whenever it wakes. That is what was killing the process a
+/// third of a second after a plan was opened.
+///
+/// The window is not the document. Its size can be read at any moment and it
+/// is the real answer besides: it stays right when the window is resized,
+/// which the measured version never did.
+#[cfg(all(feature = "native", not(feature = "desktop")))]
+fn watch_the_window(mut viewport: Signal<crate::state::Viewport>) {
+    use dioxus_native::winit::event::WindowEvent;
+
+    let window = dioxus_native::use_window();
+    // In logical pixels, the same units everything laid out by the stylesheet
+    // is written in. The surface is in device pixels, which on a scaled
+    // display is a different and much larger number.
+    let read = {
+        let window = window.clone();
+        move || {
+            let size = window.surface_size();
+            let scale = window.scale_factor().max(0.01);
+            (size.width as f64 / scale, size.height as f64 / scale)
+        }
+    };
+
+    let first = read();
+    use_hook(move || {
+        if first.0 > 0.0 && first.1 > 0.0 {
+            applog::applog!("window: {:.0} by {:.0}", first.0, first.1);
+            viewport.set(first);
+        }
+    });
+
+    dioxus_native::use_window_event(move |event, _| {
+        if !matches!(event, WindowEvent::SurfaceResized(_)) {
+            return;
+        }
+        let (width, height) = read();
+        let (was_w, was_h) = viewport();
+        // Written only on a real change. Writing re-renders, a re-render
+        // reflows, and a reflow can produce another resize.
+        if (width - was_w).abs() >= 1.0 || (height - was_h).abs() >= 1.0 {
+            viewport.set((width, height));
+        }
+    });
+}
+
+/// The webview build measures its own root element instead.
+#[cfg(feature = "desktop")]
+fn watch_the_window(_viewport: Signal<crate::state::Viewport>) {}
 
 /// Two internal windows side by side: a tab bar, a draggable splitter, and
 /// each pane able to take the whole frame.
