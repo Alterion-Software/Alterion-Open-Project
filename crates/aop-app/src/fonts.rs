@@ -111,6 +111,27 @@ pub fn draws(codepoint: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// Characters the interface types that the bundled font cannot draw, and
+    /// which therefore depend on the machine having a font that can.
+    ///
+    /// Depending on that is a decision rather than an accident: the collection
+    /// keeps the system fonts precisely so these get drawn by something. What
+    /// it costs is that they are drawn by a **different** something on each
+    /// platform, at a different weight and baseline, so the list should stay
+    /// short and every entry should be one nobody minds varying.
+    ///
+    /// The dropdown caret is deliberately not here. It sits beside text at a
+    /// size where a font's own baseline shows, so it is drawn in
+    /// `crate::icons` and looks the same everywhere.
+    const DRAWN_BY_THE_SYSTEM: &[u32] = &[
+        0x2691, // flag, on a critical-path indicator
+        0x2714, // heavy tick, on a completed one
+        0x270E, // pencil, on a manually scheduled one
+        0x25C9, // fisheye, on a deliverable
+        0x2935, // turning arrow, the ribbon group launcher
+        0x2715, // multiplication x, close buttons
+    ];
+
     #[test]
     fn the_bundled_font_is_a_font() {
         assert!(UI.len() > 100_000, "that is not a font file");
@@ -125,36 +146,32 @@ mod tests {
     }
 
     #[test]
-    fn a_glyph_the_font_does_not_have_is_reported_missing() {
-        // A guard that has never failed proves nothing, so this pins the half
-        // that matters. These are the six that were being typed into the
-        // interface and drawn as nothing at all until they became icons, and
-        // the font still does not have them. If this test ever starts failing
-        // it means `draws` has stopped being able to say no, and the guard
-        // below has quietly become decoration.
-        for (codepoint, what) in [
-            (0x25BE, "caret"),
-            (0x2714, "tick"),
-            (0x2691, "flag"),
-            (0x270E, "pencil"),
-            (0x25C9, "fisheye"),
-            (0x2935, "turning arrow"),
-        ] {
-            assert!(!draws(codepoint), "the font does have {what} after all");
+    fn the_font_still_cannot_draw_the_ones_we_said_it_could_not() {
+        // A guard that has never failed proves nothing. If this starts failing
+        // it means the bundled font has grown a glyph, which is good news, and
+        // the entry should come off the list.
+        for codepoint in DRAWN_BY_THE_SYSTEM {
+            assert!(
+                !draws(*codepoint),
+                "U+{codepoint:04X} is in the bundled font now; take it off the list"
+            );
         }
     }
 
     #[test]
-    fn every_character_the_interface_types_can_actually_be_drawn() {
-        // The guard. Any codepoint written as `\u{...}` anywhere in this
-        // program has to exist in the font that ships with it, because there
-        // is no fallback: a glyph the font does not have is not drawn, and
-        // nothing anywhere says so.
+    fn nothing_new_quietly_starts_depending_on_the_machine() {
+        // Every codepoint typed into the interface is either one the bundled
+        // font draws, or one on the list above with a reason beside it. A new
+        // one appearing unlisted is somebody adding a character whose shape
+        // will differ on every platform, which deserves a moment's thought
+        // rather than turning up in a screenshot.
         //
-        // If this fails, do not reach for system fallback. Whatever it names
-        // is almost certainly an affordance rather than a letter, and belongs
-        // in `crate::icons` where it will be the same shape on every machine.
-        let mut missing = Vec::new();
+        // This started life as a stricter test, when the font collection held
+        // nothing but the bundled font and a glyph it lacked was not drawn at
+        // all: six dropdown carets and five close crosses were simply absent
+        // and nothing said so. The collection keeps the system fonts now, so
+        // the failure is no longer silence, it is inconsistency.
+        let mut unlisted = Vec::new();
         for source in SOURCES {
             let mut rest = *source;
             while let Some(at) = rest.find("\\u{") {
@@ -163,20 +180,23 @@ mod tests {
                 if let Ok(cp) = u32::from_str_radix(&rest[..close], 16)
                     && cp > 0x7F
                     && !draws(cp)
+                    && !DRAWN_BY_THE_SYSTEM.contains(&cp)
                 {
                     let shown = char::from_u32(cp).unwrap_or('?');
-                    missing.push(format!("U+{cp:04X} {shown}"));
+                    unlisted.push(format!("U+{cp:04X} {shown}"));
                 }
                 rest = &rest[close..];
             }
         }
-        missing.sort();
-        missing.dedup();
+        unlisted.sort();
+        unlisted.dedup();
         assert!(
-            missing.is_empty(),
-            "typed in the interface but absent from the bundled font, so drawn \
-             as nothing at all: {}",
-            missing.join(", ")
+            unlisted.is_empty(),
+            "typed in the interface, absent from the bundled font, and not on \
+             DRAWN_BY_THE_SYSTEM: {}. Either draw it in `crate::icons`, or add \
+             it to that list with a note saying why varying by platform is \
+             acceptable for it.",
+            unlisted.join(", ")
         );
     }
 
@@ -195,4 +215,98 @@ mod tests {
         include_str!("welcome.rs"),
         include_str!("state.rs"),
     ];
+}
+
+/// The fonts to draw with: the one carried here, and whatever the machine has.
+///
+/// `blitz_dom::build_single_font_ctx` would register this font and nothing
+/// else, and that is a trap worth naming. A font is not a character set. Inter
+/// covers the letters a plan is written in and does not cover, for instance,
+/// the small triangle a dropdown draws for its caret, and a glyph with no font
+/// to draw it and nothing to fall back to is simply not drawn: no error, no
+/// substitute box, just a caret that is not there.
+///
+/// So the collection keeps the system fonts and this one is added to it. What
+/// is carried still decides the look, because the stylesheet names it first;
+/// the rest is there to answer for anything it cannot draw.
+#[cfg(feature = "native")]
+pub fn context() -> dioxus_native::FontContext {
+    use parley::fontique::Blob;
+    use std::sync::Arc;
+
+    let mut ctx = dioxus_native::FontContext::default();
+    ctx.collection
+        .register_fonts(Blob::new(Arc::new(UI) as _), None);
+    ctx
+}
+
+/// The font families installed on this machine, for the font list to offer.
+///
+/// Asked rather than assumed. A hard coded list is a guess about somebody
+/// else's computer: it offered Calibri and Segoe UI, which no Linux machine
+/// has, and Inter, which almost none has either, so most of what it offered
+/// could not be used and most of what could be was not offered.
+///
+/// Sorted, deduplicated, and with the font this program carries put first,
+/// because that is the one the interface is drawn in and the one a document
+/// looks the same in everywhere.
+pub fn installed() -> Vec<String> {
+    let mut collection = parley::fontique::Collection::new(parley::fontique::CollectionOptions {
+        shared: false,
+        system_fonts: true,
+    });
+    let mut names: Vec<String> = collection
+        .family_names()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| name.to_string())
+        .collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    names.dedup();
+
+    // The carried font leads, then everything else in order.
+    if let Some(at) = names.iter().position(|name| name == UI_FAMILY) {
+        let ours = names.remove(at);
+        names.insert(0, ours);
+    } else {
+        names.insert(0, UI_FAMILY.to_string());
+    }
+    names
+}
+
+/// The installed families, worked out once.
+///
+/// Reading the system's font configuration means touching the filesystem, and
+/// a ribbon rebuilds constantly, so the answer is kept. Fonts installed while
+/// the program is running will not appear until it is restarted, which is the
+/// same bargain every other application makes.
+pub fn families() -> &'static [String] {
+    static FAMILIES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FAMILIES.get_or_init(installed)
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    #[test]
+    fn the_machines_fonts_are_offered_and_the_carried_one_leads() {
+        let found = families();
+        assert!(
+            !found.is_empty(),
+            "no font families at all, which no machine that can draw text is true of"
+        );
+        assert_eq!(
+            found[0], UI_FAMILY,
+            "the font the program carries has to lead: it is what the interface \
+             is drawn in and the only one a document looks the same in everywhere"
+        );
+        // The list that used to be hard coded named fonts most machines do not
+        // have. Whatever is offered now has to be something this one does.
+        assert!(found.len() > 1, "only the carried font was found");
+    }
+
+    #[test]
+    fn it_is_worked_out_once() {
+        assert!(std::ptr::eq(families(), families()));
+    }
 }

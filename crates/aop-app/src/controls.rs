@@ -119,7 +119,7 @@ pub fn Dropdown(
                                             open.set(false);
                                             on_pick.call(chosen.clone());
                                         },
-                                        span { class: "tick", if picked { {crate::icons::icon("tick", 12)} } }
+                                        span { class: "tick", if picked { "\u{2713}" } }
                                         span { "{choice.label}" }
                                     }
                                 }

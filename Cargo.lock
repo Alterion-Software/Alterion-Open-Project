@@ -547,6 +547,7 @@ dependencies = [
  "dioxus-native",
  "flate2",
  "gtk",
+ "parley",
  "serde",
  "serde_json",
  "sha2 0.11.0",

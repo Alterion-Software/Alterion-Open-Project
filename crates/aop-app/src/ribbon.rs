@@ -67,7 +67,7 @@ fn Group(title: String, launcher: bool, children: Element) -> Element {
             div { class: "rgroup-body", {children} }
             div { class: "rgroup-title",
                 "{title}"
-                if launcher { span { class: "launcher", {crate::icons::icon("turn-down-right", 11)} } }
+                if launcher { span { class: "launcher", "\u{2935}" } }
             }
         }
     }
@@ -566,8 +566,10 @@ fn TaskTab() -> Element {
                 div { class: "font-row",
                     ComboBox {
                         value: "Calibri".to_string(),
-                        options: ["Calibri", "Segoe UI", "Inter", "Arial", "Times New Roman"]
-                            .iter().map(|f| Choice::plain(*f)).collect(),
+                        // What this machine actually has, asked once. A hard
+                        // coded list is a guess about somebody else's computer.
+                        options: crate::fonts::families()
+                            .iter().map(|f| Choice::plain(f.as_str())).collect(),
                         width: 116.0,
                         on_pick: move |value: String| state.write().set_row_font(Some(value), None),
                     }

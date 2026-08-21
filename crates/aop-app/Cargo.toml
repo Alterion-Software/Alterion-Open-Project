@@ -19,6 +19,10 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.53.1", features = ["time", "rt"] }
 dioxus-native = { version = "0.8.0-alpha.1", optional = true }
+# The same parley blitz uses, so the font context built for that build is the
+# very type it is handed. Not optional: both builds ask it which fonts the
+# machine has, for the font list in the ribbon.
+parley = "0.10"
 ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 sha2 = "0.11.0"
 # Only for reading a release tarball. Already in the tree by way of

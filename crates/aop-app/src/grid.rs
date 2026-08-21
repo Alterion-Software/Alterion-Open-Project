@@ -745,7 +745,7 @@ fn cell_body(
 fn indicator_glyph(project: &aop_core::Project, index: usize) -> Element {
     let task = &project.tasks[index];
     if task.percent_complete >= 100 {
-        return rsx! { span { style: "color: var(--accent);", {crate::icons::icon("tick", 13)} } };
+        return rsx! { span { style: "color: var(--accent);", "\u{2714}" } };
     }
     // Being on the critical path is the thing most worth flagging: any slip
     // here moves the finish date. Once that has been acknowledged the marker
@@ -760,13 +760,13 @@ fn indicator_glyph(project: &aop_core::Project, index: usize) -> Element {
         return rsx! { span { class: "{class}", "\u{26a0}" } };
     }
     if !task.notes.is_empty() {
-        return rsx! { span { style: "color: var(--ink-soft);", {crate::icons::icon("pencil", 13)} } };
+        return rsx! { span { style: "color: var(--ink-soft);", "\u{270e}" } };
     }
     if task.deadline.is_some() {
-        return rsx! { span { style: "color: var(--bar-critical-edge);", {crate::icons::icon("flag", 13)} } };
+        return rsx! { span { style: "color: var(--bar-critical-edge);", "\u{2691}" } };
     }
     if task.constraint != ConstraintType::AsSoonAsPossible {
-        return rsx! { span { style: "color: var(--contextual);", {crate::icons::icon("fisheye", 13)} } };
+        return rsx! { span { style: "color: var(--contextual);", "\u{25c9}" } };
     }
     rsx! { span {} }
 }

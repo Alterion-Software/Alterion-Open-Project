@@ -801,9 +801,9 @@ fn TextStylesDialog() -> Element {
                     value: current.family.clone(),
                     options: std::iter::once(Choice::new("", "Theme default"))
                         .chain(
-                            ["Calibri", "Segoe UI", "Inter", "Arial", "Times New Roman"]
+                            crate::fonts::families()
                                 .iter()
-                                .map(|family| Choice::plain(*family)),
+                                .map(|family| Choice::plain(family.as_str())),
                         )
                         .collect(),
                     width: 180.0, large: true, disabled: false,

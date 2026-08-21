@@ -84,27 +84,6 @@ fn body_for(name: &str) -> String {
         //
         // lucide: chevron-down
         "caret-down" => String::from("<path d='m6 9 6 6 6-6' />"),
-        // lucide: check
-        "tick" => String::from("<path d='M20 6 9 17l-5-5' />"),
-        // lucide: flag
-        "flag" => String::from(
-            "<path d='M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z' />\
-             <line x1='4' x2='4' y1='22' y2='15' />",
-        ),
-        // lucide: pencil
-        "pencil" => String::from(
-            "<path d='M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 \
-             4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z' />\
-             <path d='m15 5 4 4' />",
-        ),
-        // lucide: circle-dot
-        "fisheye" => String::from(
-            "<circle cx='12' cy='12' r='10' /><circle cx='12' cy='12' r='2.5' />",
-        ),
-        // lucide: corner-down-right
-        "turn-down-right" => String::from(
-            "<path d='m15 10 5 5-5 5' /><path d='M4 4v7a4 4 0 0 0 4 4h12' />",
-        ),
 
         // lucide: user
         "account" => String::from(
