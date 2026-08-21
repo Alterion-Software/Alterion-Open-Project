@@ -1960,12 +1960,17 @@ button { font: inherit; color: inherit; }
 
 .timeline {
   background: var(--surface);
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--grid-line);
   flex: none;
-  position: relative;
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
   padding: 4px 10px;
 }
+
+/* The dates, the rule and the caption. Fixed height, and outside the box that
+   scrolls, so they stay where they are however far down the plan goes. */
+.tl-head { position: relative; height: 22px; flex: none; }
 
 /* The contextual banner with nothing to announce: still there, still the same
    height, just not saying anything. */
@@ -1973,8 +1978,8 @@ button { font: inherit; color: inherit; }
 
 .timeline-caption {
   position: absolute;
-  left: 9px;
-  top: 3px;
+  left: 0;
+  top: 1px;
   font-size: 9px;
   color: var(--ink-faint);
   letter-spacing: 0.7px;
@@ -2840,28 +2845,38 @@ button { font: inherit; color: inherit; }
    element appears, so it had to be asked for again on a timer, and a timer
    that wakes mid-render panics. A percentage is worked out at layout, every
    layout, including the one after the window is resized. */
-.tl-strip { position: relative; width: 100%; }
+/* The lanes, and the only part of the band that scrolls. A plan of three
+   hundred phases needs a hundred and fifty lines of them; it gets all of them,
+   and the window gives up eight lines' worth of room to show the first of
+   them. Nothing is left out of the picture of the plan. */
+.tl-strip {
+  position: relative;
+  width: 100%;
+  flex: none;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
 
 /* The plan itself, inset from both ends of the strip: the left clears the word
    painted over the corner, the right leaves room for the closing date. Every
    band inside is placed as a percentage of THIS box, so the inset costs
    nothing in arithmetic and cannot be got wrong at a different window size. */
 .tl-lanes {
+  position: relative;
+  margin-left: 68px;
+  margin-right: 50px;
+}
+
+/* The rule the plan runs along, under the two dates. Inset to the same place
+   the lanes start and end, so a band that runs the whole plan runs the whole
+   rule. */
+.tl-axis {
   position: absolute;
   left: 68px;
   right: 50px;
-  top: 0;
-  bottom: 0;
-}
-
-/* The rule the plan runs along, under the two dates. */
-.tl-axis {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 16px;
+  bottom: 2px;
   height: 1px;
-  background: var(--line);
+  background: var(--grid-line);
 }
 
 .tl-edge {

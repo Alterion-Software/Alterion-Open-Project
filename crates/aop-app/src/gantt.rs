@@ -1553,8 +1553,14 @@ const BAND_LABEL_GAP: f64 = 5.0;
 /// Padding a label needs to sit inside a bar rather than beside it.
 const BAND_LABEL_PAD: f64 = 10.0;
 
-/// How tall the band is allowed to grow before it stops taking bands.
-const BAND_MAX_LANES: usize = 8;
+/// How many lines of the timeline are on screen before it starts scrolling.
+///
+/// Not a limit on how many there are. A plan of three hundred phases needs a
+/// hundred and fifty lines, and it gets them; this is only how much of the
+/// window the band is willing to take before the rest is reached by scrolling.
+/// It used to be a cap, and a cap on a plan that size meant three hundred and
+/// seven phases were quietly left off the picture of the plan.
+const BAND_LANES_SHOWN: usize = 8;
 
 /// How far each band's fill is shifted from the plan's bar colour.
 ///
@@ -1765,52 +1771,47 @@ pub fn TimelineBand() -> Element {
 
     let (lane_of, lanes) = pack_lanes(&bands.iter().map(|b| b.span).collect::<Vec<_>>());
 
-    // A band that would push the strip past its height is left off rather than
-    // drawn somewhere it does not belong, and the caption says how many.
-    let lanes = lanes.min(BAND_MAX_LANES);
-    let placed: Vec<(Band, usize)> = bands
-        .into_iter()
-        .zip(lane_of)
-        .filter(|(_, lane)| *lane < lanes)
-        .collect();
-    let dropped = project
-        .tasks
-        .iter()
-        .filter(|t| t.outline_level == 0)
-        .count()
-        .saturating_sub(placed.len());
+    // Every band is drawn. Whichever line the packing put it on, that is the
+    // line it goes on, and the strip is as tall as the packing made it.
+    let placed: Vec<(Band, usize)> = bands.into_iter().zip(lane_of).collect();
 
     let lane_h = 16.0;
-    let top = 24.0;
-    let height = top + lanes as f64 * lane_h + 4.0;
+    // What the strip is, and what is on screen of it. When the second is
+    // smaller than the first the band scrolls; the dates and the rule they
+    // hang off do not, because they are not in the part that scrolls.
+    let full = lanes as f64 * lane_h + 4.0;
+    let shown = full.min(BAND_LANES_SHOWN as f64 * lane_h + 4.0);
 
-    let caption = if dropped > 0 {
-        format!("Timeline \u{2022} {dropped} more")
+    let caption = if lanes > BAND_LANES_SHOWN {
+        let noun = if placed.len() == 1 { "phase" } else { "phases" };
+        format!("Timeline \u{2022} {} {noun}", placed.len())
     } else {
         "Timeline".to_string()
     };
 
     rsx! {
-        div {
-            class: "timeline",
-            style: "height: {height + 8.0}px;",
-            div { class: "timeline-caption", "{caption}" }
-            div { class: "tl-strip", style: "height: {height}px;",
+        div { class: "timeline",
+            // The dates and the rule they hang off, and the word over the
+            // corner. Above the part that scrolls, so a plan long enough to
+            // need scrolling does not scroll its own dates away.
+            div { class: "tl-head",
+                div { class: "timeline-caption", "{caption}" }
                 div { class: "tl-edge start", "{crate::state::format_date(start)}" }
                 div { class: "tl-edge end", "{crate::state::format_date(finish)}" }
-
-                // The plan runs inside this, not inside the strip. It is inset
-                // from both ends to clear the word painted over the corner and
-                // the two dates, which is what the old drawing did with a pair
-                // of pixel margins baked into every coordinate. Here the inset
-                // is the box, so a percentage inside it is still a percentage
-                // of the plan and nothing has to know how wide anything is.
-                div { class: "tl-lanes",
                 div { class: "tl-axis" }
+            }
+
+            div { class: "tl-strip", style: "height: {shown}px;",
+                // The plan runs inside this, not inside the strip. It is inset
+                // from both ends so the two dates above have somewhere to sit.
+                // Here the inset is the box, so a percentage inside it is
+                // still a percentage of the plan and nothing has to know how
+                // wide anything is.
+                div { class: "tl-lanes", style: "height: {full}px;",
 
                 for (slot, (band, lane)) in placed.into_iter().enumerate() {
                     {
-                        let y = top + lane as f64 * lane_h;
+                        let y = lane as f64 * lane_h;
                         let left = band.left * 100.0;
                         let width = ((band.right - band.left) * 100.0).max(0.2);
                         let critical =
