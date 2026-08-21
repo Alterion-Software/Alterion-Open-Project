@@ -74,6 +74,8 @@ pub fn Dropdown(
     // its parent is the window, which is what `position: fixed` used to mean
     // and what `absolute` means to an engine with no `fixed`. See
     // `crate::floating`.
+    // Described, not built. The layer renders it at the root, where the parent
+    // is the window. See `crate::floating`.
     let mut floating = use_context::<crate::floating::Layer>();
     let mine = use_hook(crate::floating::claim);
     {
@@ -85,49 +87,20 @@ pub fn Dropdown(
                 return;
             }
             let (ax, ay) = anchor();
-            let options = options.clone();
-            let value = value.clone();
-            floating.put(
-                mine,
-                rsx! {
-                    div {
-                        class: "ctx-scrim",
-                        onclick: move |event| {
-                            event.stop_propagation();
-                            open.set(false);
-                        },
-                        oncontextmenu: move |event| {
-                            event.prevent_default();
-                            open.set(false);
-                        },
-                    }
-                    div {
-                        class: "dd-list",
-                        style: "left: {ax.max(4.0)}px; top: {ay.max(4.0)}px; width: {list_width}px;",
-                        onclick: move |event| event.stop_propagation(),
-                        for choice in options.iter() {
-                            {
-                                let picked = choice.value == value;
-                                let item_class = if picked { "dd-item on" } else { "dd-item" };
-                                let chosen = choice.value.clone();
-                                rsx! {
-                                    button {
-                                        key: "{choice.value}",
-                                        class: "{item_class}",
-                                        onclick: move |event| {
-                                            event.stop_propagation();
-                                            open.set(false);
-                                            on_pick.call(chosen.clone());
-                                        },
-                                        span { class: "tick", if picked { "\u{2713}" } }
-                                        span { "{choice.label}" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-            );
+            floating.put(crate::floating::Panel {
+                owner: mine,
+                at: (ax, ay),
+                min_width: list_width,
+                width: Some(list_width),
+                rows: options
+                    .iter()
+                    .map(|choice| crate::floating::Row::new(&choice.value, &choice.label))
+                    .collect(),
+                chosen: value.clone(),
+                empty: None,
+                on_pick,
+                on_close: EventHandler::new(move |()| open.set(false)),
+            });
         });
     }
 
@@ -179,9 +152,6 @@ impl MenuOption {
         }
     }
 
-    fn is_separator(&self) -> bool {
-        self.value == "-"
-    }
 }
 
 /// A ribbon button that opens a menu instead of firing a single command.
@@ -210,6 +180,7 @@ pub fn MenuBtn(
     // button has to escape, and so does the scrim behind it: clipped, the
     // scrim only covers the ribbon, so clicking anywhere else never reached it
     // and the menu would not close. See `crate::floating`.
+    // Described, not built. See `crate::floating`.
     let mut floating = use_context::<crate::floating::Layer>();
     let mine = use_hook(crate::floating::claim);
     {
@@ -220,47 +191,23 @@ pub fn MenuBtn(
                 return;
             }
             let (ax, ay) = anchor();
-            let options = options.clone();
-            floating.put(mine, rsx! {
-            div {
-                class: "ctx-scrim",
-                onclick: move |event| {
-                    event.stop_propagation();
-                    open.set(false);
-                },
-                oncontextmenu: move |event| {
-                    event.prevent_default();
-                    open.set(false);
-                },
-            }
-            div {
-                class: "dd-list",
-                style: "left: {ax.max(4.0)}px; top: {ay.max(4.0)}px; min-width: 236px;",
-                onclick: move |event| event.stop_propagation(),
-                for (index, option) in options.iter().enumerate() {
-                    if option.is_separator() {
-                        div { key: "sep{index}", class: "ctxsep" }
-                    } else {
-                        {
-                            let chosen = option.value.clone();
-                            rsx! {
-                                button {
-                                    key: "opt{index}",
-                                    class: "dd-item",
-                                    onclick: move |event| {
-                                        event.stop_propagation();
-                                        open.set(false);
-                                        on_pick.call(chosen.clone());
-                                    },
-                                    span { class: "tick", {crate::icons::icon(&option.glyph, 15)} }
-                                    span { "{option.label}" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
+            floating.put(crate::floating::Panel {
+                owner: mine,
+                at: (ax, ay),
+                min_width: 236.0,
+                width: None,
+                rows: options
+                    .iter()
+                    .map(|option| {
+                        crate::floating::Row::new(&option.value, &option.label)
+                            .with_glyph(&option.glyph)
+                    })
+                    .collect(),
+                chosen: String::new(),
+                empty: None,
+                on_pick,
+                on_close: EventHandler::new(move |()| open.set(false)),
+            });
         });
     }
 
@@ -300,6 +247,8 @@ pub fn ComboBox(
 
     // As in `Dropdown` and `MenuBtn`: the panel and the scrim behind it go to
     // the layer at the root. See `crate::floating`.
+    // Described, not built, and narrowed to what has been typed. See
+    // `crate::floating`.
     let mut floating = use_context::<crate::floating::Layer>();
     let mine = use_hook(crate::floating::claim);
     {
@@ -310,54 +259,22 @@ pub fn ComboBox(
                 return;
             }
             let (ax, ay) = anchor();
-            // Narrowed to what has been typed. The list is whatever fonts the
-            // machine has, which runs to several hundred, and finding one by
-            // scrolling is not finding it. Letters in order rather than a
-            // substring, so `tnr` reaches Times New Roman.
             let typed = draft();
-            let options: Vec<Choice> = options
-                .iter()
-                .filter(|choice| fuzzy_matches(&choice.label, &typed))
-                .cloned()
-                .collect();
-            floating.put(mine, rsx! {
-            div {
-                class: "ctx-scrim",
-                onclick: move |event| {
-                    event.stop_propagation();
-                    open.set(false);
-                },
-            }
-            div {
-                class: "dd-list",
-                style: "left: {ax.max(4.0)}px; top: {ay.max(4.0)}px; min-width: {width.max(120.0)}px;",
-                onclick: move |event| event.stop_propagation(),
-                if options.is_empty() {
-                    div { class: "dd-empty", "No font matches that" }
-                }
-                for choice in options.iter() {
-                    {
-                        let picked = choice.value == draft();
-                        let item_class = if picked { "dd-item on" } else { "dd-item" };
-                        let chosen = choice.value.clone();
-                        rsx! {
-                            button {
-                                key: "{choice.value}",
-                                class: "{item_class}",
-                                onclick: move |event| {
-                                    event.stop_propagation();
-                                    open.set(false);
-                                    draft.set(chosen.clone());
-                                    on_pick.call(chosen.clone());
-                                },
-                                span { class: "tick", if picked { "\u{2713}" } }
-                                span { "{choice.label}" }
-                            }
-                        }
-                    }
-                }
-            }
-        });
+            floating.put(crate::floating::Panel {
+                owner: mine,
+                at: (ax, ay),
+                min_width: width.max(120.0),
+                width: None,
+                rows: options
+                    .iter()
+                    .filter(|choice| fuzzy_matches(&choice.label, &typed))
+                    .map(|choice| crate::floating::Row::new(&choice.value, &choice.label))
+                    .collect(),
+                chosen: typed,
+                empty: Some("No match".to_string()),
+                on_pick,
+                on_close: EventHandler::new(move |()| open.set(false)),
+            });
         });
     }
 

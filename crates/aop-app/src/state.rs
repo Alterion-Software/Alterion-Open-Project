@@ -6103,8 +6103,13 @@ impl AppState {
     }
 
     pub fn update_bar_drag(&mut self, x: f64) {
+        static MOVES: crate::applog::Tally =
+            crate::applog::Tally::new("bar drag: moving", crate::applog::HEARTBEAT_MILLIS);
         if let Some(drag) = &mut self.bar_drag {
             drag.delta_x = x - drag.origin_x;
+            MOVES.note(format_args!("delta {:.0}px", drag.delta_x));
+        } else {
+            MOVES.note(format_args!("pointer moved with no drag running"));
         }
     }
 
@@ -6116,14 +6121,24 @@ impl AppState {
     }
 
     pub fn cancel_bar_drag(&mut self) {
+        if self.bar_drag.is_some() {
+            crate::applog::applog!("bar drag: cancelled");
+        }
         self.bar_drag = None;
     }
 
     /// Apply whatever the drag was doing.
     pub fn finish_bar_drag(&mut self, px_per_day: f64) {
         let Some(drag) = self.bar_drag.take() else {
+            crate::applog::applog!("bar drag: released with nothing running");
             return;
         };
+        crate::applog::applog!(
+            "bar drag: released after {:.0}px, {:?} on row {}",
+            drag.delta_x,
+            drag.kind,
+            drag.row
+        );
         if drag.row >= self.project.tasks.len() {
             return;
         }

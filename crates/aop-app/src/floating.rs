@@ -31,9 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Who put the current panel up.
 ///
-/// Two dropdowns must not be able to take each other's panel down. Only the
-/// opener may clear what it opened, so a component that closes while another
-/// is showing leaves that one alone.
+/// Two menus must not be able to take each other's panel down. Only the opener
+/// may clear what it opened, so a component closing while another is showing
+/// leaves that one alone.
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 /// A claim on the layer, one per component that can open a panel.
@@ -45,9 +45,62 @@ pub fn claim() -> Claim {
     Claim(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-/// The panel currently over the window, and whose it is.
+/// One row of a panel.
+///
+/// Flat rather than a tree, and data rather than markup, for a reason worth
+/// keeping. The first attempt at this stored the panel as an `Element` built
+/// with `rsx!` inside an effect. Node paths are bookkeeping from a render
+/// pass, so a node built outside one and kept across renders goes stale, and a
+/// later mutation walks a path into a node that is no longer there:
+/// `invalid key`, from `blitz_dom`'s mutator, on the next interaction.
+/// Describing the panel and letting the host build it means every node is made
+/// during the render that shows it.
+#[derive(Clone, PartialEq)]
+pub struct Row {
+    pub value: String,
+    pub label: String,
+    /// An icon name from [`crate::icons`], for menus that carry one.
+    pub glyph: Option<String>,
+}
+
+impl Row {
+    pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self { value: value.into(), label: label.into(), glyph: None }
+    }
+
+    pub fn with_glyph(mut self, glyph: &str) -> Self {
+        if !glyph.is_empty() {
+            self.glyph = Some(glyph.to_string());
+        }
+        self
+    }
+
+    /// A rule between groups rather than something to pick.
+    pub fn is_separator(&self) -> bool {
+        self.value == "-"
+    }
+}
+
+/// A panel hanging over the window: what is in it, and where it goes.
+#[derive(Clone, PartialEq)]
+pub struct Panel {
+    pub owner: Claim,
+    pub at: (f64, f64),
+    pub min_width: f64,
+    /// A fixed width, for a list that has to match the control it drops from.
+    pub width: Option<f64>,
+    pub rows: Vec<Row>,
+    /// Which row is shown as chosen.
+    pub chosen: String,
+    /// What to say when a filter has left nothing.
+    pub empty: Option<String>,
+    pub on_pick: EventHandler<String>,
+    pub on_close: EventHandler<()>,
+}
+
+/// The panel currently over the window.
 #[derive(Clone, Copy)]
-pub struct Layer(Signal<Option<(Claim, Element)>>);
+pub struct Layer(Signal<Option<Panel>>);
 
 impl Layer {
     pub fn new() -> Self {
@@ -56,16 +109,15 @@ impl Layer {
 
     /// Put a panel up, replacing whatever was there.
     ///
-    /// Replacing rather than refusing, because opening a second dropdown while
-    /// one is open should show the second, which is what happens in every
-    /// other application.
-    pub fn put(&mut self, owner: Claim, panel: Element) {
-        self.0.set(Some((owner, panel)));
+    /// Replacing rather than refusing: opening a second menu while one is open
+    /// should show the second, which is what every other application does.
+    pub fn put(&mut self, panel: Panel) {
+        self.0.set(Some(panel));
     }
 
-    /// Take down the panel, if it is yours.
+    /// Take the panel down, if it is yours.
     pub fn clear(&mut self, owner: Claim) {
-        if self.0.read().as_ref().is_some_and(|(who, _)| *who == owner) {
+        if self.0.read().as_ref().is_some_and(|panel| panel.owner == owner) {
             self.0.set(None);
         }
     }
@@ -79,16 +131,76 @@ impl Default for Layer {
 
 /// Renders whatever panel is up, at the root of the application.
 ///
-/// Mounted as a child of the root and nothing else, which is the entire point:
-/// its children's parent is the window, so `absolute` and `fixed` agree about
-/// where they go.
+/// A direct child of the root and nothing else, which is the entire point: its
+/// children's parent is the window, so `absolute` reaches the window the same
+/// way `fixed` was meant to.
 #[component]
 pub fn Host() -> Element {
     let layer = use_context::<Layer>();
-    let panel = layer.0.read().as_ref().map(|(_, panel)| panel.clone());
+    let panel = layer.0.read().clone();
+    let Some(panel) = panel else {
+        return rsx! {};
+    };
+
+    let (x, y) = panel.at;
+    let sizing = match panel.width {
+        Some(w) => format!("width: {w}px;"),
+        None => format!("min-width: {}px;", panel.min_width),
+    };
+    let on_close = panel.on_close;
+    let on_pick = panel.on_pick;
+
     rsx! {
-        if let Some(panel) = panel {
-            {panel}
+        div {
+            class: "ctx-scrim",
+            onclick: move |event| {
+                event.stop_propagation();
+                on_close.call(());
+            },
+            oncontextmenu: move |event| {
+                event.prevent_default();
+                on_close.call(());
+            },
+        }
+        div {
+            class: "dd-list",
+            style: "left: {x.max(4.0)}px; top: {y.max(4.0)}px; {sizing}",
+            onclick: move |event| event.stop_propagation(),
+
+            if panel.rows.is_empty()
+                && let Some(empty) = panel.empty.clone() {
+                div { class: "dd-empty", "{empty}" }
+            }
+
+            for (index, row) in panel.rows.iter().enumerate() {
+                if row.is_separator() {
+                    div { key: "sep{index}", class: "ctxsep" }
+                } else {
+                    {
+                        let picked = row.value == panel.chosen;
+                        let class = if picked { "dd-item on" } else { "dd-item" };
+                        let chosen = row.value.clone();
+                        let glyph = row.glyph.clone();
+                        rsx! {
+                            button {
+                                key: "row{index}",
+                                class: "{class}",
+                                onclick: move |event| {
+                                    event.stop_propagation();
+                                    on_close.call(());
+                                    on_pick.call(chosen.clone());
+                                },
+                                if let Some(glyph) = glyph {
+                                    span { class: "glyph", {crate::icons::icon(&glyph, 15)} }
+                                } else {
+                                    span { class: "tick", if picked { "\u{2713}" } }
+                                }
+                                span { "{row.label}" }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
