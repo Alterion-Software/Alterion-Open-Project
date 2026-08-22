@@ -538,6 +538,7 @@ pub fn GanttChart(
     } else {
         (0.0, width)
     };
+
     // A report is never scrolled, so there is no viewport to window against:
     // it draws every row and the whole timescale, or the chain would print
     // with pieces of itself missing.

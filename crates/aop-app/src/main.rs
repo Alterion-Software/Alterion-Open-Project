@@ -899,10 +899,18 @@ fn SplitPanes(
     // tells the chart how big a picture to draw itself into.
     let ports = {
         let (window_wide, _) = use_context::<Signal<crate::state::Viewport>>()();
-        Reach {
-            table: grid_width,
-            chart: (window_wide - grid_width - SPLITTER_W - 16.0).max(120.0),
-        }
+        // The same arithmetic flexbox does, and it has to be, or the numbers
+        // handed to the panes describe a layout that is not the one on screen.
+        //
+        // The table asks for whatever the splitter was dragged to, but it can
+        // be squeezed: the chart has a floor of its own and takes what it needs
+        // out of the table's width. Working the chart's width out from the
+        // table's unsqueezed number left it at its own floor of a hundred and
+        // twenty pixels while the pane on screen was half the window.
+        let floor = crate::state::AppState::MIN_PANE;
+        let room = (window_wide - SPLITTER_W - FRAME_W).max(floor * 2.0);
+        let table = grid_width.clamp(floor, (room - floor).max(floor));
+        Reach { table, chart: (room - table).max(floor) }
     };
 
     // The chart draws itself into a picture the width of its own pane, so it
@@ -1341,6 +1349,10 @@ fn SoloGrid() -> Element {
 /// the thumb is drawn and how far the last row can be pulled up. Being a little
 /// out costs a slightly wrong thumb, not a wrong plan.
 const CHROME_H: f64 = 330.0;
+
+/// What the frame around the panes takes off the window's width: the padding
+/// either side of the panes and the border they are drawn in.
+const FRAME_W: f64 = 16.0;
 
 /// Move both panes together by a turn of the wheel.
 ///
