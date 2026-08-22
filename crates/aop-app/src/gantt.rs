@@ -1,16 +1,20 @@
 //! The Gantt chart: timescale header, bars, progress, baselines, slack and
 //! dependency arrows.
 //!
-//! The header and the body are two separate SVGs stacked in one column. The
-//! header is sticky, so the timescale stays put while the rows scroll under it,
-//! and both share the same horizontal scroll because they sit in the same pane.
+//! The timescale and the bars are two boxes of ordinary elements, drawn into
+//! two rows of the split, so the timescale stays put while the rows scroll
+//! under it. Both are slid sideways by one number, so a date is at the same
+//! pixel in each. Neither is an inline drawing: this renderer serialises one,
+//! hands it to a parser and keeps the answer as a picture, which leaves its
+//! children with no layout boxes, no reachable styling and nothing a pointer
+//! can land on.
 
 use std::collections::HashMap;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
 use dioxus::prelude::*;
 
-use aop_core::draw::{place, snap_vertical, ChartMap, Drawing, Placement, ShapeKind};
+use aop_core::draw::{place, snap_vertical, ChartMap, Drawing, LineStyle, Placement, ShapeKind};
 use aop_core::grouping::GroupRow;
 use aop_core::{LinkType, Project, TaskId, WorkCalendar};
 
@@ -520,24 +524,17 @@ pub fn GanttChart(
     let scroll = use_context::<ChartScroll>().0;
     let rows_len = rows.len();
     let seen = scroll();
-    // How much of the plan the pane shows, and where it starts.
+    // How much of the plan the pane shows is now only a question of how much
+    // of it is worth building.
     //
-    // The chart is drawn into a picture exactly the size of the pane, and the
-    // offset is carried in that picture's own coordinate system rather than by
-    // sliding it sideways. That is what stops it painting across the table.
-    //
-    // An inline drawing is not a set of boxes on this renderer: the element's
-    // markup is serialised, handed to a parser and kept as a picture, and the
-    // boxes its children would have had are thrown away. A picture is an image
-    // as far as everything else is concerned, and an image is cut off at its
-    // own edges, so a picture the size of the pane cannot spill out of it
-    // whatever it is asked to draw. Sliding it, on the other hand, moved the
-    // whole picture and its edges with it.
-    let (origin, port) = if interactive && seen.width > 1.0 {
-        (seen.left, seen.width)
-    } else {
-        (0.0, width)
-    };
+    // The chart used to be drawn into a picture exactly the size of the pane,
+    // with the offset carried in that picture's own coordinate system rather
+    // than by sliding it sideways, because a picture is an image, an image is
+    // cut off at its own edges, and an image that has been slid takes its
+    // edges with it. A tree of boxes is cut off by the pane the way anything
+    // else is, so the offset goes back where the timescale's already is: one
+    // margin on the box that holds both, applied to head and body alike, which
+    // is the only way the two can be guaranteed to agree on where a date sits.
 
     // A report is never scrolled, so there is no viewport to window against:
     // it draws every row and the whole timescale, or the chain would print
@@ -711,25 +708,37 @@ pub fn GanttChart(
                 s.cancel_bar_drag();
                 s.cancel_draw_drag();
             },
-            div { class: "chart-canvas", style: "width: {port}px;",
+            div { class: "chart-canvas", style: "width: {width}px; height: {body_h}px;",
             // ---- chart body ---------------------------------------------
-            // The box is the pane; the view box says which part of the plan is
-            // in it. Both are the same size, so nothing is scaled: a view box
-            // that disagrees with its element magnifies everything it holds,
-            // which is a fault this chart has worn before.
-            svg { class: "chart-svg", width: "{port}", height: "{body_h}",
-                view_box: "{origin} 0 {port} {body_h}", font_family: palette.font(),
-                style: "width: {port}px; height: {body_h}px; flex: none;",
+            //
+            // Boxes, not an inline drawing, for the same reasons the timescale
+            // above is. This renderer serialises an inline drawing, hands the
+            // markup to a parser and keeps the answer as a picture, and the
+            // boxes its children would have had are thrown away with them. A
+            // stylesheet does not reach inside one, an ancestor's `overflow`
+            // does not clip anything in one, and, worst of the three, nothing
+            // in one can be hit tested, so every handler this chart carried
+            // had never once fired.
+            //
+            // The body is as wide as the plan is long and is slid sideways by
+            // the same margin the timescale is slid by, so the two cannot
+            // disagree about where a date sits. It used to draw itself into a
+            // picture the width of the pane and carry the offset in that
+            // picture's own coordinates, because a picture is cut off at its
+            // own edges while a picture that has been slid is not. A tree of
+            // boxes is clipped by the pane like anything else, so that trick
+            // has nothing left to buy.
 
-                // First, so everything else is painted over it and it takes a
-                // pointer only where the chart is otherwise bare. It exists to
-                // answer one question, which is where the chart's own
-                // coordinates start on the screen. A report has no live
-                // session to tell, so it does not get one.
+                // First, so everything else is over it and it takes a pointer
+                // only where the chart is otherwise bare. It exists to answer
+                // one question, which is where the chart's own coordinates
+                // start on the screen, and it is the whole canvas placed at
+                // the canvas's own origin, so a position measured against it
+                // is already a chart coordinate. A report has no live session
+                // to tell, so it does not get one.
                 if interactive {
-                    rect {
-                        x: "0", y: "0", width: "{width}", height: "{body_h}",
-                        fill: "transparent",
+                    div {
+                        class: "chart-probe",
                         onmousemove: move |event| {
                             let here = event.element_coordinates();
                             let screen = event.client_coordinates();
@@ -754,20 +763,18 @@ pub fn GanttChart(
                     .enumerate()
                     .filter(|(_, x)| span.overlaps(**x, **x + scale.px_per_day))
                 {
-                    rect {
+                    div {
                         key: "nw{index}",
-                        x: "{x}", y: "0",
-                        width: "{scale.px_per_day}", height: "{body_h}",
-                        fill: palette.paint("--nonworking"),
+                        class: "gc-nonworking",
+                        style: "left: {x}px; width: {scale.px_per_day}px;",
                     }
                 }
 
                 for line in band_lines.iter().copied().filter(|line| window.holds(*line)) {
-                    rect {
+                    div {
                         key: "bd{line}",
-                        x: "0", y: "{line as f64 * ROW_H}",
-                        width: "{width}", height: "{ROW_H}",
-                        fill: palette.paint("--grid-header"),
+                        class: "gc-band",
+                        style: "top: {line as f64 * ROW_H}px; height: {ROW_H}px;",
                     }
                 }
 
@@ -776,8 +783,7 @@ pub fn GanttChart(
                         let y = line_index as f64 * ROW_H;
                         rsx! {
                             if grid_rows {
-                                line { key: "rl{line_index}", x1: "0", y1: "{y}", x2: "{width}", y2: "{y}",
-                                    stroke: palette.paint("--grid-line"), stroke_width: "1" }
+                                div { key: "rl{line_index}", class: "gc-rule-h", style: "top: {y}px;" }
                             }
                         }
                     }
@@ -792,8 +798,7 @@ pub fn GanttChart(
                         let x = scale.x_date(tick.from);
                         rsx! {
                             if grid_columns {
-                                line { key: "vl{index}", x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
-                                    stroke: palette.paint("--grid-line"), stroke_width: "1" }
+                                div { key: "vl{index}", class: "gc-rule-v", style: "left: {x}px;" }
                             }
                         }
                     }
@@ -801,7 +806,7 @@ pub fn GanttChart(
 
                 // ---- annotations drawn under the plan --------------------
                 if show_drawings {
-                    g { class: "drawings",
+                    div { class: "drawings",
                         for d in project.drawings.iter().filter(|d| d.behind_bars) {
                             {
                                 match placed(d) {
@@ -827,10 +832,17 @@ pub fn GanttChart(
                             .then(|| arrow_path(boxes, link.predecessor, link.successor, link.kind))
                             .flatten()
                         {
-                            Some((d, head_x, head_y, downward)) => rsx! {
-                                g { key: "lk{index}",
-                                    path { d: "{d}", fill: "none", stroke: palette.paint("--link-arrow"), stroke_width: "1" }
-                                    {arrow_head(head_x, head_y, downward, palette)}
+                            Some((runs, head_x, head_y, downward)) => rsx! {
+                                div { key: "lk{index}", class: "gc-link",
+                                    for (leg, run) in runs.iter().enumerate() {
+                                        div {
+                                            key: "rn{leg}",
+                                            class: "gc-link-run",
+                                            style: "left: {run.x}px; top: {run.y}px; \
+                                                    width: {run.w}px; height: {run.h}px;",
+                                        }
+                                    }
+                                    {arrow_head(head_x, head_y, downward)}
                                 }
                             },
                             None => rsx! {},
@@ -892,6 +904,19 @@ pub fn GanttChart(
                         let dragging_this = drag.is_some_and(|d| d.row == index);
                         let hovered = hovered_task == Some(index);
                         let done_w = ghost_w * ghost_pct as f64 / 100.0;
+                        // A border is drawn inside the box it is on, while the
+                        // stroke it replaces straddled the bar's own edge, so
+                        // the box is grown by the width of the border and
+                        // moved back by half of it. That is what puts the bar
+                        // back on the pixels it was already on.
+                        let live = dragging_this || hovered;
+                        let edge = if live { 1.4 } else { 0.6 };
+                        let bar_class = match (live, dragging_this) {
+                            (true, true) => "gc-bar live dragged",
+                            (true, false) => "gc-bar live",
+                            _ => "gc-bar",
+                        };
+                        let grip = (bar_w * 0.25).min(7.0);
                         let tip = format!(
                             "{}\n{} \u{2192} {}\n{} \u{00b7} {}% complete{}",
                             if task.name.is_empty() { "(unnamed task)" } else { &task.name },
@@ -903,8 +928,21 @@ pub fn GanttChart(
                         );
 
                         rsx! {
-                            g {
+                            div {
                                 key: "bar{index}",
+                                // The stand-in for the group this was: a box
+                                // over the whole canvas that takes no pointer
+                                // of its own, so it hears exactly what its
+                                // children hear and nothing else, and they go
+                                // on being placed in the chart's coordinates
+                                // rather than the row's.
+                                class: "gc-row",
+                                // The tooltip is an attribute rather than an
+                                // element. A `title` element is the document's
+                                // title here, which is the window's own title,
+                                // so pointing at a bar would have renamed the
+                                // window.
+                                title: "{tip}",
 
                                 onmouseenter: move |_| {
                                     // Pointing at something is reading, not
@@ -940,24 +978,23 @@ pub fn GanttChart(
                                     state.write().open_task_menu(index, point.x, point.y);
                                 },
 
-                                title { "{tip}" }
-
                                 if s.show_baseline {
                                     if let Some(base) = baseline {
-                                        rect {
-                                            x: "{scale.x_work(&project.calendar, base.start)}",
-                                            y: "{y + ROW_H - 5.0}",
-                                            width: "{(scale.x_work(&project.calendar, base.finish) - scale.x_work(&project.calendar, base.start)).max(2.0)}",
-                                            height: "3",
-                                            fill: "{styles.baseline}",
+                                        div {
+                                            class: "gc-baseline",
+                                            style: "left: {scale.x_work(&project.calendar, base.start)}px; \
+                                                    top: {y + ROW_H - 5.0}px; \
+                                                    width: {(scale.x_work(&project.calendar, base.finish) - scale.x_work(&project.calendar, base.start)).max(2.0)}px; \
+                                                    background: {styles.baseline};",
                                         }
                                     }
                                 }
 
                                 if s.show_slack && !summary && has_slack {
-                                    line {
-                                        x1: "{right}", y1: "{centre}", x2: "{slack_x}", y2: "{centre}",
-                                        stroke: palette.paint("--slack"), stroke_width: "1", stroke_dasharray: "3 2",
+                                    div {
+                                        class: "gc-slack",
+                                        style: "left: {right}px; top: {centre - 0.5}px; \
+                                                width: {(slack_x - right).max(0.0)}px;",
                                     }
                                 }
 
@@ -965,15 +1002,12 @@ pub fn GanttChart(
                                 // which has no bar edge to outline, still says
                                 // it is the one being pointed at.
                                 if hovered {
-                                    rect {
-                                        x: "0", y: "{y}", width: "{width}", height: "{ROW_H}",
-                                        fill: palette.paint("--selection"),
-                                        style: "pointer-events: none;",
-                                    }
+                                    div { class: "gc-hover", style: "top: {y}px; height: {ROW_H}px;" }
                                 }
 
                                 if project.is_marker(index) {
-                                    g {
+                                    div {
+                                        class: if interactive { "gc-grab live" } else { "gc-grab" },
                                         onmousedown: move |event| {
                                             if !interactive {
                                                 return;
@@ -986,7 +1020,6 @@ pub fn GanttChart(
                                             let x = event.client_coordinates().x;
                                             state.write().begin_bar_drag(index, kind, x, 11.0);
                                         },
-                                        style: if interactive { "cursor: move;" } else { "" },
                                         {milestone_marker(
                                             left + ghost_dx,
                                             centre,
@@ -996,75 +1029,77 @@ pub fn GanttChart(
                                 } else if summary {
                                     {summary_bar(left, right, y + (ROW_H - SUMMARY_H) / 2.0, &styles.summary)}
                                 } else {
-                                    g {
-                                        rect {
-                                            x: "{left + ghost_dx}", y: "{bar_y}",
-                                            width: "{ghost_w}", height: "{BAR_H}",
-                                            rx: "1.5", fill: "{fill}",
-                                            stroke: if dragging_this || hovered {
-                                                palette.paint("--accent-bright")
-                                            } else {
-                                                palette.paint("--bar-edge")
-                                            },
-                                            stroke_width: if dragging_this || hovered { "1.4" } else { "0.6" },
-                                            opacity: if dragging_this { "0.85" } else { "1" },
+                                    div {
+                                        class: "{bar_class}",
+                                        style: "left: {left + ghost_dx - edge / 2.0}px; top: {bar_y - edge / 2.0}px; \
+                                                width: {ghost_w + edge}px; height: {BAR_H + edge}px; \
+                                                background: {fill};",
+                                    }
+                                    if done_w > 0.5 {
+                                        div {
+                                            class: "gc-progress",
+                                            style: "left: {left + ghost_dx}px; top: {centre - 1.5}px; \
+                                                    width: {done_w}px; background: {progress_fill};",
                                         }
-                                        if done_w > 0.5 {
-                                            rect {
-                                                x: "{left + ghost_dx}", y: "{centre - 1.5}",
-                                                width: "{done_w}", height: "3",
-                                                fill: "{progress_fill}",
-                                            }
-                                        }
+                                    }
 
-                                        // Hit zones: left sets progress, right resizes,
-                                        // the middle moves the whole bar. A report
-                                        // has none of them at all, rather than three
-                                        // invisible rectangles that do nothing.
-                                        if interactive {
-                                            rect {
-                                                x: "{left}", y: "{bar_y}",
-                                                width: "{(bar_w * 0.25).min(7.0)}", height: "{BAR_H}",
-                                                fill: "transparent", style: "cursor: col-resize;",
-                                                onmousedown: move |event| {
-                                                    event.stop_propagation();
-                                                    let x = event.client_coordinates().x;
-                                                    state.write().begin_bar_drag(index, BarDragKind::Progress, x, bar_w);
-                                                },
-                                            }
-                                            rect {
-                                                x: "{right - (bar_w * 0.25).min(7.0)}", y: "{bar_y}",
-                                                width: "{(bar_w * 0.25).min(7.0)}", height: "{BAR_H}",
-                                                fill: "transparent", style: "cursor: ew-resize;",
-                                                onmousedown: move |event| {
-                                                    event.stop_propagation();
-                                                    let x = event.client_coordinates().x;
-                                                    state.write().begin_bar_drag(index, BarDragKind::Resize, x, bar_w);
-                                                },
-                                            }
-                                            rect {
-                                                x: "{left + (bar_w * 0.25).min(7.0)}", y: "{bar_y}",
-                                                width: "{(bar_w - 2.0 * (bar_w * 0.25).min(7.0)).max(0.0)}",
-                                                height: "{BAR_H}",
-                                                fill: "transparent", style: "cursor: move;",
-                                                onmousedown: move |event| {
-                                                    event.stop_propagation();
-                                                    let kind = if event.modifiers().shift() {
-                                                        BarDragKind::Link
-                                                    } else {
-                                                        BarDragKind::Move
-                                                    };
-                                                    let x = event.client_coordinates().x;
-                                                    state.write().begin_bar_drag(index, kind, x, bar_w);
-                                                },
-                                            }
+                                    // Hit zones: left sets progress, right resizes,
+                                    // the middle moves the whole bar. They come
+                                    // after the bar, so the pointer reaches them
+                                    // first. A report has none of them at all,
+                                    // rather than three invisible boxes that do
+                                    // nothing.
+                                    if interactive {
+                                        div {
+                                            class: "gc-grip progress",
+                                            style: "left: {left}px; top: {bar_y}px; \
+                                                    width: {grip}px; height: {BAR_H}px;",
+                                            onmousedown: move |event| {
+                                                event.stop_propagation();
+                                                let x = event.client_coordinates().x;
+                                                state.write().begin_bar_drag(index, BarDragKind::Progress, x, bar_w);
+                                            },
+                                        }
+                                        div {
+                                            class: "gc-grip resize",
+                                            style: "left: {right - grip}px; top: {bar_y}px; \
+                                                    width: {grip}px; height: {BAR_H}px;",
+                                            onmousedown: move |event| {
+                                                event.stop_propagation();
+                                                let x = event.client_coordinates().x;
+                                                state.write().begin_bar_drag(index, BarDragKind::Resize, x, bar_w);
+                                            },
+                                        }
+                                        div {
+                                            class: "gc-grip whole",
+                                            style: "left: {left + grip}px; top: {bar_y}px; \
+                                                    width: {(bar_w - 2.0 * grip).max(0.0)}px; height: {BAR_H}px;",
+                                            onmousedown: move |event| {
+                                                event.stop_propagation();
+                                                let kind = if event.modifiers().shift() {
+                                                    BarDragKind::Link
+                                                } else {
+                                                    BarDragKind::Move
+                                                };
+                                                let x = event.client_coordinates().x;
+                                                state.write().begin_bar_drag(index, kind, x, bar_w);
+                                            },
                                         }
                                     }
                                 }
 
                                 if bar_text && !label.is_empty() {
-                                    text { class: "bar-label", x: "{right + 6.0}", y: "{centre + 0.5}", font_size: "10",
-                                        fill: palette.paint("--ink-soft"), "{label}" }
+                                    // A row's worth of height centred on the
+                                    // line the drawn text sat on, because a box
+                                    // holds its text by the middle of the box
+                                    // and the text it replaces was held by the
+                                    // middle of the glyphs.
+                                    div {
+                                        class: "bar-label",
+                                        style: "left: {right + 6.0}px; top: {centre + 0.5 - ROW_H / 2.0}px; \
+                                                height: {ROW_H}px;",
+                                        "{label}"
+                                    }
                                 }
                             }
                         }
@@ -1092,18 +1127,20 @@ pub fn GanttChart(
                                     let x = scale.x_work(&project.calendar, entry.available);
                                     let mid = y + ROW_H / 2.0;
                                     rsx! {
-                                        g { key: "ex{index}-{entry.id}",
-                                            title { "{entry.reference}: {entry.label}" }
+                                        div {
+                                            key: "ex{index}-{entry.id}",
+                                            class: "gc-external",
+                                            title: "{entry.reference}: {entry.label}",
                                             // A pin through the row: it is a
                                             // date nothing in the plan can move.
-                                            line {
-                                                x1: "{x}", y1: "{y + 1.0}",
-                                                x2: "{x}", y2: "{y + ROW_H - 1.0}",
-                                                stroke: palette.paint("--contextual"), stroke_width: "1.5",
+                                            div {
+                                                class: "gc-pin",
+                                                style: "left: {x - 0.75}px; top: {y + 1.0}px; \
+                                                        height: {ROW_H - 2.0}px;",
                                             }
-                                            polygon {
-                                                points: "{x - 4.0},{mid - 5.0} {x + 4.0},{mid - 5.0} {x},{mid + 1.0}",
-                                                fill: palette.paint("--contextual"),
+                                            div {
+                                                class: "gc-flag",
+                                                style: "left: {x - 4.0}px; top: {mid - 5.0}px;",
                                             }
                                         }
                                     }
@@ -1115,7 +1152,7 @@ pub fn GanttChart(
 
                 // ---- annotations drawn over the plan ---------------------
                 if show_drawings {
-                    g { class: "drawings",
+                    div { class: "drawings",
                         for d in project.drawings.iter().filter(|d| !d.behind_bars) {
                             {
                                 match placed(d) {
@@ -1130,16 +1167,12 @@ pub fn GanttChart(
                 }
 
                 if let Some(x) = today_x {
-                    line {
-                        x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
-                        stroke: palette.paint("--today"), stroke_width: "1", stroke_dasharray: "4 3",
-                    }
+                    div { class: "gc-today", style: "left: {x - 0.5}px;" }
                 }
 
                 if tracking {
                     if let Some(x) = status_x {
-                        line { x1: "{x}", y1: "0", x2: "{x}", y2: "{body_h}",
-                            stroke: palette.paint("--contextual"), stroke_width: "1.4" }
+                        div { class: "gc-status", style: "left: {x - 0.7}px;" }
                     }
                 }
 
@@ -1162,15 +1195,15 @@ pub fn GanttChart(
                 }
 
                 // The drawing surface, and the last thing in the body so it is
-                // over everything else. This SVG carries no view box and no
-                // transform, so a pointer position measured against it already
-                // is a chart coordinate: no bounding rectangles, no eval.
-                // A report never gets one: there is nothing on it to draw on.
+                // over everything else and so the pointer reaches it first. It
+                // is the whole canvas at the canvas's own origin and carries
+                // nothing that could move it, so a position measured against it
+                // already is a chart coordinate: no bounding rectangles, no
+                // eval. A report never gets one: there is nothing on it to
+                // draw on.
                 if interactive && (draw_tool.is_some() || draw_drag.is_some()) {
-                    rect {
-                        x: "0", y: "0", width: "{width}", height: "{body_h}",
-                        fill: "transparent",
-                        style: if draw_tool.is_some() { "cursor: crosshair;" } else { "cursor: move;" },
+                    div {
+                        class: if draw_tool.is_some() { "chart-sheet drawing" } else { "chart-sheet moving" },
                         onmousedown: move |event| {
                             let point = event.element_coordinates();
                             state.write().begin_draw(point.x, point.y);
@@ -1182,7 +1215,6 @@ pub fn GanttChart(
                         onmouseup: move |_| state.write().finish_draw_drag(),
                     }
                 }
-            }
 
             // Inside the pane, in the chart's own coordinates, so the pane
             // carries other people's pointers along as it scrolls and clips
@@ -1220,63 +1252,97 @@ fn fit(label: &str, width: f64) -> String {
     }
 }
 
+/// The diamond that stands for a milestone.
+///
+/// A square with its corners cut off, and not a square turned through forty
+/// five degrees. A transformed box is painted outside its parent's clip on
+/// this renderer, so a diamond made by rotation would still be on screen after
+/// the pane it belongs to had scrolled past it. Cutting the shape out of an
+/// upright box leaves the box upright, and an upright box is clipped normally.
 fn milestone_marker(x: f64, y: f64, fill: &str) -> Element {
     let size = 5.5;
-    // A path, not a polygon. Every other shape in this chart is a rect, a line
-    // or a path, and those all appear; the diamond was the one polygon and it
-    // was the one shape nobody could see. Written as the same four corners,
-    // closed, which is all a polygon is anyway.
-    let d = format!(
-        "M{x},{} L{},{y} L{x},{} L{},{y} Z",
-        y - size,
-        x + size,
-        y + size,
-        x - size
-    );
-    rsx! { path { d: "{d}", fill: "{fill}" } }
+    rsx! {
+        div {
+            class: "gc-milestone",
+            style: "left: {x - size}px; top: {y - size}px; \
+                    width: {size * 2.0}px; height: {size * 2.0}px; background: {fill};",
+        }
+    }
 }
 
 /// Project draws a summary as a flat spanning bar with a downward spike at
 /// each end, so the rolled-up range reads at a glance.
+///
+/// Three boxes: the bar, and a right angled triangle cut out of a box at each
+/// end. The spikes are the only part that is not a rectangle, so they are the
+/// only part that needs cutting.
 fn summary_bar(left: f64, right: f64, y: f64, fill: &str) -> Element {
     let width = (right - left).max(4.0);
     let right = left + width;
     let cap = (width / 2.0).min(5.0);
     let spike = SUMMARY_H + 5.0;
 
-    let body = format!("M{left},{y} L{right},{y} L{right},{} L{left},{} Z", y + SUMMARY_H, y + SUMMARY_H);
-    let left_cap = format!(
-        "M{left},{} L{},{} L{left},{} Z",
-        y + SUMMARY_H,
-        left + cap,
-        y + SUMMARY_H,
-        y + spike
-    );
-    let right_cap = format!(
-        "M{right},{} L{},{} L{right},{} Z",
-        y + SUMMARY_H,
-        right - cap,
-        y + SUMMARY_H,
-        y + spike
-    );
-
     rsx! {
-        g {
-            path { d: "{body}", fill: "{fill}" }
-            path { d: "{left_cap}", fill: "{fill}" }
-            path { d: "{right_cap}", fill: "{fill}" }
+        div {
+            class: "gc-summary",
+            style: "left: {left}px; top: {y}px; width: {width}px; height: {SUMMARY_H}px; \
+                    background: {fill};",
+        }
+        div {
+            class: "gc-cap left",
+            style: "left: {left}px; top: {y + SUMMARY_H}px; \
+                    width: {cap}px; height: {spike - SUMMARY_H}px; background: {fill};",
+        }
+        div {
+            class: "gc-cap right",
+            style: "left: {right - cap}px; top: {y + SUMMARY_H}px; \
+                    width: {cap}px; height: {spike - SUMMARY_H}px; background: {fill};",
         }
     }
 }
 
-/// Route an elbow from one bar to another. Returns the path, the arrow head
-/// position, and whether the head points down rather than right.
+/// The boxes that paint an elbow through a list of corners.
+///
+/// Each leg is a box one pixel across rather than a stroke. A stroke straddles
+/// the line it is drawn on, so the box is pulled back half a pixel to sit
+/// where the stroke sat, and it is stretched half a pixel into each corner it
+/// shares with the next leg, so a join leaves no notch. The free ends are left
+/// alone: a stroke ends flush at its last point and so does this.
+fn elbow_runs(corners: &[(f64, f64)]) -> Vec<Placement> {
+    corners
+        .windows(2)
+        .enumerate()
+        .map(|(leg, pair)| {
+            let ((x1, y1), (x2, y2)) = (pair[0], pair[1]);
+            let back = if leg == 0 { 0.0 } else { 0.5 };
+            let on = if leg + 2 == corners.len() { 0.0 } else { 0.5 };
+            if (y2 - y1).abs() < (x2 - x1).abs() {
+                let (from, to) = if x1 <= x2 {
+                    (x1 - back, x2 + on)
+                } else {
+                    (x2 - on, x1 + back)
+                };
+                Placement { x: from, y: y1 - 0.5, w: to - from, h: 1.0 }
+            } else {
+                let (from, to) = if y1 <= y2 {
+                    (y1 - back, y2 + on)
+                } else {
+                    (y2 - on, y1 + back)
+                };
+                Placement { x: x1 - 0.5, y: from, w: 1.0, h: to - from }
+            }
+        })
+        .collect()
+}
+
+/// Route an elbow from one bar to another. Returns the legs to paint, the
+/// arrow head position, and whether the head points down rather than right.
 fn arrow_path(
     boxes: &HashMap<TaskId, BarBox>,
     predecessor: TaskId,
     successor: TaskId,
     kind: LinkType,
-) -> Option<(String, f64, f64, bool)> {
+) -> Option<(Vec<Placement>, f64, f64, bool)> {
     let from = boxes.get(&predecessor)?;
     let to = boxes.get(&successor)?;
 
@@ -1294,35 +1360,44 @@ fn arrow_path(
     // straight on to the next task looks like. A plain drop reads far better
     // than an elbow that jogs sideways and back for no reason.
     if (end_x - start_x).abs() < 1.0 {
-        let path = format!("M{start_x},{y1} L{start_x},{}", y2 - 6.0);
-        return Some((path, start_x, y2 - 6.0, true));
+        let runs = elbow_runs(&[(start_x, y1), (start_x, y2 - 6.0)]);
+        return Some((runs, start_x, y2 - 6.0, true));
     }
 
     // The straightforward case: the successor sits clear of the predecessor.
     if (approach > 0.0 && end_x >= start_x + stub) || (approach < 0.0 && end_x <= start_x - stub) {
         let corner = end_x - approach;
-        let path = format!("M{start_x},{y1} L{corner},{y1} L{corner},{y2} L{end_x},{y2}");
-        return Some((path, end_x, y2, false));
+        let runs = elbow_runs(&[(start_x, y1), (corner, y1), (corner, y2), (end_x, y2)]);
+        return Some((runs, end_x, y2, false));
     }
 
     // Otherwise the successor starts before the predecessor ends, so the line
     // has to double back. Run it between the two rows rather than through them.
     let between = y1 + ROW_H / 2.0;
     let out = start_x + approach;
-    let path = format!(
-        "M{start_x},{y1} L{out},{y1} L{out},{between} L{end_x},{between} L{end_x},{}",
-        y2 - 6.0
-    );
-    Some((path, end_x, y2 - 6.0, true))
+    let runs = elbow_runs(&[
+        (start_x, y1),
+        (out, y1),
+        (out, between),
+        (end_x, between),
+        (end_x, y2 - 6.0),
+    ]);
+    Some((runs, end_x, y2 - 6.0, true))
 }
 
-fn arrow_head(x: f64, y: f64, downward: bool, palette: Palette) -> Element {
-    let points = if downward {
-        format!("{},{y} {},{y} {x},{}", x - 3.0, x + 3.0, y + 5.0)
+/// The head of a dependency arrow, at the end it points at.
+///
+/// A box with no size of its own and three borders, two of them transparent,
+/// is a triangle. Made that way rather than by cutting one out of a box,
+/// because a border costs the frame nothing while a clip path costs it one of
+/// its layers, and there is one of these per link on screen.
+fn arrow_head(x: f64, y: f64, downward: bool) -> Element {
+    let (class, left, top) = if downward {
+        ("gc-link-head down", x - 3.0, y)
     } else {
-        format!("{},{} {},{} {x},{y}", x - 5.0, y - 3.0, x - 5.0, y + 3.0)
+        ("gc-link-head right", x - 5.0, y - 3.0)
     };
-    rsx! { polygon { points: "{points}", fill: palette.paint("--link-arrow") } }
+    rsx! { div { class: "{class}", style: "left: {left}px; top: {top}px;" } }
 }
 
 // ---------------------------------------------------------------- drawings
@@ -1370,6 +1445,152 @@ fn shape_shows(at: Placement, span: &SpanWindow, window: &RowWindow) -> bool {
 /// How far a selection outline stands off the shape it is around.
 const SELECT_PAD: f64 = 3.0;
 
+/// The upright box a set of corners fits in, and those corners again as the
+/// clip path that cuts the shape back out of it.
+///
+/// A box cannot be leaned over without a transform, and a transformed box
+/// escapes the clip of the pane it is in on this renderer, so anything that is
+/// not upright is cut out of a box that is. Cutting costs the frame one of its
+/// clipping layers, so it is kept for the shapes that genuinely lean: a
+/// triangle standing square on can be had from borders for nothing.
+///
+/// `None` for a set of corners with no area, which has nothing to paint.
+fn clipped_box(corners: &[(f64, f64)]) -> Option<(Placement, String)> {
+    let (first, rest) = corners.split_first()?;
+    let (mut low, mut high) = (*first, *first);
+    for (x, y) in rest {
+        low = (low.0.min(*x), low.1.min(*y));
+        high = (high.0.max(*x), high.1.max(*y));
+    }
+    let (w, h) = (high.0 - low.0, high.1 - low.1);
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let points = corners
+        .iter()
+        .map(|(x, y)| format!("{:.2}px {:.2}px", x - low.0, y - low.1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some((Placement { x: low.0, y: low.1, w, h }, format!("polygon({points})")))
+}
+
+/// The four corners of a stroke of the given weight laid along a line.
+fn stroke_corners(x1: f64, y1: f64, x2: f64, y2: f64, weight: f64) -> Option<[(f64, f64); 4]> {
+    let (dx, dy) = (x2 - x1, y2 - y1);
+    let length = dx.hypot(dy);
+    if length < 0.001 {
+        return None;
+    }
+    // The perpendicular, half a stroke long, which is how far the stroke
+    // stands off the line on either side.
+    let (nx, ny) = (-dy / length * weight / 2.0, dx / length * weight / 2.0);
+    Some([
+        (x1 + nx, y1 + ny),
+        (x2 + nx, y2 + ny),
+        (x2 - nx, y2 - ny),
+        (x1 - nx, y1 - ny),
+    ])
+}
+
+/// A colour broken up the way a dash pattern breaks up a stroke, running along
+/// the direction given.
+///
+/// A background is the only thing a box has that can be broken up, so a dashed
+/// line is a repeating gradient of colour and nothing. The angle is measured
+/// the way CSS measures one, clockwise from straight up, while the direction
+/// handed in is measured the way a screen counts, downwards.
+fn dashed_paint(dx: f64, dy: f64, colour: &str, pattern: &str) -> String {
+    let mut lengths = pattern.split_whitespace().filter_map(|n| n.parse::<f64>().ok());
+    let on = lengths.next().unwrap_or(1.0).max(0.1);
+    let off = lengths.next().unwrap_or(on).max(0.1);
+    let angle = dx.atan2(-dy).to_degrees();
+    format!(
+        "repeating-linear-gradient({angle:.2}deg, {colour} 0 {on}px, \
+         transparent {on}px {}px)",
+        on + off
+    )
+}
+
+/// How wide a pointer target a drawn hairline is given.
+const LINE_GRAB: f64 = 8.0;
+
+/// The most boxes one drawn line's pointer target is allowed to cost.
+const LINE_GRAB_STEPS: usize = 24;
+
+/// Pointer targets along a drawn line.
+///
+/// A clip path decides what is painted and not what is pointed at here, so a
+/// leaning line given one box would answer for the whole rectangle it leans
+/// through, which on a long diagonal is most of the chart. A short chain of
+/// boxes following the line keeps the target on the line itself, which is what
+/// the fat invisible companion stroke was always for. A line that does not
+/// lean needs one box, and gets one.
+fn line_targets(x1: f64, y1: f64, x2: f64, y2: f64) -> Vec<Placement> {
+    let (dx, dy) = (x2 - x1, y2 - y1);
+    if dx.hypot(dy) < 0.001 {
+        return Vec::new();
+    }
+    // Only the shorter of the two extents makes a staircase necessary: a run
+    // that is flat in one direction is one box however long it is.
+    let drift = dx.abs().min(dy.abs());
+    let steps = ((drift / LINE_GRAB).ceil() as usize).clamp(1, LINE_GRAB_STEPS);
+    (0..steps)
+        .map(|step| {
+            let (near, far) = (step as f64 / steps as f64, (step + 1) as f64 / steps as f64);
+            let (ax, ay) = (x1 + dx * near, y1 + dy * near);
+            let (bx, by) = (x1 + dx * far, y1 + dy * far);
+            Placement {
+                x: ax.min(bx) - LINE_GRAB / 2.0,
+                y: ay.min(by) - LINE_GRAB / 2.0,
+                w: (bx - ax).abs() + LINE_GRAB,
+                h: (by - ay).abs() + LINE_GRAB,
+            }
+        })
+        .collect()
+}
+
+/// The CSS keyword that breaks a border up the way a line style asks for.
+///
+/// `aop_core` keeps the pattern as a dash array, because that is what anything
+/// printing the plan will want, and a border is broken up by a keyword rather
+/// than by lengths, so the two are matched here.
+fn border_dashes(style: LineStyle) -> &'static str {
+    match style {
+        LineStyle::Solid => "solid",
+        LineStyle::Dashed => "dashed",
+        LineStyle::Dotted => "dotted",
+    }
+}
+
+/// A drawn straight line, as an upright box with the lean cut out of it.
+fn drawn_line(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    stroke: &str,
+    weight: f64,
+    style: LineStyle,
+) -> Element {
+    let Some(corners) = stroke_corners(x1, y1, x2, y2, weight) else {
+        return rsx! {};
+    };
+    let Some((at, clip)) = clipped_box(&corners) else {
+        return rsx! {};
+    };
+    let paint = match style.dasharray() {
+        Some(pattern) => dashed_paint(x2 - x1, y2 - y1, stroke, pattern),
+        None => stroke.to_string(),
+    };
+    rsx! {
+        div {
+            class: "gc-line",
+            style: "left: {at.x}px; top: {at.y}px; width: {at.w}px; height: {at.h}px; \
+                    background: {paint}; clip-path: {clip};",
+        }
+    }
+}
+
 /// One annotation, drawn where `place` put it.
 fn drawn_shape(
     d: &Drawing,
@@ -1387,19 +1608,34 @@ fn drawn_shape(
     // are resolved here rather than there.
     let stroke = palette.literal(d.style.stroke());
     let stroke_w = d.style.width();
-    let dash = d.style.line_style.dasharray().unwrap_or("none");
-    let fill = palette.literal(d.style.fill());
+    let edge = border_dashes(d.style.line_style);
+    // An unset fill means unfilled, which a box says as `transparent`: `none`
+    // is a paint an SVG understands and a background does not.
+    let fill = match palette.literal(d.style.fill()) {
+        "none" => "transparent",
+        colour => colour,
+    };
     let ink = palette.literal(d.style.ink());
+    let weight = if d.style.bold { "600" } else { "400" };
+    let slant = if d.style.italic { "italic" } else { "normal" };
+    // A border is drawn inside the box it is on, while the stroke it stands in
+    // for straddled the shape's own edge, so the box is grown by a whole
+    // stroke and moved back by half of one. The outline then covers exactly
+    // the pixels the stroke covered.
+    let half = stroke_w / 2.0;
     // A locked shape lets the pointer through to the bars underneath, which is
     // the point of locking one: mark the plan up, then get back to work on it.
     // A report is locked all over, since nothing on it is meant to be touched.
     let inert = d.locked || !interactive;
-    let closed_hit = if inert { "none" } else { "all" };
-    let stroke_hit = if inert { "none" } else { "stroke" };
+    let hit = if inert { "none" } else { "auto" };
 
     rsx! {
-        g {
+        div {
             key: "dw{id}",
+            // The whole canvas, taking no pointer of its own, so the shapes
+            // inside it keep the chart's coordinates and it hears only what
+            // they hear. The group it replaces had no geometry either.
+            class: "gc-drawing",
             onmousedown: move |event| {
                 if !interactive {
                     return;
@@ -1432,70 +1668,70 @@ fn drawn_shape(
 
             match d.kind {
                 ShapeKind::Line | ShapeKind::Arrow => rsx! {
-                    line {
-                        x1: "{at.x}", y1: "{at.y}", x2: "{end_x}", y2: "{end_y}",
-                        stroke: "{stroke}", stroke_width: "{stroke_w}",
-                        stroke_dasharray: "{dash}", style: "pointer-events: none;",
-                    }
+                    {drawn_line(at.x, at.y, end_x, end_y, stroke, stroke_w, d.style.line_style)}
                     // An open shape has no interior to click and a hairline is
-                    // a hard target, so an invisible fat companion carries the
+                    // a hard target, so invisible fat companions carry the
                     // pointer events for it.
-                    line {
-                        x1: "{at.x}", y1: "{at.y}", x2: "{end_x}", y2: "{end_y}",
-                        stroke: "transparent", stroke_width: "8",
-                        style: "pointer-events: {stroke_hit}; cursor: move;",
+                    for (step, target) in line_targets(at.x, at.y, end_x, end_y).into_iter().enumerate() {
+                        div {
+                            key: "hit{step}",
+                            class: "gc-line-grab",
+                            style: "left: {target.x}px; top: {target.y}px; \
+                                    width: {target.w}px; height: {target.h}px; \
+                                    pointer-events: {hit};",
+                        }
                     }
                     if d.kind == ShapeKind::Arrow {
                         {arrow_tip(at.x, at.y, end_x, end_y, stroke, stroke_w)}
                     }
                 },
                 ShapeKind::Rectangle => rsx! {
-                    rect {
-                        x: "{outer.x}", y: "{outer.y}",
-                        width: "{outer.w}", height: "{outer.h}",
-                        fill: "{fill}", stroke: "{stroke}", stroke_width: "{stroke_w}",
-                        stroke_dasharray: "{dash}",
-                        // An unfilled box is still a box: without this the
-                        // planner has to hit the one pixel of its outline.
-                        style: "pointer-events: {closed_hit}; cursor: move;",
+                    div {
+                        class: "gc-shape",
+                        // An unfilled box is still a box: without a background
+                        // the planner would have to hit the one pixel of its
+                        // outline, which is what `pointer-events` said before.
+                        style: "left: {outer.x - half}px; top: {outer.y - half}px; \
+                                width: {outer.w + stroke_w}px; height: {outer.h + stroke_w}px; \
+                                background: {fill}; border: {stroke_w}px {edge} {stroke}; \
+                                pointer-events: {hit};",
                     }
                 },
                 ShapeKind::Oval => rsx! {
-                    ellipse {
-                        cx: "{outer.x + outer.w / 2.0}", cy: "{outer.y + outer.h / 2.0}",
-                        rx: "{outer.w / 2.0}", ry: "{outer.h / 2.0}",
-                        fill: "{fill}", stroke: "{stroke}", stroke_width: "{stroke_w}",
-                        stroke_dasharray: "{dash}",
-                        style: "pointer-events: {closed_hit}; cursor: move;",
+                    div {
+                        class: "gc-shape oval",
+                        style: "left: {outer.x - half}px; top: {outer.y - half}px; \
+                                width: {outer.w + stroke_w}px; height: {outer.h + stroke_w}px; \
+                                background: {fill}; border: {stroke_w}px {edge} {stroke}; \
+                                pointer-events: {hit};",
                     }
                 },
                 ShapeKind::TextBox => rsx! {
-                    rect {
-                        x: "{outer.x}", y: "{outer.y}",
-                        width: "{outer.w}", height: "{outer.h}",
-                        fill: "{fill}", stroke: "{stroke}", stroke_width: "{stroke_w}",
-                        stroke_dasharray: "{dash}",
-                        style: "pointer-events: {closed_hit}; cursor: move;",
+                    div {
+                        class: "gc-shape",
+                        style: "left: {outer.x - half}px; top: {outer.y - half}px; \
+                                width: {outer.w + stroke_w}px; height: {outer.h + stroke_w}px; \
+                                background: {fill}; border: {stroke_w}px {edge} {stroke}; \
+                                pointer-events: {hit};",
                     }
-                    text {
+                    div {
                         class: "draw-text",
-                        x: "{outer.x + 4.0}", y: "{outer.y + outer.h / 2.0}",
-                        fill: "{ink}",
-                        font_size: "{d.style.font_size()}pt",
-                        font_weight: if d.style.bold { "600" } else { "400" },
-                        font_style: if d.style.italic { "italic" } else { "normal" },
-                        style: "pointer-events: none;",
+                        // A box the height of the shape, holding its caption by
+                        // the middle, which is where the drawn text sat.
+                        style: "left: {outer.x + 4.0}px; top: {outer.y}px; height: {outer.h}px; \
+                                color: {ink}; font-size: {d.style.font_size()}pt; \
+                                font-weight: {weight}; font-style: {slant};",
                         "{d.text}"
                     }
                 },
             }
 
             if selected {
-                rect {
-                    x: "{outer.x - SELECT_PAD}", y: "{outer.y - SELECT_PAD}",
-                    width: "{outer.w + 2.0 * SELECT_PAD}", height: "{outer.h + 2.0 * SELECT_PAD}",
-                    fill: "none", stroke: palette.paint("--accent-bright"), stroke_width: "1",
-                    stroke_dasharray: "3 2", style: "pointer-events: none;",
+                div {
+                    class: "gc-outline",
+                    style: "left: {outer.x - SELECT_PAD - 0.5}px; top: {outer.y - SELECT_PAD - 0.5}px; \
+                            width: {outer.w + 2.0 * SELECT_PAD + 1.0}px; \
+                            height: {outer.h + 2.0 * SELECT_PAD + 1.0}px;",
                 }
             }
         }
@@ -1515,14 +1751,21 @@ fn arrow_tip(x1: f64, y1: f64, x2: f64, y2: f64, stroke: &str, stroke_w: f64) ->
     let (base_x, base_y) = (x2 - ux * size, y2 - uy * size);
     // The perpendicular, for the two back corners.
     let (px, py) = (-uy * size * 0.45, ux * size * 0.45);
-    let points = format!(
-        "{x2},{y2} {},{} {},{}",
-        base_x + px,
-        base_y + py,
-        base_x - px,
-        base_y - py
-    );
-    rsx! { polygon { points: "{points}", fill: "{stroke}", style: "pointer-events: none;" } }
+    let corners = [
+        (x2, y2),
+        (base_x + px, base_y + py),
+        (base_x - px, base_y - py),
+    ];
+    let Some((at, clip)) = clipped_box(&corners) else {
+        return rsx! {};
+    };
+    rsx! {
+        div {
+            class: "gc-tip",
+            style: "left: {at.x}px; top: {at.y}px; width: {at.w}px; height: {at.h}px; \
+                    background: {stroke}; clip-path: {clip};",
+        }
+    }
 }
 
 /// The outline pulled out while a new shape is being drawn.
@@ -1531,20 +1774,28 @@ fn arrow_tip(x1: f64, y1: f64, x2: f64, y2: f64, stroke: &str, stroke_w: f64) ->
 /// go" without pretending the shape exists before the pointer is let go.
 fn rubber_band(kind: ShapeKind, x: f64, y: f64, dx: f64, dy: f64, palette: Palette) -> Element {
     if matches!(kind, ShapeKind::Line | ShapeKind::Arrow) {
+        let colour = palette.paint("--accent-bright");
+        let Some(corners) = stroke_corners(x, y, x + dx, y + dy, 1.5) else {
+            return rsx! {};
+        };
+        let Some((at, clip)) = clipped_box(&corners) else {
+            return rsx! {};
+        };
+        let paint = dashed_paint(dx, dy, colour, "4 3");
         return rsx! {
-            line {
-                x1: "{x}", y1: "{y}", x2: "{x + dx}", y2: "{y + dy}",
-                stroke: palette.paint("--accent-bright"), stroke_width: "1.5",
-                stroke_dasharray: "4 3", style: "pointer-events: none;",
+            div {
+                class: "gc-line",
+                style: "left: {at.x}px; top: {at.y}px; width: {at.w}px; height: {at.h}px; \
+                        background: {paint}; clip-path: {clip};",
             }
         };
     }
     let band = Placement { x, y, w: dx, h: dy }.normalised();
     rsx! {
-        rect {
-            x: "{band.x}", y: "{band.y}", width: "{band.w}", height: "{band.h}",
-            fill: "none", stroke: palette.paint("--accent-bright"), stroke_width: "1",
-            stroke_dasharray: "4 3", style: "pointer-events: none;",
+        div {
+            class: "gc-outline",
+            style: "left: {band.x - 0.5}px; top: {band.y - 0.5}px; \
+                    width: {band.w + 1.0}px; height: {band.h + 1.0}px;",
         }
     }
 }
@@ -2263,5 +2514,150 @@ mod tests {
         assert_eq!(scale.x_work(&calendar, at(2026, 8, 17, 17)), 26.0);
         // Tuesday 08:00 is the same place, so the bars meet.
         assert_eq!(scale.x_work(&calendar, at(2026, 8, 18, 8)), 26.0);
+    }
+}
+
+#[cfg(test)]
+mod body_boxes_tests {
+    use super::*;
+
+    /// This file, so the shape of what it draws can be asserted on.
+    ///
+    /// What is being guarded here does not show up in a value anywhere: it is
+    /// which elements the chart asks for. An inline drawing costs the whole
+    /// chart its handlers and its styling on this renderer, quietly and with
+    /// no error, and the last time it was reintroduced it took a day to find.
+    const SOURCE: &str = include_str!("gantt.rs");
+
+    /// The chart, from the component down to the last of its helpers. The
+    /// timeline strip below is a separate thing and is not in scope here.
+    fn chart_source() -> &'static str {
+        let from = SOURCE.find("pub fn GanttChart(").expect("the chart component");
+        let to = SOURCE[from..]
+            .find("// ---------------------------------------------------------------- timeline")
+            .expect("the end of the chart");
+        &SOURCE[from..from + to]
+    }
+
+    #[test]
+    fn the_chart_draws_no_inline_pictures() {
+        // An inline drawing is serialised, parsed and kept as a picture here,
+        // and its children never get layout boxes. Nothing inside one can be
+        // styled by the sheet and, worse, nothing inside one can be hit
+        // tested, so every handler in it is dead without saying so.
+        // Read as elements rather than as text: `show_baseline {` ends in the
+        // name of one and is not one, so what counts is a line that opens with
+        // the tag and nothing else.
+        for tag in ["svg", "rect", "line", "path", "polygon", "ellipse", "text", "g"] {
+            let opens = format!("{tag} {{");
+            let drawn = chart_source()
+                .lines()
+                .find(|line| line.trim_start().starts_with(&opens));
+            assert!(
+                drawn.is_none(),
+                "the chart still asks for `{tag}`, which puts it back inside a \
+                 picture: {}",
+                drawn.unwrap_or("").trim()
+            );
+        }
+    }
+
+    #[test]
+    fn the_tooltip_is_an_attribute_and_never_an_element() {
+        // A `title` element is the document's title on this renderer, and the
+        // document's title is the window's, so a `title` in the chart would
+        // rename the window to whatever bar the pointer was over.
+        assert!(!chart_source().contains("title {"));
+        assert!(chart_source().contains("title: \"{tip}\""));
+    }
+
+    #[test]
+    fn nothing_the_pane_has_to_clip_is_moved_by_a_transform() {
+        // The pane is a clipped box holding something much larger than itself,
+        // and a transformed box is painted outside its parent's clip here. The
+        // milestone diamond is the shape that invites one, so it is cut out of
+        // an upright box instead. The same rule is asserted on the stylesheet
+        // in `crate::theme`.
+        assert!(
+            !chart_source().contains("transform:"),
+            "something in the chart is moved by a transform, which takes it \
+             outside the clip that is supposed to be cutting it off"
+        );
+        assert!(chart_source().contains("clip-path: {clip}"));
+    }
+
+    #[test]
+    fn an_elbow_leg_sits_where_its_stroke_sat() {
+        // A stroke straddles the line it is drawn on and a box does not, so a
+        // leg is pulled back half its own thickness. Getting this wrong moves
+        // every dependency arrow half a pixel off the bar it points at.
+        let legs = elbow_runs(&[(10.0, 20.0), (40.0, 20.0), (40.0, 60.0)]);
+        assert_eq!(legs.len(), 2);
+        assert_eq!((legs[0].x, legs[0].y, legs[0].h), (10.0, 19.5, 1.0));
+        assert_eq!((legs[1].x, legs[1].w), (39.5, 1.0));
+        // The free ends stop where the polyline did, and the shared corner is
+        // grown into from both sides so the join leaves no notch.
+        assert_eq!(legs[0].x + legs[0].w, 40.5);
+        assert_eq!(legs[1].y, 19.5);
+        assert_eq!(legs[1].y + legs[1].h, 60.0);
+    }
+
+    #[test]
+    fn an_arrow_still_ends_where_it_used_to() {
+        // The route is untouched; only what paints it changed. A finish to
+        // start link between two bars clear of each other elbows through one
+        // corner and arrives pointing right.
+        let mut boxes = HashMap::new();
+        boxes.insert(1, BarBox { left: 0.0, right: 40.0, mid: 11.0 });
+        boxes.insert(2, BarBox { left: 90.0, right: 130.0, mid: 33.0 });
+        let (legs, head_x, head_y, downward) =
+            arrow_path(&boxes, 1, 2, LinkType::FS).expect("both bars are drawn");
+        assert_eq!((head_x, head_y, downward), (90.0, 33.0, false));
+        assert_eq!(legs.len(), 3);
+        // Out of the predecessor, down between the rows, into the successor.
+        assert_eq!(legs[0].y, 10.5);
+        assert_eq!(legs[1].x, 82.5);
+        assert_eq!(legs[2].y, 32.5);
+    }
+
+    #[test]
+    fn a_leaning_shape_is_cut_out_of_an_upright_box() {
+        // The corners come back as a clip path measured from the box's own top
+        // left, because that is the only origin a clip path has.
+        let corners = stroke_corners(0.0, 0.0, 10.0, 10.0, 2.0).expect("a real line");
+        let (at, clip) = clipped_box(&corners).expect("an area to paint");
+        assert!(at.x < 0.0 && at.y < 0.0, "the stroke stands off the line both ways");
+        assert!(clip.starts_with("polygon("), "{clip}");
+        assert_eq!(clip.matches("px").count(), 8, "four corners, two lengths each");
+        // Nothing is left over: the box is exactly what the corners span.
+        assert!((at.w - (10.0 + 2.0f64.sqrt())).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_line_that_does_not_lean_needs_one_pointer_target() {
+        // The staircase exists for diagonals. A horizontal or vertical line is
+        // its own bounding box, so giving it more boxes would be waste.
+        assert_eq!(line_targets(0.0, 0.0, 300.0, 0.0).len(), 1);
+        assert_eq!(line_targets(0.0, 0.0, 0.0, 300.0).len(), 1);
+        // A diagonal gets a chain, and a bounded one.
+        let steps = line_targets(0.0, 0.0, 400.0, 400.0);
+        assert!(steps.len() > 1 && steps.len() <= LINE_GRAB_STEPS);
+        // Every one of them is on the line rather than beside it.
+        for target in &steps {
+            let (cx, cy) = (target.x + target.w / 2.0, target.y + target.h / 2.0);
+            assert!((cx - cy).abs() < 0.01, "the chain has wandered off the line");
+        }
+    }
+
+    #[test]
+    fn a_dash_pattern_becomes_a_gradient_along_the_line() {
+        // A background is the only part of a box that can be broken up, and it
+        // has to be broken up along the line rather than down the page.
+        assert!(dashed_paint(10.0, 0.0, "red", "6 3").starts_with("repeating-linear-gradient(90.00deg"));
+        assert!(dashed_paint(0.0, 10.0, "red", "6 3").starts_with("repeating-linear-gradient(180.00deg"));
+        assert_eq!(
+            dashed_paint(0.0, 10.0, "red", "6 3"),
+            "repeating-linear-gradient(180.00deg, red 0 6px, transparent 6px 9px)"
+        );
     }
 }

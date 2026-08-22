@@ -1074,14 +1074,18 @@ fn SplitPanes(
                             class: "pane-body",
                             onwheel: move |event| wheel(event, &mut down, rows_len, panes),
                             div {
-                                // Sideways only downwards, so to speak: the
-                                // chart carries its own sideways offset in the
-                                // view box of the picture it draws itself into,
-                                // so that the picture stays the size of the
-                                // pane. Sliding it here as well would move it
-                                // twice and put its edges back outside.
+                                // Both ways, and by the same number the
+                                // timescale above is slid by, which is the
+                                // only way head and body can be guaranteed to
+                                // put a date on the same pixel. The chart used
+                                // to carry its sideways offset itself, in the
+                                // coordinates of the picture it drew itself
+                                // into, because a picture is cut off at its
+                                // own edges and a picture that has been slid is
+                                // not. It is a tree of boxes now, and the pane
+                                // cuts those off wherever they are.
                                 class: "shift",
-                                style: "margin: -{down().0}px 0 0 0;",
+                                style: "margin: -{down().0}px 0 0 -{shift.chart}px;",
                                 {right_body}
                             }
                         }

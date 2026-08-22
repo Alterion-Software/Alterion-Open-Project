@@ -2297,15 +2297,20 @@ button { font: inherit; color: inherit; }
 
 .splitter:hover { background: var(--accent); }
 
-/* While resizing, nothing under the pointer may react. */
+/* While resizing, nothing under the pointer may react. The chart's own boxes
+   are named as well as the box that holds them, because `pointer-events` is
+   inherited and a bar asks for it back by name: told only the parent, the bars
+   would go on taking the pointer through the whole drag. */
 .split.resizing { cursor: col-resize; }
 .split.resizing .grid,
-.split.resizing .chart-svg { pointer-events: none; }
+.split.resizing .chart-canvas,
+.split.resizing .chart-canvas * { pointer-events: none; }
 .split.resizing .splitter { background: var(--accent); }
 
 /* While a row is being dragged the cursor says so throughout. */
 .split.row-dragging { cursor: grabbing; }
-.split.row-dragging .chart-svg { pointer-events: none; }
+.split.row-dragging .chart-canvas,
+.split.row-dragging .chart-canvas * { pointer-events: none; }
 
 /* ---------- task grid ---------- */
 
@@ -2868,19 +2873,172 @@ button { font: inherit; color: inherit; }
 }
 .tl-tier-major .tl-cell { color: var(--ink); }
 .tl-cell.weekend { color: var(--ink-faint); }
-.chart-svg { display: block; }
 
-.tl-major, .tl-minor { font-size: 10px; fill: var(--ink-soft); }
-.tl-major { fill: var(--ink); }
-.tl-minor.weekend { fill: var(--ink-faint); }
+/* ---------- the chart body ---------- */
 
-.bar-label { font-size: 10px; fill: var(--ink-soft); dominant-baseline: middle; }
+/* The box the bars are placed against, and the only one of them that is in
+   the ordinary flow. Everything below is placed absolutely, and an absolutely
+   placed child gives its parent no size at all, so this has to carry the
+   chart's own width and height: without the height the pane would have
+   nothing to scroll. */
+.chart-canvas { display: block; position: relative; }
 
-/* Annotation shapes. The group is inert as a whole and each shape opts back
-   in, so an unfilled outline is still clickable while the empty space between
-   two shapes lets the pointer through to the bars underneath. */
-.drawings { pointer-events: none; }
-.draw-text { dominant-baseline: middle; user-select: none; }
+/* Two sheets over the whole canvas, at the canvas's own origin, so a pointer
+   position taken against either is already a chart coordinate. The first is
+   under everything and answers where the chart begins on the screen; the
+   second is over everything and is what the drawing tools are measured
+   against. */
+.chart-probe, .chart-sheet { position: absolute; inset: 0; }
+.chart-sheet.drawing { cursor: crosshair; }
+.chart-sheet.moving { cursor: move; }
+
+/* A day nobody works, shaded the full height of the chart. */
+.gc-nonworking { position: absolute; top: 0; bottom: 0; background: var(--nonworking); }
+
+/* The strip behind a grouping band's row. */
+.gc-band { position: absolute; left: 0; right: 0; background: var(--grid-header); }
+
+/* The gridlines. A hairline here is a box one pixel across rather than a
+   stroke straddling the coordinate it is drawn on, and the vertical ones are
+   deliberately placed the way the timescale places its cell borders: both run
+   from the date's own pixel rightwards, so the rule under a tick and the rule
+   beside its label are the same rule. */
+.gc-rule-h { position: absolute; left: 0; right: 0; height: 1px; background: var(--grid-line); }
+.gc-rule-v { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--grid-line); }
+
+/* Today, and the status date a tracking view is measured against. The dashes
+   are a repeating gradient because a background is the only thing a box has
+   that can be broken up, where a stroke had a dash pattern. */
+.gc-today {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: repeating-linear-gradient(180deg, var(--today) 0 4px, transparent 4px 7px);
+}
+.gc-status { position: absolute; top: 0; bottom: 0; width: 1.4px; background: var(--contextual); }
+
+/* One task's boxes, and one link's. Each wrapper covers the canvas and takes
+   no pointer of its own, so it stands in exactly for the group it replaces: it
+   hears what its children hear and nothing else, and they go on being placed
+   in the chart's own coordinates rather than the row's. `pointer-events` is
+   inherited, so every child that is meant to be reachable says so. */
+.gc-row, .gc-link, .gc-external, .gc-grab, .gc-drawing, .drawings {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* The lit band across a hovered row, and the two marks that ride under a bar.
+   None of them is a target: the band is the width of the chart and would take
+   every pointer in the row if it were. */
+.gc-hover { position: absolute; left: 0; right: 0; background: var(--selection); pointer-events: none; }
+.gc-baseline { position: absolute; height: 3px; }
+.gc-slack {
+  position: absolute;
+  height: 1px;
+  background: repeating-linear-gradient(90deg, var(--slack) 0 3px, transparent 3px 5px);
+}
+
+/* The bar itself. The border stands in for the stroke that was on it, so the
+   box it is on is grown by the border's own width and moved back by half of
+   it, which the chart works out; what is here is only how heavy it is. */
+.gc-bar {
+  position: absolute;
+  box-sizing: border-box;
+  border-radius: 1.5px;
+  border: 0.6px solid var(--bar-edge);
+  pointer-events: auto;
+}
+.gc-bar.live { border-width: 1.4px; border-color: var(--accent-bright); }
+.gc-bar.dragged { opacity: 0.85; }
+.gc-progress { position: absolute; height: 3px; }
+
+/* The three hit zones along a bar. They come after it, so the pointer reaches
+   them first. */
+.gc-grip { position: absolute; pointer-events: auto; }
+.gc-grip.progress { cursor: col-resize; }
+.gc-grip.resize { cursor: ew-resize; }
+.gc-grip.whole { cursor: move; }
+
+/* A milestone, and a summary's two end spikes. Cut out of upright boxes, never
+   turned: a transformed box escapes the clip of the pane it is in here, so a
+   diamond made by rotating a square would still be drawn after the pane had
+   scrolled past it. */
+.gc-milestone {
+  position: absolute;
+  clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+  pointer-events: auto;
+}
+.gc-grab.live .gc-milestone { cursor: move; }
+.gc-summary { position: absolute; pointer-events: auto; }
+.gc-cap { position: absolute; }
+.gc-cap.left { clip-path: polygon(0 0, 100% 0, 0 100%); }
+.gc-cap.right { clip-path: polygon(0 0, 100% 0, 100% 100%); }
+
+/* A dependency arrow: straight runs, and a head made of borders. A box with no
+   size and three borders, two of them transparent, is a triangle, and unlike a
+   cut-out one it costs the frame none of its clipping layers. */
+.gc-link-run { position: absolute; background: var(--link-arrow); }
+.gc-link-head { position: absolute; width: 0; height: 0; }
+.gc-link-head.right {
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  border-left: 5px solid var(--link-arrow);
+}
+.gc-link-head.down {
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+  border-top: 5px solid var(--link-arrow);
+}
+
+/* A date outside the plan that a row is waiting on: a pin through the row and
+   a flag pointing down at it. */
+.gc-pin { position: absolute; width: 1.5px; background: var(--contextual); }
+.gc-flag {
+  position: absolute;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 6px solid var(--contextual);
+}
+
+/* The trailing resource label. Inert, unlike the drawn text it replaces: it
+   reaches well past the bar's own end, and a box out there that answered for
+   the bar would be taking clicks over bare canvas the planner is trying to
+   draw on. */
+.bar-label {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--ink-soft);
+}
+
+/* Annotation shapes. Each wrapper is inert and each shape opts back in, so an
+   unfilled outline is still clickable while the empty space between two shapes
+   lets the pointer through to the bars underneath. */
+.gc-shape { position: absolute; box-sizing: border-box; cursor: move; }
+.gc-shape.oval { border-radius: 50%; }
+.gc-line { position: absolute; pointer-events: none; }
+.gc-line-grab { position: absolute; cursor: move; }
+.gc-tip { position: absolute; pointer-events: none; }
+.gc-outline {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px dashed var(--accent-bright);
+  pointer-events: none;
+}
+.draw-text {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: none;
+}
 
 /* Timeline band labels. One beside its bar reads as ordinary text; one within
    a bar sits on the bar's own colour, so it takes the dark ink instead. */
@@ -5027,5 +5185,55 @@ mod escaping_clip_tests {
             "the sliding box may not be moved by a transform, or it escapes \
              the pane that is supposed to be cutting it off"
         );
+    }
+
+    #[test]
+    fn the_chart_moves_nothing_it_draws() {
+        // The bars are boxes now, and every one of them is inside the pane's
+        // clip. A shape that is not upright is the one thing that invites a
+        // rotation, and the diamond a milestone is drawn as is exactly that,
+        // so it is cut out of an upright box instead. Any rule here that took
+        // a transform would put whatever it moved back outside the pane.
+        let chart = CSS
+            .find("/* ---------- the chart body ---------- */")
+            .expect("the chart's own rules");
+        let rules = &CSS[chart..];
+        let ends = rules.find("/* ---------- the timeline strip").unwrap_or(rules.len());
+        let rules = &rules[..ends];
+        assert!(
+            !rules.contains("transform:"),
+            "a box the chart draws is moved by a transform, so the pane it is \
+             in will not cut it off"
+        );
+        assert!(
+            rules.contains(".gc-milestone") && rules.contains("clip-path: polygon(50% 0"),
+            "the milestone diamond has to be a square with its corners cut off"
+        );
+    }
+
+    #[test]
+    fn nothing_drawn_once_a_row_asks_for_a_clipping_layer() {
+        // The frame has a thousand or so clipping layers to spend and a long
+        // plan draws thousands of boxes, so an `overflow` that is not visible
+        // cannot go on anything there is one of per bar. Cutting a shape out
+        // of a box costs one too, which is why only the shapes that genuinely
+        // lean are cut.
+        let chart = CSS
+            .find("/* ---------- the chart body ---------- */")
+            .expect("the chart's own rules");
+        let rules = &CSS[chart..];
+        let ends = rules.find("/* ---------- the timeline strip").unwrap_or(rules.len());
+        for rule in rules[..ends].split('}') {
+            let Some(selector) = rule.split('{').next().map(str::trim) else {
+                continue;
+            };
+            if !selector.contains(".gc-") {
+                continue;
+            }
+            assert!(
+                !rule.contains("overflow"),
+                "{selector} is drawn once per bar and may not spend a clipping layer"
+            );
+        }
     }
 }
