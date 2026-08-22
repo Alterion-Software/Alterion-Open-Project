@@ -520,6 +520,24 @@ pub fn GanttChart(
     let scroll = use_context::<ChartScroll>().0;
     let rows_len = rows.len();
     let seen = scroll();
+    // How much of the plan the pane shows, and where it starts.
+    //
+    // The chart is drawn into a picture exactly the size of the pane, and the
+    // offset is carried in that picture's own coordinate system rather than by
+    // sliding it sideways. That is what stops it painting across the table.
+    //
+    // An inline drawing is not a set of boxes on this renderer: the element's
+    // markup is serialised, handed to a parser and kept as a picture, and the
+    // boxes its children would have had are thrown away. A picture is an image
+    // as far as everything else is concerned, and an image is cut off at its
+    // own edges, so a picture the size of the pane cannot spill out of it
+    // whatever it is asked to draw. Sliding it, on the other hand, moved the
+    // whole picture and its edges with it.
+    let (origin, port) = if interactive && seen.width > 1.0 {
+        (seen.left, seen.width)
+    } else {
+        (0.0, width)
+    };
     // A report is never scrolled, so there is no viewport to window against:
     // it draws every row and the whole timescale, or the chain would print
     // with pieces of itself missing.
@@ -692,11 +710,15 @@ pub fn GanttChart(
                 s.cancel_bar_drag();
                 s.cancel_draw_drag();
             },
-            div { class: "chart-canvas", style: "width: {width}px;",
+            div { class: "chart-canvas", style: "width: {port}px;",
             // ---- chart body ---------------------------------------------
-            svg { class: "chart-svg", width: "{width}", height: "{body_h}",
-                view_box: "0 0 {width} {body_h}", font_family: palette.font(),
-                style: "width: {width}px; height: {body_h}px; flex: none;",
+            // The box is the pane; the view box says which part of the plan is
+            // in it. Both are the same size, so nothing is scaled: a view box
+            // that disagrees with its element magnifies everything it holds,
+            // which is a fault this chart has worn before.
+            svg { class: "chart-svg", width: "{port}", height: "{body_h}",
+                view_box: "{origin} 0 {port} {body_h}", font_family: palette.font(),
+                style: "width: {port}px; height: {body_h}px; flex: none;",
 
                 // First, so everything else is painted over it and it takes a
                 // pointer only where the chart is otherwise bare. It exists to

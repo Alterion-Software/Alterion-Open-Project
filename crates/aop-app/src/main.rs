@@ -838,7 +838,6 @@ fn SplitPanes(
     // the offset was then.
     let mut down_drag = use_signal(|| None::<(f64, f64)>);
     let reach = use_context::<Signal<Reach>>();
-    let grid_scroll = use_context::<GridScroll>().0;
     let mut chart_scroll = use_context::<ChartScroll>().0;
 
     let (grid_width, focus, rows_len) = {
@@ -890,26 +889,31 @@ fn SplitPanes(
 
     let shift = shifted();
     let far = reach();
-    // How wide each pane is, for sizing the scrollbar thumbs. Taken from the
-    // panes themselves once they have reported it, and worked out from the
-    // window until then, so a bar is the right size on the first paint rather
-    // than after the first scroll.
+    // How wide each pane is: the table's is what the splitter was dragged to,
+    // and the chart's is what is left of the window after it.
+    //
+    // Worked out rather than reported. Nothing in the split scrolls itself any
+    // more, so nothing gets asked its size by the renderer, and measuring a box
+    // means `get_client_rect`, which takes the document's `RefCell` and is the
+    // call that was killing the process. It sizes the scrollbar thumbs and it
+    // tells the chart how big a picture to draw itself into.
     let ports = {
         let (window_wide, _) = use_context::<Signal<crate::state::Viewport>>()();
-        let table = {
-            let seen = grid_scroll().width;
-            if seen > 1.0 && seen < window_wide { seen } else { grid_width }
-        };
-        let chart = {
-            let seen = chart_scroll().width;
-            if seen > 1.0 && seen < window_wide {
-                seen
-            } else {
-                (window_wide - grid_width - SPLITTER_W - 16.0).max(120.0)
-            }
-        };
-        Reach { table, chart }
+        Reach {
+            table: grid_width,
+            chart: (window_wide - grid_width - SPLITTER_W - 16.0).max(120.0),
+        }
     };
+
+    // The chart draws itself into a picture the width of its own pane, so it
+    // has to be told what that is. Written only when it changes.
+    {
+        let mut seen = chart_scroll;
+        let now = seen();
+        if (now.width - ports.chart).abs() >= 1.0 {
+            seen.set(PaneScroll { width: ports.chart, ..now });
+        }
+    }
 
     // The left column of all three rows is one width, so a column title, the
     // cells under it and the strip at the bottom are all cut off at the same
@@ -1062,8 +1066,14 @@ fn SplitPanes(
                             class: "pane-body",
                             onwheel: move |event| wheel(event, &mut down, rows_len, panes),
                             div {
+                                // Sideways only downwards, so to speak: the
+                                // chart carries its own sideways offset in the
+                                // view box of the picture it draws itself into,
+                                // so that the picture stays the size of the
+                                // pane. Sliding it here as well would move it
+                                // twice and put its edges back outside.
                                 class: "shift",
-                                style: "margin: -{down().0}px 0 0 -{shift.chart}px;",
+                                style: "margin: -{down().0}px 0 0 0;",
                                 {right_body}
                             }
                         }
