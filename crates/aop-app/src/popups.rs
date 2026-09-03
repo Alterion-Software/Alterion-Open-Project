@@ -299,7 +299,20 @@ pub fn LinkPicker(row: usize, end: LinkEnd) -> Element {
                                                 class: "rselect", style: "width: 92px;",
                                                 title: "Lag; use a negative value to overlap",
                                                 value: "{signed_lag(lag)}",
-                                                onchange: move |event| {
+                                                // `oninput`, not `onchange`.
+                                                //
+                                                // The webview-free renderer has no change event at
+                                                // all: `blitz_traits::events::DomEventData` runs
+                                                // from `PointerMove` to `Ime` and there is no
+                                                // `Change` in it, so a handler waiting for one
+                                                // waits for ever and the field cannot be edited.
+                                                // Input is raised on both builds.
+                                                //
+                                                // Committing per keystroke is right here and would
+                                                // not be everywhere: a lag is a few characters, and
+                                                // `parse_signed_lag` reads a half typed one as the
+                                                // number it has so far rather than as an error.
+                                                oninput: move |event| {
                                                     set(id, kind, parse_signed_lag(&event.value()));
                                                 },
                                             }
@@ -464,7 +477,11 @@ pub fn ResourcePicker(row: usize) -> Element {
                                                 input {
                                                     class: "rselect", style: "width: 100%;",
                                                     value: "{shown * 100.0:.0}%",
-                                                    onchange: move |event| {
+                                                    // See the lag field above: there is no change
+                                                    // event on the webview-free build. A half typed
+                                                    // percentage simply does not parse, and nothing
+                                                    // is written until it does.
+                                                    oninput: move |event| {
                                                         let cleaned = event.value().trim().trim_end_matches('%').to_string();
                                                         if let Ok(percent) = cleaned.parse::<f64>() {
                                                             let mut w = state.write();

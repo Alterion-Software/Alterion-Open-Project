@@ -31,7 +31,8 @@ build() {
   export CARGO_TARGET_DIR=target
 
   # Removed --frozen
-  cargo build --release --package aop-app
+  # The webview-free build: Blitz rather than wry and webkit2gtk.
+  cargo build --release --package aop-app --no-default-features --features native
 }
 
 check() {
@@ -39,7 +40,7 @@ check() {
   export RUSTUP_TOOLCHAIN=stable
 
   # Removed --frozen
-  cargo test --release
+  cargo test --release --no-default-features --features aop-app/native
 }
 
 package() {

@@ -13,9 +13,11 @@ use crate::gantt::ROW_H;
 /// How many rows to draw beyond each edge of the viewport.
 ///
 /// Scrolling arrives a frame after the pointer moves, so drawing only what is
-/// strictly visible leaves a blank band at the leading edge. A margin of a few
-/// rows covers that without costing much.
-const OVERSCAN: usize = 6;
+/// strictly visible leaves a blank band at the leading edge. Three rows covers
+/// that. It used to be six, from before the renderer's cost per row was known:
+/// every row beyond the edge is rows of table cells and chart boxes that are
+/// built, laid out and turned into paint commands to be looked at by nobody.
+const OVERSCAN: usize = 3;
 
 /// Rows per step of the window.
 ///
@@ -89,9 +91,15 @@ impl RowWindow {
         }
     }
 
-    /// Whether a row is drawn.
-    pub fn holds(&self, line: usize) -> bool {
-        line >= self.first && line < self.end
+    /// The rows that are drawn.
+    ///
+    /// A range rather than a `contains` test, because that is what the callers
+    /// actually want: the row list is held in the order it is drawn in, so the
+    /// rows on screen are a slice of it, and asking a plan of a hundred and
+    /// fifty thousand tasks which of them are on screen one at a time is the
+    /// whole cost this window exists to avoid.
+    pub fn lines(&self) -> std::ops::Range<usize> {
+        self.first..self.end
     }
 
     /// Whether anything between two rows is drawn.
@@ -135,12 +143,13 @@ impl SpanWindow {
         }
     }
 
-    /// Whether anything drawn at this x is worth drawing.
-    pub fn holds(&self, x: f64) -> bool {
-        x >= self.left && x <= self.right
-    }
-
     /// Whether something spanning `left..right` shows at all.
+    ///
+    /// The only question the chart asks of the sideways window. Everything it
+    /// draws has a width: a tick is a cell, a shaded day is a column and a bar
+    /// runs from one date to another, so a point test would have to pick one
+    /// of an element's two edges and would drop whatever straddles the edge of
+    /// the window. A point is `overlaps(x, x)`.
     pub fn overlaps(&self, left: f64, right: f64) -> bool {
         right >= self.left && left <= self.right
     }
@@ -225,7 +234,7 @@ mod tests {
         // The margin is what stops a blank band appearing at the leading edge
         // while the pane catches up with the pointer.
         let w = RowWindow::new(ROW_H * 30.0, 220.0, 200);
-        assert!(w.holds(30 - OVERSCAN), "the margin above must be drawn");
+        assert!(w.lines().contains(&(30 - OVERSCAN)), "the margin above must be drawn");
         // Snapping to a block only ever draws more, never less, so the exact
         // far edge is no longer fixed. What matters is that it stays bounded:
         // a window that crept outwards would give back the virtualization.
@@ -276,13 +285,14 @@ mod tests {
     #[test]
     fn the_timescale_window_covers_the_pane_and_a_margin() {
         let span = SpanWindow::new(1000.0, 800.0);
-        assert!(span.holds(1000.0) && span.holds(1800.0), "the pane itself");
-        assert!(span.holds(1000.0 - SpanWindow::MARGIN / 2.0), "and the margin before it");
+        let at = |x: f64| span.overlaps(x, x);
+        assert!(at(1000.0) && at(1800.0), "the pane itself");
+        assert!(at(1000.0 - SpanWindow::MARGIN / 2.0), "and the margin before it");
         // Bounded, not endless: written against the margin rather than a
         // distance of its own, so widening the margin does not quietly turn
         // this into a test that the window holds everything.
-        assert!(!span.holds(1000.0 - SpanWindow::MARGIN - 1.0), "but not the far side of the plan");
-        assert!(!span.holds(1800.0 + SpanWindow::MARGIN + 1.0), "nor the far end of it");
+        assert!(!at(1000.0 - SpanWindow::MARGIN - 1.0), "but not the far side of the plan");
+        assert!(!at(1800.0 + SpanWindow::MARGIN + 1.0), "nor the far end of it");
     }
 
     #[test]
@@ -297,8 +307,8 @@ mod tests {
     #[test]
     fn a_link_crossing_the_window_is_kept_though_neither_end_shows() {
         let w = RowWindow::new(ROW_H * 50.0, 220.0, 200);
-        assert!(!w.holds(2));
-        assert!(!w.holds(150));
+        assert!(!w.lines().contains(&2));
+        assert!(!w.lines().contains(&150));
         assert!(w.spans(2, 150), "its line still crosses the pane");
         assert!(!w.spans(0, 1), "this one is wholly above");
     }

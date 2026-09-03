@@ -12,13 +12,47 @@ name = "alterion-open-project"
 path = "src/main.rs"
 
 [dependencies]
-aop-core = { version = "1.0.5-beta", path = "../aop-core" }
+aop-core = { version = "1.0.6-beta", path = "../aop-core" }
 chrono.workspace = true
 dioxus = { version = "0.8.0-alpha.1" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.53.1", features = ["time", "rt"] }
-dioxus-native = { version = "0.8.0-alpha.1", optional = true, features = ["autofocus"] }
+# The feature list is written out rather than taken as it comes, because two
+# of these are decisions rather than defaults.
+#
+# `incremental` is `blitz-dom`'s cached layout, and it is ON because without it
+# every relayout is a full one, which on a plan of a hundred and fifty thousand
+# rows is the whole cost of `build_layout` per frame instead of a cached no-op.
+# It was turned off once while chasing the resize fault, on the theory that a
+# resize produces no damage and so leaves every cached layout in place:
+# `ViewportMut`'s `Drop` in `blitz-dom` only invalidates when the *scale*
+# changes, and a plain width change takes the early return. That theory is
+# untested and the slowdown is not worth carrying while it stays that way.
+#
+# The renderer stays on `vello-hybrid`, the default. The full `vello` backend
+# was tried and paints a black window; the document lays out and hit tests
+# correctly under it, so it reaches the renderer and no further.
+#
+# The defaults have to be listed by hand because they are turned off as a set,
+# and they are only ours to turn off at all because `native` below no longer
+# goes through `dioxus/native`. That feature declares `dioxus-native` without
+# `default-features = false`, and cargo features are additive, so while it was
+# on nothing here could switch any of these off.
+dioxus-native = { version = "0.8.0-alpha.1", optional = true, default-features = false, features = [
+    "vello-hybrid",
+    "accessibility",
+    "incremental",
+    "hot-reload",
+    "net",
+    "html",
+    "svg",
+    "system-fonts",
+    "clipboard",
+    "file-dialog",
+    "woff",
+    "autofocus",
+] }
 # The same parley blitz uses, so the font context built for that build is the
 # very type it is handed. Not optional: both builds ask it which fonts the
 # machine has, for the font list in the ribbon.
@@ -46,4 +80,8 @@ default = ["desktop"]
 # The webview build: wry and webkit2gtk.
 desktop = ["dioxus/desktop"]
 # The webview-free build: Blitz, which paints with wgpu and lays out with Stylo.
-native = ["dep:dioxus-native", "dioxus/native"]
+# No `dioxus/native`. That feature only adds `dep:dioxus-native` and
+# `dioxus-config-macro/native`; this build reaches `dioxus_native` directly and
+# uses neither, and going through it would pull the crate in with its default
+# features and take the choice above away.
+native = ["dep:dioxus-native"]

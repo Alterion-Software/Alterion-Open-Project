@@ -9,14 +9,13 @@
 //! children with no layout boxes, no reachable styling and nothing a pointer
 //! can land on.
 
-use std::collections::HashMap;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
 use dioxus::prelude::*;
 
 use aop_core::draw::{place, snap_vertical, ChartMap, Drawing, LineStyle, Placement, ShapeKind};
 use aop_core::grouping::GroupRow;
-use aop_core::{LinkType, Project, TaskId, WorkCalendar};
+use aop_core::{Link, LinkType, Project, TaskId, WorkCalendar};
 
 use crate::viewport::{ChartScroll, Part, Reach, RowWindow, SpanWindow};
 use crate::state::{AppState, BarDragKind, Dialog, DrawDragKind, ViewKind, Zoom};
@@ -291,7 +290,7 @@ pub fn bar_edges(
     Some((left, right))
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct BarBox {
     left: f64,
     right: f64,
@@ -316,9 +315,210 @@ struct ChartLayout {
     minor: Vec<Tick>,
     nonworking: Vec<f64>,
     today_x: Option<f64>,
-    boxes: HashMap<TaskId, BarBox>,
-    lines: HashMap<TaskId, usize>,
+    boxes: BarBoxes,
+    lines: TaskLines,
     band_lines: Vec<usize>,
+    links: LinkIndex,
+}
+
+/// Where each task's bar was drawn, indexed by the task's own id.
+///
+/// A dense table, not a hash map. Ids come off a counter and are never reused
+/// within a plan, so an id already is an index and hashing it buys nothing.
+/// On a plan of a hundred and fifty thousand tasks, filling two hash maps was
+/// three quarters of the time the whole layout took; filling two vectors is a
+/// pass over the rows and no hashing at all.
+///
+/// The cost is one slot per id ever issued rather than one per task, which is
+/// four bytes a slot for the lines and a little more for the boxes. A plan
+/// that has had rows deleted carries the gaps. That is the right trade at
+/// this size and it is worth knowing it is being made.
+#[derive(Default, PartialEq)]
+struct BarBoxes {
+    slots: Vec<Option<BarBox>>,
+}
+
+impl BarBoxes {
+    fn with_room_for(bound: usize) -> Self {
+        BarBoxes { slots: vec![None; bound] }
+    }
+
+    fn set(&mut self, id: TaskId, at: BarBox) {
+        if let Some(slot) = self.slots.get_mut(id as usize) {
+            *slot = Some(at);
+        }
+    }
+
+    fn get(&self, id: TaskId) -> Option<&BarBox> {
+        self.slots.get(id as usize).and_then(Option::as_ref)
+    }
+
+    /// How many tasks actually have geometry, for the tests that count them.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+}
+
+/// Which line each task sits on, indexed the same way.
+///
+/// `NOT_DRAWN` rather than an `Option`, so the table is a flat run of `u32`
+/// and a plan's worth of it stays in cache while the link index is built.
+#[derive(Default, PartialEq)]
+struct TaskLines {
+    slots: Vec<u32>,
+}
+
+impl TaskLines {
+    const NOT_DRAWN: u32 = u32::MAX;
+
+    fn with_room_for(bound: usize) -> Self {
+        TaskLines { slots: vec![Self::NOT_DRAWN; bound] }
+    }
+
+    fn set(&mut self, id: TaskId, line: usize) {
+        if let Some(slot) = self.slots.get_mut(id as usize) {
+            *slot = line as u32;
+        }
+    }
+
+    fn get(&self, id: TaskId) -> Option<usize> {
+        match self.slots.get(id as usize) {
+            Some(&line) if line != Self::NOT_DRAWN => Some(line as usize),
+            _ => None,
+        }
+    }
+}
+
+/// One past the highest task id the plan has issued.
+///
+/// The tables are sized from this rather than from the task count, because an
+/// id is only an index into them while every id is inside them.
+fn id_bound(project: &Project) -> usize {
+    project.tasks.iter().map(|task| task.id).max().unwrap_or(0) as usize + 1
+}
+
+/// How far apart two rows can be before a link between them stops being filed
+/// under the higher of the two and is simply looked at every frame instead.
+///
+/// The index files a link under its top row, so a query has to look back as
+/// far as the longest filed link reaches. That is cheap while links are local,
+/// which nearly all of them are: a predecessor sits a few rows above its
+/// successor. One link from the first row of the plan to the last would
+/// otherwise make every query walk the whole thing, so links that long are
+/// kept in a list of their own and looked at in full. There are never many.
+const LONG_LINK: usize = 512;
+
+/// Which links cross which rows.
+///
+/// A link is drawn whenever the stretch of rows between its two ends touches
+/// the window, so what has to be answered once per frame is an interval
+/// overlap against a table that, at the size this build is aimed at, holds
+/// hundreds of thousands of entries. Walking it was costing a pass over the
+/// whole plan per frame, and a node in the tree per link besides, because an
+/// arrow that is not drawn still had to be decided against.
+///
+/// Held the way a sparse matrix is. `starts` has one entry per row plus a
+/// sentinel, and `starts[line]..starts[line + 1]` is that row's stretch of
+/// `filed`; the rows are contiguous, so the whole window is one slice rather
+/// than a walk over its rows. Built by counting sort, which is one pass to
+/// count and one to place.
+#[derive(Default, PartialEq)]
+struct LinkIndex {
+    starts: Vec<u32>,
+    /// `(link, bottom row)`, grouped by top row. The bottom row is carried
+    /// here so the query needs no lookup back into the plan to reject a link
+    /// that ends above the window.
+    filed: Vec<(u32, u32)>,
+    /// `(link, top row, bottom row)` for the links that reach too far to file.
+    long: Vec<(u32, u32, u32)>,
+    /// The longest reach among the filed links, so a plan whose links are all
+    /// short does not look back the full `LONG_LINK` rows for nothing.
+    reach: usize,
+}
+
+impl LinkIndex {
+    /// File every link that has both ends on a drawn row.
+    ///
+    /// A link to a task that is filtered out, collapsed into a summary or
+    /// simply not in this report is dropped here rather than being rejected
+    /// once per frame for the life of the view.
+    fn build(links: &[Link], lines: &TaskLines, rows: usize) -> Self {
+        let mut short: Vec<(u32, u32, u32)> = Vec::new();
+        let mut long: Vec<(u32, u32, u32)> = Vec::new();
+        let mut reach = 0usize;
+
+        for (index, link) in links.iter().enumerate() {
+            let (Some(a), Some(b)) =
+                (lines.get(link.predecessor), lines.get(link.successor))
+            else {
+                continue;
+            };
+            let (low, high) = if a <= b { (a, b) } else { (b, a) };
+            if high - low > LONG_LINK {
+                long.push((index as u32, low as u32, high as u32));
+            } else {
+                reach = reach.max(high - low);
+                short.push((index as u32, low as u32, high as u32));
+            }
+        }
+
+        // Count into `starts[line + 1]` so the prefix sum below leaves each
+        // row's own offset in `starts[line]`, with the sentinel at the end.
+        let mut starts = vec![0u32; rows + 1];
+        for &(_, low, _) in &short {
+            starts[low as usize + 1] += 1;
+        }
+        for line in 1..starts.len() {
+            starts[line] += starts[line - 1];
+        }
+
+        let mut cursor = starts.clone();
+        let mut filed = vec![(0u32, 0u32); short.len()];
+        for &(index, low, high) in &short {
+            let slot = &mut cursor[low as usize];
+            filed[*slot as usize] = (index, high);
+            *slot += 1;
+        }
+
+        LinkIndex { starts, filed, long, reach }
+    }
+
+    /// The links whose span touches `window`, in the plan's own order.
+    ///
+    /// The same answer `RowWindow::spans` gives, reached without asking it
+    /// about every link in the plan: the filed links come out of one slice,
+    /// and only the handful that reach past `LONG_LINK` rows are looked at
+    /// one by one.
+    fn crossing(&self, window: RowWindow) -> impl Iterator<Item = usize> + '_ {
+        let rows = self.starts.len().saturating_sub(1);
+        let from = window.first.saturating_sub(self.reach);
+        let to = window.end.min(rows);
+        let slice = if from < to {
+            &self.filed[self.starts[from] as usize..self.starts[to] as usize]
+        } else {
+            &self.filed[0..0]
+        };
+        let first = window.first as u32;
+
+        slice
+            .iter()
+            // The slice already holds only links whose top row is above the
+            // bottom of the window; this is the other half of the overlap.
+            .filter(move |(_, high)| *high >= first)
+            .map(|(index, _)| *index as usize)
+            .chain(
+                // The few that reach too far to file are asked the question
+                // in its original form, so the rule the index is reproducing
+                // is still written down in exactly one place.
+                self.long
+                    .iter()
+                    .filter(move |(_, low, high)| {
+                        window.spans(*low as usize, *high as usize)
+                    })
+                    .map(|(index, _, _)| *index as usize),
+            )
+    }
 }
 
 /// The lines the chart draws.
@@ -365,17 +565,18 @@ fn build_layout(s: &AppState, rows: Vec<GroupRow>, only: Option<&[usize]>) -> Ch
     let today_x = (today >= from && today < to).then(|| scale.x_date(today));
 
     // Bar geometry, keyed by task so the arrows can find their endpoints.
-    let mut boxes: HashMap<TaskId, BarBox> = HashMap::new();
+    let bound = id_bound(project);
+    let mut boxes = BarBoxes::with_room_for(bound);
     // Which line each task sits on, so an arrow can be skipped without first
     // working out the path it would have taken.
-    let mut lines: HashMap<TaskId, usize> = HashMap::new();
+    let mut lines = TaskLines::with_room_for(bound);
     for (line, index) in rows.iter().enumerate().filter_map(task_line) {
         let task = &project.tasks[index];
-        lines.insert(task.id, line);
+        lines.set(task.id, line);
         let Some((left, right)) = bar_edges(project, &scale, s.round_bars, index) else {
             continue;
         };
-        boxes.insert(
+        boxes.set(
             task.id,
             BarBox {
                 left,
@@ -393,6 +594,10 @@ fn build_layout(s: &AppState, rows: Vec<GroupRow>, only: Option<&[usize]>) -> Ch
         .filter_map(|(line, row)| matches!(row, GroupRow::Band { .. }).then_some(line))
         .collect();
 
+    // Which arrow crosses which row, worked out here with everything else
+    // that does not change when the viewport moves.
+    let links = LinkIndex::build(&project.links, &lines, rows.len());
+
     ChartLayout {
         rows,
         from,
@@ -406,7 +611,24 @@ fn build_layout(s: &AppState, rows: Vec<GroupRow>, only: Option<&[usize]>) -> Ch
         boxes,
         lines,
         band_lines,
+        links,
     }
+}
+
+/// The stretch of a run of ticks that falls inside `span`.
+///
+/// The ticks run left to right and do not overlap, so both edges of the window
+/// are a binary search rather than a walk. A year of day columns is a few
+/// thousand ticks and a pane shows a screenful, so this is the difference
+/// between reading the whole timescale every frame and reading the part of it
+/// that is on screen.
+fn tick_window(ticks: &[Tick], scale: &Scale, span: &SpanWindow) -> std::ops::Range<usize> {
+    let left = |tick: &Tick| scale.x_date(tick.from);
+    let right =
+        |tick: &Tick| left(tick) + (tick.to - tick.from).num_days() as f64 * scale.px_per_day;
+    let from = ticks.partition_point(|tick| right(tick) < span.left);
+    let to = ticks.partition_point(|tick| left(tick) <= span.right);
+    from..to.max(from)
 }
 
 #[component]
@@ -470,12 +692,16 @@ pub fn GanttChart(
         nonworking,
         today_x,
         boxes,
-        lines,
         band_lines,
+        links: link_index,
         // The chart's date range lives in the layout for the memo's sake; the
         // scale already carries the origin, so nothing here reads it again.
         from: _,
         to: _,
+        // Only the index reads these now: which line a task sits on is a
+        // question the arrows used to ask once per link per frame, and the
+        // index answers it once per plan instead.
+        lines: _,
     } = layout;
     let (width, body_h, today_x) = (*width, *body_h, *today_x);
     let s = state.read();
@@ -557,6 +783,46 @@ pub fn GanttChart(
         )
     };
 
+    // Everything the two windows cut down to, worked out once here rather than
+    // as a test carried through a walk over the whole plan. Each of these
+    // collections is held in the order it is drawn in, so what is on screen is
+    // a range of it.
+    let minor_window = tick_window(minor, &scale, &span);
+    let nonworking_window = {
+        let day = scale.px_per_day;
+        let from = nonworking.partition_point(|x| x + day < span.left);
+        let to = nonworking.partition_point(|x| *x <= span.right);
+        from..to.max(from)
+    };
+    let band_window = {
+        let from = band_lines.partition_point(|line| *line < window.first);
+        let to = band_lines.partition_point(|line| *line < window.end);
+        from..to.max(from)
+    };
+    // How far down the drawn rows reach, for the furniture that runs the
+    // height of the chart rather than sitting on a row of its own.
+    //
+    // A gridline used to be written `top: 0; bottom: 0`, which makes it as
+    // tall as the canvas, and the canvas is as tall as the plan: at a hundred
+    // and fifty thousand rows that is a box one pixel wide and three and a
+    // third million pixels tall. This renderer only skips a box whose bounds
+    // fall wholly outside the window, and one that tall never does, so every
+    // one of them was drawn to its full height and turned into strips a
+    // scanline at a time. Two hundred of those was half a second a frame, and
+    // it scaled with the plan rather than with what was on screen, which is
+    // the whole thing the windowing exists to stop.
+    let band_top = window.first as f64 * ROW_H;
+    let band_h = (window.end.saturating_sub(window.first)) as f64 * ROW_H;
+
+    // Collected rather than borrowed: the arrows are read inside the body's
+    // `rsx!`, which outlives the borrow of the index, and there are only ever
+    // a windowful of them.
+    let arrows: Vec<usize> = if show_links {
+        link_index.crossing(window).collect()
+    } else {
+        Vec::new()
+    };
+
     // Where this planner's pointer is, for the others in a live session, and
     // what it takes to work that out.
     //
@@ -598,10 +864,7 @@ pub fn GanttChart(
             // for an ordinary element.
             div { class: "chart-head", style: "width: {width}px; height: {HEADER_H}px;",
                 div { class: "tl-tier tl-tier-major", style: "height: {TIER_H}px;",
-                    for (index, tick) in major.iter().enumerate().filter(|(_, t)| {
-                        let x = scale.x_date(t.from);
-                        span.overlaps(x, x + (t.to - t.from).num_days() as f64 * scale.px_per_day)
-                    }) {
+                    for (index, tick) in tick_window(major, &scale, &span).map(|i| (i, &major[i])) {
                         {
                             let x = scale.x_date(tick.from);
                             let w = (tick.to - tick.from).num_days() as f64 * scale.px_per_day;
@@ -619,10 +882,7 @@ pub fn GanttChart(
                 }
                 div { class: "tl-tier tl-tier-minor",
                     style: "top: {TIER_H}px; height: {HEADER_H - TIER_H}px;",
-                    for (index, tick) in minor.iter().enumerate().filter(|(_, t)| {
-                        let x = scale.x_date(t.from);
-                        span.overlaps(x, x + (t.to - t.from).num_days() as f64 * scale.px_per_day)
-                    }) {
+                    for (index, tick) in tick_window(minor, &scale, &span).map(|i| (i, &minor[i])) {
                         {
                             let x = scale.x_date(tick.from);
                             let w = (tick.to - tick.from).num_days() as f64 * scale.px_per_day;
@@ -758,19 +1018,20 @@ pub fn GanttChart(
                     }
                 }
 
-                for (index, x) in nonworking
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, x)| span.overlaps(**x, **x + scale.px_per_day))
-                {
+                // Shaded days, banded rows and gridlines are all held in
+                // order, so the stretch of each that is on screen is a pair of
+                // binary searches. They used to be a walk over the whole plan
+                // that threw away everything but a screenful.
+                for (index, x) in nonworking_window.clone().map(|i| (i, nonworking[i])) {
                     div {
                         key: "nw{index}",
                         class: "gc-nonworking",
-                        style: "left: {x}px; width: {scale.px_per_day}px;",
+                        style: "left: {x}px; width: {scale.px_per_day}px; \
+                                top: {band_top}px; height: {band_h}px;",
                     }
                 }
 
-                for line in band_lines.iter().copied().filter(|line| window.holds(*line)) {
+                for line in band_window.clone().map(|i| band_lines[i]) {
                     div {
                         key: "bd{line}",
                         class: "gc-band",
@@ -789,16 +1050,16 @@ pub fn GanttChart(
                     }
                 }
 
-                for (index, tick) in minor
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| span.holds(scale.x_date(t.from)))
-                {
+                for (index, tick) in minor_window.clone().map(|i| (i, &minor[i])) {
                     {
                         let x = scale.x_date(tick.from);
                         rsx! {
                             if grid_columns {
-                                div { key: "vl{index}", class: "gc-rule-v", style: "left: {x}px;" }
+                                div {
+                                    key: "vl{index}",
+                                    class: "gc-rule-v",
+                                    style: "left: {x}px; top: {band_top}px; height: {band_h}px;",
+                                }
                             }
                         }
                     }
@@ -821,17 +1082,15 @@ pub fn GanttChart(
                 }
 
                 // ---- dependency arrows -----------------------------------
-                for (index, link) in project.links.iter().enumerate() {
+                //
+                // The index gives back the arrows that cross the window and
+                // nothing else. Asking the plan instead meant a pass over
+                // every link it holds, and a node in the tree for each of
+                // them, because an arrow that is not drawn still had to be
+                // decided against and a decision is an element either way.
+                for (index, link) in arrows.iter().map(|&i| (i, &project.links[i])) {
                     {
-                        let shown = show_links
-                            && match (lines.get(&link.predecessor), lines.get(&link.successor)) {
-                                (Some(&a), Some(&b)) => window.spans(a, b),
-                                _ => false,
-                            };
-                        match shown
-                            .then(|| arrow_path(boxes, link.predecessor, link.successor, link.kind))
-                            .flatten()
-                        {
+                        match arrow_path(boxes, link.predecessor, link.successor, link.kind) {
                             Some((runs, head_x, head_y, downward)) => rsx! {
                                 div { key: "lk{index}", class: "gc-link",
                                     for (leg, run) in runs.iter().enumerate() {
@@ -851,20 +1110,24 @@ pub fn GanttChart(
                 }
 
                 // ---- bars ------------------------------------------------
-                for (line_index, index) in rows
+                //
+                // Sliced, not filtered. The rows are held in the order they
+                // are drawn in, so the rows on screen are a range of the plan
+                // rather than a property of it, and a plan of a hundred and
+                // fifty thousand tasks costs the same per frame as a plan of
+                // fifty. What is left to test is the other axis: a row can be
+                // on screen while its bar is a year off to the side.
+                for (line_index, index) in rows[window.lines()]
                     .iter()
                     .enumerate()
+                    .map(|(offset, row)| (window.first + offset, row))
                     .filter_map(task_line)
-                    .filter(|(line, i)| {
-                        // A bar has to be on screen both ways: on a drawn row,
-                        // and within the stretch of timescale the pane shows.
-                        window.holds(*line) && {
-                            let t = &project.tasks[*i];
-                            let left = scale.x_work(&project.calendar, t.scheduled.start);
-                            let right = scale.x_work(&project.calendar, t.scheduled.finish);
-                            // The trailing label reaches past the bar's own end.
-                            span.overlaps(left, right + BAR_LABEL_REACH)
-                        }
+                    .filter(|(_, i)| {
+                        let t = &project.tasks[*i];
+                        let left = scale.x_work(&project.calendar, t.scheduled.start);
+                        let right = scale.x_work(&project.calendar, t.scheduled.finish);
+                        // The trailing label reaches past the bar's own end.
+                        span.overlaps(left, right + BAR_LABEL_REACH)
                     })
                 {
                     {
@@ -1112,11 +1375,11 @@ pub fn GanttChart(
                 // waits for it, at the date it lands. Held only in a dialog it
                 // is invisible in the one place a planner is actually looking
                 // when they wonder why a bar will not move.
-                for (line_index, index) in rows
+                for (line_index, index) in rows[window.lines()]
                     .iter()
                     .enumerate()
+                    .map(|(offset, row)| (window.first + offset, row))
                     .filter_map(task_line)
-                    .filter(|(line, _)| window.holds(*line))
                 {
                     {
                         let waits = project.externals_of(index);
@@ -1167,12 +1430,18 @@ pub fn GanttChart(
                 }
 
                 if let Some(x) = today_x {
-                    div { class: "gc-today", style: "left: {x - 0.5}px;" }
+                    div {
+                        class: "gc-today",
+                        style: "left: {x - 0.5}px; top: {band_top}px; height: {band_h}px;",
+                    }
                 }
 
                 if tracking {
                     if let Some(x) = status_x {
-                        div { class: "gc-status", style: "left: {x - 0.7}px;" }
+                        div {
+                            class: "gc-status",
+                            style: "left: {x - 0.7}px; top: {band_top}px; height: {band_h}px;",
+                        }
                     }
                 }
 
@@ -1338,13 +1607,13 @@ fn elbow_runs(corners: &[(f64, f64)]) -> Vec<Placement> {
 /// Route an elbow from one bar to another. Returns the legs to paint, the
 /// arrow head position, and whether the head points down rather than right.
 fn arrow_path(
-    boxes: &HashMap<TaskId, BarBox>,
+    boxes: &BarBoxes,
     predecessor: TaskId,
     successor: TaskId,
     kind: LinkType,
 ) -> Option<(Vec<Placement>, f64, f64, bool)> {
-    let from = boxes.get(&predecessor)?;
-    let to = boxes.get(&successor)?;
+    let from = boxes.get(predecessor)?;
+    let to = boxes.get(successor)?;
 
     let (start_x, end_x) = match kind {
         LinkType::FS => (from.right, to.left),
@@ -1408,7 +1677,7 @@ fn arrow_head(x: f64, y: f64, downward: bool) -> Element {
 /// pinned to a bar lands on exactly the bar that was drawn, snapping and all.
 struct ChartView<'a> {
     scale: Scale,
-    boxes: &'a HashMap<TaskId, BarBox>,
+    boxes: &'a BarBoxes,
 }
 
 impl ChartMap for ChartView<'_> {
@@ -1426,7 +1695,7 @@ impl ChartMap for ChartView<'_> {
 
     fn bar(&self, task: TaskId) -> Option<(f64, f64, f64)> {
         self.boxes
-            .get(&task)
+            .get(task)
             .map(|b| (b.left, b.right, b.mid - ROW_H / 2.0))
     }
 }
@@ -1831,6 +2100,23 @@ const BAND_LABEL_GAP: f64 = 5.0;
 /// Padding a label needs to sit inside a bar rather than beside it.
 const BAND_LABEL_PAD: f64 = 10.0;
 
+/// How wide a band has to be before it is worth naming.
+///
+/// The strip is the whole plan squeezed into the width of the window, so there
+/// is no viewport to leave anything out of: every band is drawn, and on a plan
+/// of a hundred and fifty thousand tasks that is seven and a half thousand of
+/// them. Each one used to cost two elements, a blip and a label, and at that
+/// count most of the bands are a fraction of a pixel across. A name written
+/// beside a band nobody can point at is not telling anybody which phase it
+/// belongs to; it is a second element per band, drawn on every frame, above
+/// the panes, whatever the panes are doing.
+///
+/// Three pixels. Below that the band keeps its blip and loses its name, which
+/// also keeps its `span` down to the bar itself and lets the packing put more
+/// of them on a line. Nothing is left out of the picture of the plan: every
+/// phase is still there to be seen and still holds its place.
+const BAND_LABEL_MIN: f64 = 3.0;
+
 /// How many lines of the timeline are on screen before it starts scrolling.
 ///
 /// Not a limit on how many there are. A plan of three hundred phases needs a
@@ -1908,7 +2194,15 @@ pub fn measure_band(
     // this decides which line a band is packed onto, never where it is drawn.
     across: f64,
 ) -> Band {
-    let label = name.trim().to_string();
+    // A milestone is a diamond of fixed size rather than a bar, so its width
+    // says nothing about whether it can be identified: its name is the only
+    // thing that can. Those keep their labels whatever the plan's size.
+    let readable = marker || (right - left) * across.max(1.0) >= BAND_LABEL_MIN;
+    let label = if readable {
+        name.trim().to_string()
+    } else {
+        String::new()
+    };
     let label_w = label.chars().count() as f64 * BAND_CHAR_W / across.max(1.0);
 
     let inside = !marker && !label.is_empty() && label_w + BAND_LABEL_PAD / across.max(1.0) <= right - left;
@@ -1932,6 +2226,60 @@ pub fn measure_band(
 ///
 /// Each span goes on the first line it fits, so a milestone followed straight
 /// away by a task shares a line with it rather than starting a new one.
+/// How many pixels of strip a band is allowed to claim before the strip starts
+/// putting them together.
+///
+/// Two. Below that a band is a mark rather than a bar, and two marks in the
+/// same two pixels are one mark that has been drawn twice.
+const BAND_MERGE_PX: f64 = 2.0;
+
+/// Put together the bands that land in the same sliver of the strip.
+///
+/// The strip is the whole plan squeezed into the width of the window, so
+/// unlike everything else in the chart there is no viewport to leave anything
+/// out of: a plan with seven and a half thousand phases asks for seven and a
+/// half thousand bands and their labels, drawn every frame, and measured
+/// against a plan of that size it was nine tenths of the time the whole window
+/// took to paint.
+///
+/// Nothing is left out of the picture of the plan. Every phase still puts a
+/// mark on the strip; what stops is drawing several of them into the same two
+/// pixels, where they were already indistinguishable. A merged mark spans from
+/// the first of them to the last and loses its label, because a name on a mark
+/// standing for four phases would be naming one of them.
+///
+/// Untouched when the plan is small enough for every band to have room, which
+/// is every ordinary plan: the work here begins only once the strip is asked
+/// for more bands than it has pixels.
+fn merge_crowded(bands: Vec<Band>, across: f64) -> Vec<Band> {
+    let room = (across / BAND_MERGE_PX).max(1.0) as usize;
+    if bands.len() <= room {
+        return bands;
+    }
+
+    // Which sliver of the strip a fraction falls in. The bands arrive sorted
+    // by where they start, so anything sharing a sliver arrives together and
+    // one pass is enough.
+    let sliver = |left: f64| (left * across / BAND_MERGE_PX).floor() as i64;
+
+    let mut out: Vec<Band> = Vec::with_capacity(room + 1);
+    for band in bands {
+        match out.last_mut() {
+            Some(last) if sliver(last.left) == sliver(band.left) => {
+                last.right = last.right.max(band.right);
+                last.span.1 = last.span.1.max(band.span.1);
+                // A merged mark stands for more than one phase, so it stops
+                // claiming to be any of them, and stops reserving the room a
+                // label would have needed beside it.
+                last.label.clear();
+                last.inside = false;
+            }
+            _ => out.push(band),
+        }
+    }
+    out
+}
+
 pub fn pack_lanes(spans: &[(f64, f64)]) -> (Vec<usize>, usize) {
     let mut lane_ends: Vec<f64> = Vec::new();
     let mut lanes = Vec::with_capacity(spans.len());
@@ -2047,22 +2395,30 @@ pub fn TimelineBand() -> Element {
     // drawn in, and the outline order is not always the order they start in.
     bands.sort_by(|a, b| a.span.0.total_cmp(&b.span.0));
 
+    // How many phases the plan actually has, before any of them are merged
+    // into one another. The caption reports this, not what survived.
+    let phases = bands.len();
+    let bands = merge_crowded(bands, across);
+
     let (lane_of, lanes) = pack_lanes(&bands.iter().map(|b| b.span).collect::<Vec<_>>());
 
     // Every band is drawn. Whichever line the packing put it on, that is the
     // line it goes on, and the strip is as tall as the packing made it.
     let placed: Vec<(Band, usize)> = bands.into_iter().zip(lane_of).collect();
 
-    let lane_h = 16.0;
+    // Sixteen of band and four of air. The bands were three pixels shorter
+    // and sat two apart, which packs more of them into the strip and reads as
+    // a stack rather than as a row of things.
+    let lane_h = 20.0;
     // What the strip is, and what is on screen of it. When the second is
     // smaller than the first the band scrolls; the dates and the rule they
     // hang off do not, because they are not in the part that scrolls.
     let full = lanes as f64 * lane_h + 4.0;
     let shown = full.min(BAND_LANES_SHOWN as f64 * lane_h + 4.0);
 
-    let caption = if lanes > BAND_LANES_SHOWN {
-        let noun = if placed.len() == 1 { "phase" } else { "phases" };
-        format!("Timeline \u{2022} {} {noun}", placed.len())
+    let caption = if lanes > BAND_LANES_SHOWN || placed.len() < phases {
+        let noun = if phases == 1 { "phase" } else { "phases" };
+        format!("Timeline \u{2022} {phases} {noun}")
     } else {
         "Timeline".to_string()
     };
@@ -2193,7 +2549,7 @@ mod tests {
             let drawn = scale.x_work(&state.project.calendar, task.scheduled.start);
             let geometry = layout
                 .boxes
-                .get(&task.id)
+                .get(task.id)
                 .map(|b| b.left)
                 .expect("every reported row has geometry");
             assert!(
@@ -2203,6 +2559,420 @@ mod tests {
             );
             assert!(drawn >= 0.0, "{} would be off the left of the canvas", task.name);
         }
+    }
+
+    /// What one frame of a very large plan actually costs, and where.
+    ///
+    /// Not a correctness test, and not run with the suite: `cargo test -p
+    /// aop-app --release -- --ignored --nocapture bench_` prints the figures.
+    /// It exists so a claim about this chart's speed is a measurement rather
+    /// than an opinion, and so the split between what is paid once per change
+    /// and what is paid once per frame stays visible.
+    #[test]
+    #[ignore = "a benchmark, not a test"]
+    fn bench_a_very_large_plan() {
+        use std::time::Instant;
+
+        let count = 150_000;
+        let t = Instant::now();
+        let state = a_plan_of(count);
+        println!(
+            "\n  plan          {:>9.1?}  ({count} tasks, {} links, scheduled)",
+            t.elapsed(),
+            state.project.links.len(),
+        );
+
+        let t = Instant::now();
+        let rows = chart_rows(&state, None);
+        let rows_len = rows.len();
+        println!("  layout_rows   {:>9.1?}  ({rows_len} rows)", t.elapsed());
+
+        let t = Instant::now();
+        let count_only = state.layout_row_count();
+        println!("  row_count     {:>9.1?}  ({count_only})", t.elapsed());
+
+        // Where the layout's time actually goes, phase by phase, so the fix
+        // lands on the part that is costing rather than on the whole of it.
+        {
+            let s = &state;
+            let (from, to) = chart_range(&s.project);
+            let scale = Scale { origin: from, px_per_day: s.zoom.px_per_day() };
+
+            let t = Instant::now();
+            let major = major_ticks(s.zoom, from, to);
+            let minor = minor_ticks(s.zoom, from, to);
+            println!("    ticks       {:>9.1?}  ({} major, {} minor)",
+                     t.elapsed(), major.len(), minor.len());
+
+            let t = Instant::now();
+            let mut nonworking: Vec<f64> = Vec::new();
+            let mut cursor = from;
+            while cursor < to {
+                if !s.project.calendar.is_working_day(cursor) {
+                    nonworking.push(scale.x_date(cursor));
+                }
+                cursor += Duration::days(1);
+            }
+            println!("    nonworking  {:>9.1?}  ({})", t.elapsed(), nonworking.len());
+
+            let rows2 = chart_rows(s, None);
+            let t = Instant::now();
+            let bound = id_bound(&s.project);
+            let mut boxes = BarBoxes::with_room_for(bound);
+            let mut lines = TaskLines::with_room_for(bound);
+            for (line, index) in rows2.iter().enumerate().filter_map(task_line) {
+                let task = &s.project.tasks[index];
+                lines.set(task.id, line);
+                if let Some((left, right)) = bar_edges(&s.project, &scale, s.round_bars, index) {
+                    boxes.set(
+                        task.id,
+                        BarBox { left, right, mid: line as f64 * ROW_H + ROW_H / 2.0 },
+                    );
+                }
+            }
+            println!("    geometry    {:>9.1?}  <- two dense tables, {} bars",
+                     t.elapsed(), boxes.len());
+
+            let t = Instant::now();
+            let index = LinkIndex::build(&s.project.links, &lines, rows2.len());
+            println!("    link index  {:>9.1?}  ({} filed, {} long)",
+                     t.elapsed(), index.filed.len(), index.long.len());
+        }
+
+        let t = Instant::now();
+        let layout = build_layout(&state, rows, None);
+        println!("  build_layout  {:>9.1?}  <- once per change, not per frame", t.elapsed());
+
+        // What a frame actually walks now: the windows, and the arrows.
+        let scale = Scale { origin: layout.from, px_per_day: state.zoom.px_per_day() };
+        let window = RowWindow::new(300_000.0, 900.0, rows_len);
+        let span = SpanWindow::new(40_000.0, 1_500.0);
+
+        let t = Instant::now();
+        let rounds = 100u32;
+        let mut seen = 0usize;
+        for _ in 0..rounds {
+            seen += tick_window(&layout.minor, &scale, &span).len();
+            seen += layout.links.crossing(window).count();
+            seen += layout.rows[window.lines()].len();
+        }
+        println!(
+            "  one frame     {:>9.1?}  ({} elements windowed)\n",
+            t.elapsed() / rounds,
+            seen / rounds as usize,
+        );
+    }
+
+    /// What a frame costs at the size this build is aimed at must not depend
+    /// on the size of the plan.
+    ///
+    /// The benchmark above prints the figures; this one fails the suite when
+    /// they stop holding. Everything asserted here was untrue before the
+    /// windowing went in: the chart walked the whole plan for its bars, its
+    /// arrows, its ticks and its shaded days, and drew gridlines as tall as
+    /// the whole canvas, so a hundred and fifty thousand rows cost a hundred
+    /// and fifty thousand rows' worth of work to show forty of them.
+    ///
+    /// A hundred and fifty thousand tasks takes a moment to build and to
+    /// schedule even optimised, so it is out of the ordinary run:
+    ///
+    ///     cargo test -p aop-app --release -- --ignored at_a_hundred
+    #[test]
+    #[ignore = "builds a hundred and fifty thousand tasks"]
+    fn a_frame_at_a_hundred_and_fifty_thousand_rows_costs_a_windowful() {
+        let count = 150_000;
+        let state = a_plan_of(count);
+
+        let rows = chart_rows(&state, None);
+        let rows_len = rows.len();
+        assert_eq!(rows_len, count, "every task is a row");
+        let layout = build_layout(&state, rows, None);
+
+        // Somewhere down the middle, so nothing is being saved by the window
+        // happening to sit at an end of the plan.
+        let half = rows_len as f64 * ROW_H / 2.0;
+        let tall = 900.0;
+        let window = RowWindow::new(half, tall, rows_len);
+        let span = SpanWindow::new(4_000.0, 1_500.0);
+        let scale = Scale { origin: layout.from, px_per_day: state.zoom.px_per_day() };
+
+        // Generous: the window is the viewport plus its overscan plus the
+        // block it snaps to, and this is about orders of magnitude, not about
+        // pinning the constants in `viewport`.
+        let ceiling = (tall / ROW_H) as usize + BLOCK_ALLOWANCE;
+
+        let drawn = window.lines().len();
+        assert!(
+            drawn <= ceiling,
+            "{drawn} rows drawn for a {tall}px pane: the row window is not cutting the plan down"
+        );
+        // Not vacuous: a window over the middle of the plan has rows in it,
+        // and a test that passes because nothing was drawn is a test that
+        // passes when the chart is blank.
+        assert!(drawn > 0, "the window is over the middle of the plan and drew nothing");
+
+        let arrows = layout.links.crossing(window).count();
+        assert!(
+            arrows <= ceiling,
+            "{arrows} arrows for {drawn} rows out of {} links: the link index is not cutting the \
+             plan down",
+            state.project.links.len()
+        );
+        assert!(
+            arrows > 0,
+            "every row but one in twenty is linked to the next, so a window of {drawn} rows \
+             crosses arrows"
+        );
+        // The point of the index, stated as a ratio rather than a count: what
+        // comes back is a windowful whatever the plan holds.
+        assert!(
+            arrows * 100 < state.project.links.len(),
+            "{arrows} of {} links came back, which is not a window",
+            state.project.links.len()
+        );
+
+        let ticks = tick_window(&layout.minor, &scale, &span).len();
+        assert!(
+            ticks <= layout.minor.len(),
+            "the tick window cannot hand back more ticks than the timescale has"
+        );
+
+        // The furniture that runs down the chart is cut to the drawn rows, not
+        // to the canvas. A gridline as tall as the plan is three and a third
+        // million pixels of box that this renderer turns into strips a
+        // scanline at a time, and it was half a second a frame.
+        let band_h = window.lines().len() as f64 * ROW_H;
+        let canvas_h = rows_len as f64 * ROW_H;
+        assert!(
+            band_h < canvas_h / 100.0,
+            "the drawn band is {band_h}px of a {canvas_h}px canvas, which is not a window"
+        );
+    }
+
+    /// What the timeline band costs on a plan of this size, which is the one
+    /// part of the window that has no viewport to be windowed against.
+    ///
+    /// The strip is the whole plan squeezed into the width of the window, so
+    /// "what is on screen" is all of it by construction, and the code says so:
+    /// *every* band is drawn. A band is a top level task, and it costs two
+    /// elements, a blip and its label. On a plan with a phase every twentieth
+    /// row that is a fixed cost proportional to the plan and paid on every
+    /// frame, above the panes, whatever the panes are doing.
+    ///
+    /// This does not assert a budget, because what to do about it is a choice
+    /// rather than a bug: the comment on the strip says nothing is left out of
+    /// the picture of the plan, and that is a decision. It prints the numbers
+    /// so the decision is made against them.
+    ///
+    ///     cargo test -p aop-app --release -- --ignored --nocapture what_the_timeline
+    #[test]
+    #[ignore = "builds a hundred and fifty thousand tasks"]
+    fn what_the_timeline_band_costs_on_a_very_large_plan() {
+        // The strip's own width, near enough: a maximised window less the
+        // caption, the two dates and the padding.
+        let across = 1700.0;
+
+        for count in [500usize, 150_000] {
+            let state = a_plan_of(count);
+            let project = &state.project;
+
+            // Measured by the strip's own function, not by arithmetic written
+            // here to look like it. A number from a copy of the code is a
+            // number about the copy.
+            let bands: Vec<Band> = (0..project.tasks.len())
+                .filter(|&i| project.tasks[i].outline_level == 0)
+                .map(|index| {
+                    let task = &project.tasks[index];
+                    let left = (task.scheduled.start - project.start_date).num_minutes() as f64
+                        / (project.finish_date - project.start_date).num_minutes().max(1) as f64;
+                    let right = (task.scheduled.finish - project.start_date).num_minutes() as f64
+                        / (project.finish_date - project.start_date).num_minutes().max(1) as f64;
+                    measure_band(index, left, right.max(left), &task.name, false, across)
+                })
+                .collect();
+
+            let labelled = bands.iter().filter(|b| !b.label.is_empty()).count();
+            let (_, lanes) = pack_lanes(&bands.iter().map(|b| b.span).collect::<Vec<_>>());
+
+            println!(
+                "\n  {count} tasks\n    bands        {}\n    labelled     {labelled}\
+                 \n    elements     {}  (was {} with a label on every band)\
+                 \n    lanes        {lanes}",
+                bands.len(),
+                bands.len() + labelled,
+                bands.len() * 2,
+            );
+        }
+    }
+
+    /// How much wider than the viewport the row window is allowed to be.
+    ///
+    /// The window snaps to a block so that scrolling does not rebuild the
+    /// chart every row, and it draws an overscan either side of that. Both are
+    /// counted in rows and both are small; this is their sum with room to
+    /// spare, so tuning either does not fail the test above.
+    const BLOCK_ALLOWANCE: usize = 64;
+
+    /// A plan of `count` tasks: a summary every twentieth row, its children
+    /// chained under it. The same shape `aop-core`'s `big_plan` example
+    /// writes, so a figure from the suite and a figure from the application
+    /// are measuring the same thing.
+    fn a_plan_of(count: usize) -> AppState {
+        let mut state = AppState::new();
+        // Read before the loop: the tasks are borrowed mutably inside it.
+        let start = state.project.start_date;
+        for index in 0..count {
+            let at = state.project.tasks.len();
+            state.project.insert_task(at, format!("Task {index}"));
+            if let Some(task) = state.project.tasks.last_mut() {
+                task.outline_level = if index % GROUP == 0 { 0 } else { 1 };
+                task.duration_minutes = 480;
+                task.estimated = false;
+                // The first step of each phase is pinned, which drags the
+                // phase with it; pinning the summary would do nothing,
+                // because a summary is driven by its children.
+                if index % GROUP == 1 {
+                    let offset = (index / GROUP) as i64 % SPREAD;
+                    task.constraint = aop_core::ConstraintType::StartNoEarlierThan;
+                    task.constraint_date = Some(start + Duration::days(offset));
+                }
+            }
+        }
+        let ids: Vec<TaskId> = state.project.tasks.iter().map(|task| task.id).collect();
+        for index in 0..count.saturating_sub(1) {
+            if index % GROUP != 0 && index % GROUP != GROUP - 1 {
+                state
+                    .project
+                    .links
+                    .push(aop_core::Link::finish_to_start(ids[index], ids[index + 1]));
+            }
+        }
+        state.reschedule();
+        state
+    }
+
+    /// Rows per summary, and how many days the phases are spread over before
+    /// wrapping. The same two numbers `aop-core`'s `big_plan` example uses, so
+    /// a figure from the suite and a figure from the application are measuring
+    /// the same plan.
+    const GROUP: usize = 20;
+    const SPREAD: i64 = 500;
+
+    /// The index has to give the same answer the walk gave.
+    ///
+    /// The walk asked `RowWindow::spans` about every link in the plan. The
+    /// index answers from a slice and a short list of the links that reach too
+    /// far to file, which is a different route to what has to be the same set:
+    /// an arrow that goes missing here is an arrow missing from the chart, and
+    /// nothing on screen would say why.
+    #[test]
+    fn the_link_index_answers_what_the_walk_answered() {
+        let mut state = AppState::new();
+        // Long enough that the window is a small part of it and that links can
+        // reach further than `LONG_LINK`, so both halves of the index are
+        // exercised rather than only the filed one.
+        let count = LONG_LINK * 3;
+        for index in 0..count {
+            state.append_task(&format!("T{index}"));
+        }
+        let ids: Vec<TaskId> = state.project.tasks.iter().map(|t| t.id).collect();
+
+        // A spread of reaches: the neighbourly ones that get filed, and a few
+        // that cross most of the plan and go in the long list.
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for from in (0..count - 1).step_by(7) {
+            pairs.push((from, from + 1));
+        }
+        for from in (0..count / 2).step_by(101) {
+            pairs.push((from, from + count / 2));
+        }
+        // Backwards, so the index cannot be relying on the predecessor being
+        // the higher of the two rows.
+        for from in (10..count).step_by(313) {
+            pairs.push((from, from - 10));
+        }
+        for &(a, b) in &pairs {
+            state.project.links.push(aop_core::Link::finish_to_start(ids[a], ids[b]));
+        }
+        state.reschedule();
+
+        let rows = chart_rows(&state, None);
+        let rows_len = rows.len();
+        let layout = build_layout(&state, rows, None);
+        assert_eq!(layout.rows.len(), count, "every task is a row");
+        assert!(!layout.links.long.is_empty(), "the long list has to be under test too");
+        assert!(!layout.links.filed.is_empty(), "so does the filed one");
+
+        for top in [0.0, 137.0, 4000.0, 19_000.0, 90_000.0] {
+            let window = RowWindow::new(top, 700.0, rows_len);
+
+            // What the walk would have said, straight out of the plan.
+            let mut expected: Vec<usize> = state
+                .project
+                .links
+                .iter()
+                .enumerate()
+                .filter(|(_, link)| {
+                    match (
+                        layout.lines.get(link.predecessor),
+                        layout.lines.get(link.successor),
+                    ) {
+                        (Some(a), Some(b)) => window.spans(a, b),
+                        _ => false,
+                    }
+                })
+                .map(|(index, _)| index)
+                .collect();
+
+            let mut got: Vec<usize> = layout.links.crossing(window).collect();
+            expected.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, expected, "at scroll {top}");
+            // Scrolled past the last row there is nothing to cross, and the
+            // two agreeing on nothing is still the two agreeing. Anywhere the
+            // window holds rows, this plan links every seventh one, so an
+            // empty answer there would mean the index had lost them.
+            if window.end > window.first {
+                assert!(!got.is_empty(), "at scroll {top} the window should cross links");
+            }
+        }
+    }
+
+    /// Scrolling must not cost a pass over the plan.
+    ///
+    /// The point of the index is that what comes back is a windowful whatever
+    /// the plan's size, so this pins the size of the answer rather than the
+    /// time it took to reach: a regression that goes back to walking would
+    /// hand back every link that spans the window, which on a plan this shape
+    /// is most of them.
+    #[test]
+    fn a_window_costs_a_windowful_of_arrows() {
+        let mut state = AppState::new();
+        let count = 4_000;
+        for index in 0..count {
+            state.append_task(&format!("T{index}"));
+        }
+        let ids: Vec<TaskId> = state.project.tasks.iter().map(|t| t.id).collect();
+        for from in 0..count - 1 {
+            state
+                .project
+                .links
+                .push(aop_core::Link::finish_to_start(ids[from], ids[from + 1]));
+        }
+        state.reschedule();
+
+        let rows = chart_rows(&state, None);
+        let rows_len = rows.len();
+        let layout = build_layout(&state, rows, None);
+
+        let window = RowWindow::new(20_000.0, 700.0, rows_len);
+        let drawn = layout.links.crossing(window).count();
+        let on_screen = window.end - window.first;
+        assert!(
+            drawn <= on_screen + 2,
+            "{drawn} arrows for {on_screen} rows: the window is not cutting the plan down"
+        );
+        assert!(drawn > 0, "the window is over linked rows, so it should have arrows");
     }
 
     #[test]
@@ -2228,20 +2998,20 @@ mod tests {
         let window = RowWindow { first: 0, end: rows_len, above: 0.0, below: 0.0 };
         let span = SpanWindow { left: f64::NEG_INFINITY, right: f64::INFINITY };
 
-        let drawn = layout
-            .rows
+        // The same two steps the bar loop takes: slice to the rows on screen,
+        // then keep the ones whose bar is inside the stretch of timescale.
+        let drawn = layout.rows[window.lines()]
             .iter()
             .enumerate()
+            .map(|(offset, row)| (window.first + offset, row))
             .filter_map(task_line)
-            .filter(|(line, index)| {
-                window.holds(*line) && {
-                    // The geometry the layout already worked out, which is
-                    // the same span the bar loop tests against.
-                    let id = state.project.tasks[*index].id;
-                    match layout.boxes.get(&id) {
-                        Some(box_) => span.overlaps(box_.left, box_.right),
-                        None => false,
-                    }
+            .filter(|(_, index)| {
+                // The geometry the layout already worked out, which is the
+                // same span the bar loop tests against.
+                let id = state.project.tasks[*index].id;
+                match layout.boxes.get(id) {
+                    Some(box_) => span.overlaps(box_.left, box_.right),
+                    None => false,
                 }
             })
             .count();
@@ -2607,9 +3377,9 @@ mod body_boxes_tests {
         // The route is untouched; only what paints it changed. A finish to
         // start link between two bars clear of each other elbows through one
         // corner and arrives pointing right.
-        let mut boxes = HashMap::new();
-        boxes.insert(1, BarBox { left: 0.0, right: 40.0, mid: 11.0 });
-        boxes.insert(2, BarBox { left: 90.0, right: 130.0, mid: 33.0 });
+        let mut boxes = BarBoxes::with_room_for(3);
+        boxes.set(1, BarBox { left: 0.0, right: 40.0, mid: 11.0 });
+        boxes.set(2, BarBox { left: 90.0, right: 130.0, mid: 33.0 });
         let (legs, head_x, head_y, downward) =
             arrow_path(&boxes, 1, 2, LinkType::FS).expect("both bars are drawn");
         assert_eq!((head_x, head_y, downward), (90.0, 33.0, false));

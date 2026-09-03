@@ -306,6 +306,28 @@ impl Action {
 ///
 /// Returns `None` for a press that is only a modifier, so holding Ctrl on its
 /// own is not treated as a shortcut or recorded as one.
+/// Whether the "this is a command" modifier is held.
+///
+/// The bindings are all written with `Ctrl`, because that is what they are
+/// called in the keyboard page and on the two platforms where that is the key.
+/// A Mac keyboard does not work that way: the command key is Cmd, which
+/// arrives as `META`, and reading only `CONTROL` meant that on macOS every
+/// shortcut with a modifier resolved to the bare letter and nothing matched.
+/// Cmd+S saved nothing.
+///
+/// Ctrl is still accepted there as well as Cmd. A planner who came from
+/// Windows and presses the key they are used to gets what they meant, and
+/// there is no binding it could be confused with.
+fn is_accelerator(modifiers: Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.contains(Modifiers::META) || modifiers.contains(Modifiers::CONTROL)
+    } else {
+        // Not `META` here: that is the Windows key and the Super key, which
+        // belong to the desktop rather than to this application.
+        modifiers.contains(Modifiers::CONTROL)
+    }
+}
+
 pub fn shortcut_for(key: &Key, modifiers: Modifiers) -> Option<String> {
     let name = match key {
         Key::Character(text) => {
@@ -346,7 +368,7 @@ pub fn shortcut_for(key: &Key, modifiers: Modifiers) -> Option<String> {
     };
 
     let mut parts = Vec::new();
-    if modifiers.contains(Modifiers::CONTROL) {
+    if is_accelerator(modifiers) {
         parts.push("Ctrl");
     }
     if modifiers.contains(Modifiers::ALT) {
@@ -494,6 +516,16 @@ mod tests {
     fn holding_a_modifier_on_its_own_is_not_a_shortcut() {
         // Otherwise reaching for Ctrl would be recorded as a binding.
         assert_eq!(shortcut_for(&Key::Control, Modifiers::CONTROL), None);
+
+        // The command key. On macOS Cmd is what a planner presses and it
+        // arrives as `META`; everywhere else `META` is the desktop's own key
+        // and means nothing here.
+        let meta = shortcut_for(&Key::Character("s".into()), Modifiers::META);
+        if cfg!(target_os = "macos") {
+            assert_eq!(meta.as_deref(), Some("Ctrl+S"), "Cmd+S has to be a shortcut on macOS");
+        } else {
+            assert_eq!(meta.as_deref(), Some("S"), "the Super key is not an accelerator here");
+        }
         assert_eq!(shortcut_for(&Key::Shift, Modifiers::SHIFT), None);
     }
 

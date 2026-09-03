@@ -329,6 +329,8 @@ pub static CSS: LazyLock<String> =
     LazyLock::new(|| format!("{}{}{RULES}", face(), root_block(Palette::Dark)));
 
 
+
+
 /// The bundled font, declared so the webview can use the same one the native
 /// build registers directly.
 ///
@@ -382,6 +384,14 @@ body {
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
+
+/* What the backstage is covering.
+
+   The backstage is `position: fixed` over the whole window and opaque, so
+   everything under it is work with no viewer. `display: none` takes the
+   subtree out of layout as well as out of paint, which is the point: on a
+   large plan the chart behind the page cost more per frame than the page. */
+.app.covered > *:not(.backstage) { display: none; }
 
 .app {
   display: flex;
@@ -1184,9 +1194,19 @@ button { font: inherit; color: inherit; }
   flex-wrap: wrap;
   gap: 16px;
   width: 100%;
-}/* Flex has no track list, so the basis lives on the children. */
-.tpl-grid > * { flex: 1 1 212px; max-width: 320px; }
+  /* The last row has fewer cards in it than the ones above, and without this
+     it would centre them or stretch them. They start at the left, under the
+     card above, like every other row. */
+  justify-content: flex-start;
+}
 
+/* Every card the same size, in every row.
+   Flex has no track list, so the basis lives on the children, and it has to be
+   a basis that does not grow: `flex: 1 1 212px` let the cards share out the
+   slack, so a row of two came out half as wide again as a row of four and the
+   gallery had a different card size per row. A fixed basis with no grow and no
+   shrink gives one width everywhere and lets the wrap fall where it falls. */
+.tpl-grid > * { flex: 0 0 236px; }
 
 .tpl-card {
   justify-content: flex-start;
@@ -1199,23 +1219,63 @@ button { font: inherit; color: inherit; }
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  transition: border-color 0.15s, transform 0.15s;
+  /* The same height whatever is written in it. The thumbnail is a fixed 128
+     and the caption takes the rest, so a card with a description and a card
+     without still line up: `align-items: stretch` only levels the cards within
+     one row, and a gallery is several rows. */
+  height: 218px;
+  /* No transform. A transformed box escapes its parent's clip on the native
+     renderer, and this one sits inside a backstage page that scrolls, so a
+     lifted card would paint over the heading above it. The colour and the
+     shadow say the same thing and cost nothing. */
+  transition: border-color 0.14s ease, background 0.14s ease, box-shadow 0.14s ease;
 }
 
-.tpl-card:hover { border-color: var(--accent-line); transform: translateY(-2px); }
+.tpl-card:hover {
+  border-color: var(--accent-line);
+  background: var(--surface-2);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+}
+
+.tpl-card:active { background: var(--surface-3); }
+
+/* The thumbnail lifts with the card, so the whole card reads as one target
+   rather than a picture with a frame that reacts on its own. */
+.tpl-card:hover .tpl-thumb { border-bottom-color: var(--accent-line); }
+.tpl-card:hover .tpl-name { color: var(--accent-bright); }
 
 .tpl-thumb {
   height: 128px;
+  flex: none;
   background: var(--surface-2);
   border-bottom: 1px solid var(--line);
   position: relative;
   overflow: hidden;
+  transition: border-color 0.14s ease;
 }
 
-.tpl-thumb svg { display: block; width: 100%; height: 100%; }
+/* The thumbnail is a wrapper with the drawing parsed inside it, so both the
+   wrapper and the drawing have to fill the frame. */
+.tpl-thumb svg, .mini-gantt svg { display: block; width: 100%; height: 100%; }
+.mini-gantt { display: block; width: 100%; height: 100%; }
 
-.tpl-meta { padding: 9px 11px 11px; }
-.tpl-name { font-size: 12.5px; font-weight: 600; color: var(--ink); }
+/* Takes whatever the thumbnail leaves, so the card's height is the card's and
+   not the caption's. */
+.tpl-meta {
+  padding: 9px 11px 11px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+.tpl-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color 0.14s ease;
+}
 .tpl-desc { font-size: 11px; color: var(--ink-soft); margin-top: 4px; line-height: 1.4; }
 .tpl-count { font-size: 10.5px; color: var(--accent); margin-top: 6px; letter-spacing: 0.2px; }
 
@@ -2196,8 +2256,23 @@ button { font: inherit; color: inherit; }
    the size of my contents" and the contents are the whole plan. */
 .pane.right { flex: 1 1 0; min-width: 120px; }
 
-.pane-head { flex: none; overflow: hidden; }
-.pane-body { flex: 1 1 0; min-height: 0; overflow: hidden; }
+/* Both carry a `z-index` they do not need for stacking, and it is load
+   bearing.
+
+   A positioned box with a non-auto `z-index` is lifted out of the paint order
+   here and drawn from the nearest ancestor that is a stacking context, and
+   `overflow: hidden` does not make an ancestor one: only opacity, a transform,
+   or a position with a `z-index` of its own. So a box that was lifted skipped
+   every clip between it and wherever it landed. Three of them sit inside these
+   panes: the live session's pointers, the grip that widens a column and the
+   predecessor picker's cell, and all three were painted across whatever
+   happened to be beside the pane.
+
+   `z-index: 0` changes nothing about what is in front of what, because these
+   two are siblings that never overlap. What it changes is that a lift stops
+   here, inside the clip, instead of carrying on past it. */
+.pane-head { flex: none; overflow: hidden; position: relative; z-index: 0; }
+.pane-body { flex: 1 1 0; min-height: 0; overflow: hidden; position: relative; z-index: 0; }
 
 /* Always there, whether or not there is anywhere to go, so the bottom edge of
    the window does not move as columns are widened. */
@@ -2853,26 +2928,52 @@ button { font: inherit; color: inherit; }
   position: absolute;
   left: 0;
   right: 0;
+  background: var(--grid-header);
 }
 .tl-tier-major { top: 0; border-bottom: 1px solid var(--line); }
 
 /* One tick. A rule down its left edge and its label centred in what is left,
    which is the whole of what the drawn version was doing. */
+/* No clip, for the reason the table's cells have none: a clipping box costs
+   the renderer a painting layer, and a layer here is not one of a few but one
+   per tick. A screenful of day columns plus the window's margin either side is
+   the better part of two hundred of them, pushed and popped every frame, and
+   at that count building the frame's command buffer costs longer than half a
+   second. It was the single largest thing in the frame.
+
+   Nothing is lost. A label that will not fit its column is already cut to
+   nothing in Rust before it gets here, by `gantt::fit`, which is the same
+   answer `grid::shorten` gives the table. `white-space: nowrap` keeps a label
+   that does fit on one line. */
 .tl-cell {
   position: absolute;
   top: 0;
   box-sizing: border-box;
+  /* Solid, like the table's own headings.
+     `.chart-head` paints this colour underneath, but the cells are placed
+     absolutely across it and the chart's gridlines run up to it, so the head
+     read as something the plan showed through rather than as a heading over
+     it. Every cell paints its own ground for the same reason a `th` does. */
+  background: var(--grid-header);
   border-left: 1px solid var(--line);
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
   white-space: nowrap;
   font-size: 10px;
   color: var(--ink-soft);
 }
 .tl-tier-major .tl-cell { color: var(--ink); }
 .tl-cell.weekend { color: var(--ink-faint); }
+
+/* The lower tier carries no rule of its own.
+   A line between every day turns the heading into a grid, and a heading is
+   supposed to read as one bar: the table's own heading rules between columns,
+   of which there are eight, not between every cell it could have drawn. The
+   tier above still rules between weeks, which is the division a reader is
+   actually using, and the day letters are spaced plainly enough to be read
+   without a line between each of them. */
+.tl-tier-minor .tl-cell { border-left: 0; }
 
 /* ---------- the chart body ---------- */
 
@@ -2892,8 +2993,13 @@ button { font: inherit; color: inherit; }
 .chart-sheet.drawing { cursor: crosshair; }
 .chart-sheet.moving { cursor: move; }
 
-/* A day nobody works, shaded the full height of the chart. */
-.gc-nonworking { position: absolute; top: 0; bottom: 0; background: var(--nonworking); }
+/* A day nobody works, shaded down the rows that are drawn.
+
+   The top and the height are written by the chart, not here: they follow the
+   row window, because a box as tall as the whole plan costs this renderer a
+   scanline at a time whether or not any of it is on screen. Same for the
+   gridlines and the two date markers below. */
+.gc-nonworking { position: absolute; background: var(--nonworking); }
 
 /* The strip behind a grouping band's row. */
 .gc-band { position: absolute; left: 0; right: 0; background: var(--grid-header); }
@@ -2904,19 +3010,17 @@ button { font: inherit; color: inherit; }
    from the date's own pixel rightwards, so the rule under a tick and the rule
    beside its label are the same rule. */
 .gc-rule-h { position: absolute; left: 0; right: 0; height: 1px; background: var(--grid-line); }
-.gc-rule-v { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--grid-line); }
+.gc-rule-v { position: absolute; width: 1px; background: var(--grid-line); }
 
 /* Today, and the status date a tracking view is measured against. The dashes
    are a repeating gradient because a background is the only thing a box has
    that can be broken up, where a stroke had a dash pattern. */
 .gc-today {
   position: absolute;
-  top: 0;
-  bottom: 0;
   width: 1px;
   background: repeating-linear-gradient(180deg, var(--today) 0 4px, transparent 4px 7px);
 }
-.gc-status { position: absolute; top: 0; bottom: 0; width: 1.4px; background: var(--contextual); }
+.gc-status { position: absolute; width: 1.4px; background: var(--contextual); }
 
 /* One task's boxes, and one link's. Each wrapper covers the canvas and takes
    no pointer of its own, so it stands in exactly for the group it replaces: it
@@ -3061,6 +3165,13 @@ button { font: inherit; color: inherit; }
   flex: none;
   overflow-y: auto;
   overflow-x: hidden;
+  /* Clear of the head above it.
+     The head is the dates, the rule they hang off and the word in the corner,
+     and it is a fixed twenty two pixels with nothing under it. The first lane
+     of bands began immediately below, so a band and the date over it were
+     touching, and on a plan whose first phase starts at the left edge the two
+     ran into each other. */
+  margin-top: 15px;
 }
 
 /* The plan itself, inset from both ends of the strip: the left clears the word
@@ -3085,6 +3196,11 @@ button { font: inherit; color: inherit; }
   background: var(--line);
 }
 
+/* The two dates at the ends of the axis, and the word over the corner. Project
+   prints these plainly; the only change is that they are quieter than the
+   bands, because the bands are the content and the dates are the scale. */
+.tl-edge { letter-spacing: 0.2px; }
+
 .tl-edge {
   position: absolute;
   top: 1px;
@@ -3097,13 +3213,22 @@ button { font: inherit; color: inherit; }
 .tl-edge.end { right: 0; }
 
 /* One phase. Placed and sized as a share of the strip; only its height and its
-   corners are in pixels, because those do not depend on how long the plan is. */
+   corners are in pixels, because those do not depend on how long the plan is.
+
+   Shaped the way Project shapes a timeline bar, which is the thing every
+   planner arriving here has used: a solid block with its name in it, heavy
+   enough to read as an object rather than as a rule. What is different is the
+   finish. The corners are rounder than Project's square ends, the edge is the
+   band's own colour darkened rather than a hard outline, and there is one soft
+   shadow under it so the strip reads as bands lying on a surface instead of
+   ink printed into it. */
 .tl-blip {
   position: absolute;
-  height: 13px;
-  border-radius: 3px;
+  height: 16px;
+  border-radius: 4px;
   border: 1px solid transparent;
   box-sizing: border-box;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
 }
 
 /* A milestone is a moment, not a stretch, so it is a fixed diamond centred on
@@ -3113,24 +3238,37 @@ button { font: inherit; color: inherit; }
    cut its contents off; a clip path is a shape, not a movement, so the strip
    still gets to do its job. */
 .tl-blip.marker {
-  width: 10px;
-  height: 10px;
-  margin-left: -5px;
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  margin-top: 2px;
+  border-radius: 0;
+  /* A cut shape takes no shadow worth having, and a diamond with one reads as
+     a smudge at this size. */
+  box-shadow: none;
   clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
 }
 
 .tl-blip-label {
   position: absolute;
-  height: 13px;
-  line-height: 13px;
-  font-size: 10px;
+  height: 16px;
+  line-height: 16px;
+  font-size: 10.5px;
   color: var(--ink-soft);
   white-space: nowrap;
   /* The label is a caption on the band, never a thing to catch a pointer. */
   pointer-events: none;
-  margin-left: 5px;
+  margin-left: 7px;
 }
-.tl-blip-label.in { font-weight: 600; margin-left: 5px; }
+
+/* A name written inside its own band sits on the band's colour, so it takes
+   the band's ink and a little more weight; one written beside a band that was
+   too short to hold it stays the quieter of the two. */
+.tl-blip-label.in {
+  font-weight: 600;
+  margin-left: 8px;
+  letter-spacing: 0.1px;
+}
 
 /* ---------- reports ---------- */
 

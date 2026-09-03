@@ -271,6 +271,36 @@ fn App() -> Element {
     use_context_provider(|| Signal::new(crate::state::from_command_line()));
     let mut state = use_context::<Signal<AppState>>();
 
+    // The plan named on the command line is opened after the first paint, not
+    // during it. See `state::from_command_line`, which no longer opens it.
+    //
+    // Read from the arguments again rather than carried out of the provider
+    // above: the provider's closure runs once and returns one thing, and
+    // reaching a second value out of it means a hook inside a hook, which is
+    // the one rule the hook order depends on.
+    let asked = use_hook(crate::state::asked_for_on_the_command_line);
+    use_future(move || {
+        let asked = asked.clone();
+        async move {
+            let Some(what) = asked else {
+                return;
+            };
+            // Long enough for the splash to have reached the screen, not
+            // merely to have been rendered.
+            //
+            // A frame is built, handed to the renderer and painted, and only
+            // the first of those has happened when the tree is done. Yielding
+            // for a frame's worth of time put the parse in front of the paint
+            // and the window stayed black; a third of a second is past any
+            // first paint on this renderer and is not a delay anybody can see
+            // against a load that takes several seconds. It costs a plan that
+            // opens instantly a third of a second of splash, which is what a
+            // splash is for.
+            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+            state.write().open_what_was_asked(what);
+        }
+    });
+
     // The window size is kept apart from the plan. It changes for reasons that
     // have nothing to do with the document, and anything sharing a signal with
     // it would be re-rendered every time the window moved a pixel.
@@ -289,6 +319,7 @@ fn App() -> Element {
     let mut viewport = use_context_provider(|| Signal::new(crate::state::Viewport::default()));
     use_context_provider(crate::floating::Layer::new);
     watch_the_window(viewport);
+    watch_the_keyboard(state);
 
     // Snapshot the plan on a timer so that a crash, a kill, or a power cut
     // costs at most one interval of work rather than everything since the last
@@ -532,12 +563,42 @@ fn App() -> Element {
     // media query inside it rather than a separate code path.
     let palette = state.read().theme.overlay();
 
+    // The splash comes first and alone.
+    //
+    // It used to be drawn over the application: the whole tree was built, and
+    // the splash sat on top of it. That is the wrong way round on this
+    // renderer, because nothing reaches the screen until the entire tree has
+    // been built and resolved, which on this application is about ten seconds.
+    // The splash was in that frame, so the splash waited for the thing it
+    // exists to cover, and the window was black until both were ready.
+    //
+    // A tree of one box is on screen in about half a second. So while the
+    // splash is up that is the whole tree; the application is built when it
+    // comes down. The build still takes as long as it takes and still holds
+    // the thread while it does, but the last frame painted stays on screen
+    // throughout, so what somebody watches is the splash rather than nothing.
+    if splash {
+        return rsx! {
+            Stylesheet {}
+            Palette { css: palette }
+            Splash {}
+        };
+    }
+
     rsx! {
         Stylesheet {}
         Palette { css: palette }
 
         div {
-            class: "app",
+            // The backstage covers the window, so what is under it does not
+            // need painting. Marked rather than unmounted: taking the
+            // workspace out of the tree and putting it back is a mutation the
+            // size of the plan each way, where a class is one attribute and
+            // `display: none` costs this renderer nothing at all. On a plan of
+            // a hundred and fifty thousand tasks the chart was still being
+            // laid out and painted in full behind an opaque page, every frame,
+            // for nobody.
+            class: if backstage.is_some() { "app covered" } else { "app" },
             tabindex: "0",
             // Focused at start up, because every keyboard shortcut in this
             // application is handled by the `onkeydown` below and a key press
@@ -546,10 +607,30 @@ fn App() -> Element {
             // nothing asking is indistinguishable from every shortcut being
             // broken.
             autofocus: true,
-            onkeydown: move |event| handle_shortcut(&mut state, event),
+            onkeydown: move |event| {
+                // The webview-free build reads its keys from the window
+                // instead; see `watch_the_keyboard`.
+                #[cfg(feature = "desktop")]
+                handle_shortcut(&mut state, event);
+                #[cfg(all(feature = "native", not(feature = "desktop")))]
+                let _ = event;
+            },
             // Measured on the webview build only, where an element can be
             // measured safely. See `watch_the_window` for the other build.
             onmounted: move |_event| async move {
+                // Ask for the focus rather than hoping `autofocus` gave it.
+                //
+                // Every shortcut in this application hangs off the `onkeydown`
+                // below, and a key press goes to whatever holds the focus. In
+                // a webview the document holds it from the start. Here nothing
+                // does until something asks, and `autofocus` on this element
+                // was not enough on its own: nothing had the focus, so no key
+                // ever reached the handler and every shortcut, Delete
+                // included, did nothing at all.
+                #[cfg(all(feature = "native", not(feature = "desktop")))]
+                {
+                    let _ = _event.set_focus(true).await;
+                }
                 #[cfg(feature = "desktop")]
                 match _event.get_client_rect().await {
                     Ok(rect) if rect.width() > 0.0 && rect.height() > 0.0 => {
@@ -648,9 +729,6 @@ fn App() -> Element {
         // same thing as `fixed` did. See `crate::floating`.
         floating::Host {}
 
-        if splash {
-            Splash {}
-        }
 
         // Last, so it sits over the splash as well. On a first run the licence
         // is the only thing on screen and nothing behind it is reachable until
@@ -774,9 +852,24 @@ fn watch_the_window(mut viewport: Signal<crate::state::Viewport>) {
     };
 
     let first = read();
+    let at_start = window.clone();
     use_hook(move || {
         if first.0 > 0.0 && first.1 > 0.0 {
-            applog::applog!("window: {:.0} by {:.0}", first.0, first.1);
+            // The surface and the scale as well as the answer, because the
+            // three together are what says whether the document is being
+            // drawn at the display's own resolution. A scene painted at one
+            // scale and presented into a surface built for another is upscaled
+            // by the compositor, and upscaling is invisible on a filled
+            // rectangle and ruinous on eleven pixel text.
+            let surface = at_start.surface_size();
+            applog::applog!(
+                "window: {:.0} by {:.0} logical, {} by {} surface, scale {:.3}",
+                first.0,
+                first.1,
+                surface.width,
+                surface.height,
+                at_start.scale_factor(),
+            );
             viewport.set(first);
         }
     });
@@ -790,6 +883,10 @@ fn watch_the_window(mut viewport: Signal<crate::state::Viewport>) {
         // Written only on a real change. Writing re-renders, a re-render
         // reflows, and a reflow can produce another resize.
         if (width - was_w).abs() >= 1.0 || (height - was_h).abs() >= 1.0 {
+            applog::applog!(
+                "window: resized to {width:.0} by {height:.0} logical, scale {:.3}",
+                window.scale_factor(),
+            );
             viewport.set((width, height));
         }
     });
@@ -798,6 +895,159 @@ fn watch_the_window(mut viewport: Signal<crate::state::Viewport>) {
 /// The webview build measures its own root element instead.
 #[cfg(feature = "desktop")]
 fn watch_the_window(_viewport: Signal<crate::state::Viewport>) {}
+
+/// Take the shortcuts from the window rather than from the document.
+///
+/// A key press goes to whatever holds the focus, and on this renderer that is
+/// not dependable: the shortcuts worked while the backstage was up, because
+/// the backstage had the focus, and stopped the moment it closed, because
+/// nothing took the focus back. Asking for it on mount is not enough either,
+/// since anything the planner clicks afterwards takes it away again.
+///
+/// The window sees every key whatever has the focus inside it, so that is
+/// where these are read. The document's own `onkeydown` is left to the webview
+/// build, which does have a dependable document focus, and is not run here, or
+/// every shortcut would fire twice.
+///
+/// The guards are the same ones the document handler applies: a cell editor, a
+/// dialog, the backstage, a menu or a start up page all mean the keys belong
+/// to them and not to the plan behind them.
+#[cfg(all(feature = "native", not(feature = "desktop")))]
+fn watch_the_keyboard(mut state: Signal<AppState>) {
+    use dioxus_native::winit::event::{ElementState, WindowEvent};
+    use dioxus_native::winit::keyboard::ModifiersState;
+
+    // Winit reports modifiers as their own event rather than on each key, so
+    // the last set has to be kept.
+    let mut held = use_signal(ModifiersState::default);
+
+    dioxus_native::use_window_event(move |event, _| {
+        match event {
+            WindowEvent::ModifiersChanged(next) => held.set(next.state()),
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
+                // A synthetic press is the window telling us what was already
+                // down when it gained focus, not somebody pressing anything.
+                if *is_synthetic || event.state != ElementState::Pressed {
+                    return;
+                }
+                let modifiers = held();
+                let Some(name) = shortcut_name(&event.logical_key) else {
+                    return;
+                };
+
+                {
+                    let s = state.read();
+                    if s.editing.is_some()
+                        || s.dialog.is_some()
+                        || s.backstage.is_some()
+                        || s.context_menu.is_some()
+                        || !s.greetings.is_empty()
+                    {
+                        return;
+                    }
+                }
+
+                // Escape puts down whatever the chart is holding, exactly as
+                // the document handler does.
+                if name == "Escape" {
+                    let mut writer = state.write();
+                    if writer.draw_tool.is_some() {
+                        writer.arm_draw_tool_off();
+                        return;
+                    }
+                    if writer.selected_drawing.is_some() {
+                        writer.selected_drawing = None;
+                        return;
+                    }
+                }
+
+                let mut parts: Vec<&str> = Vec::new();
+                // Cmd on a Mac, Ctrl everywhere else; see `keymap`.
+                let accelerator = if cfg!(target_os = "macos") {
+                    modifiers.meta_key() || modifiers.control_key()
+                } else {
+                    modifiers.control_key()
+                };
+                if accelerator {
+                    parts.push("Ctrl");
+                }
+                if modifiers.alt_key() {
+                    parts.push("Alt");
+                }
+                if modifiers.shift_key() {
+                    parts.push("Shift");
+                }
+                parts.push(&name);
+                let pressed = parts.join("+");
+
+                crate::applog::applog_verbose!("key: window saw {pressed}");
+                let Some(action) = state.read().keys.action_for(&pressed) else {
+                    return;
+                };
+                run_action(&mut state, action);
+            }
+            _ => {}
+        }
+    });
+}
+
+/// What a winit key is called in the keymap.
+///
+/// The same names `keymap::shortcut_for` produces from the document's own key
+/// type, which is a different enum from a different crate saying the same
+/// things. `None` for anything that is not a shortcut on its own, a bare
+/// modifier most of all.
+#[cfg(all(feature = "native", not(feature = "desktop")))]
+fn shortcut_name(key: &dioxus_native::winit::keyboard::Key) -> Option<String> {
+    use dioxus_native::winit::keyboard::{Key as WinitKey, NamedKey};
+
+    let named = |name: &str| Some(name.to_string());
+    match key {
+        WinitKey::Character(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_uppercase())
+            }
+        }
+        WinitKey::Named(name) => match name {
+            NamedKey::ArrowUp => named("Up"),
+            NamedKey::ArrowDown => named("Down"),
+            NamedKey::ArrowLeft => named("Left"),
+            NamedKey::ArrowRight => named("Right"),
+            NamedKey::Enter => named("Enter"),
+            NamedKey::Escape => named("Escape"),
+            NamedKey::Tab => named("Tab"),
+            NamedKey::Backspace => named("Backspace"),
+            NamedKey::Delete => named("Delete"),
+            NamedKey::Insert => named("Insert"),
+            NamedKey::Home => named("Home"),
+            NamedKey::End => named("End"),
+            NamedKey::PageUp => named("PageUp"),
+            NamedKey::PageDown => named("PageDown"),
+            NamedKey::F1 => named("F1"),
+            NamedKey::F2 => named("F2"),
+            NamedKey::F3 => named("F3"),
+            NamedKey::F4 => named("F4"),
+            NamedKey::F5 => named("F5"),
+            NamedKey::F6 => named("F6"),
+            NamedKey::F7 => named("F7"),
+            NamedKey::F8 => named("F8"),
+            NamedKey::F9 => named("F9"),
+            NamedKey::F10 => named("F10"),
+            NamedKey::F11 => named("F11"),
+            NamedKey::F12 => named("F12"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The webview build reads its shortcuts from the document.
+#[cfg(feature = "desktop")]
+fn watch_the_keyboard(_state: Signal<AppState>) {}
+
 
 /// Two internal windows side by side: a tab bar, a draggable splitter, and
 /// each pane able to take the whole frame.
@@ -830,6 +1080,36 @@ fn SplitPanes(
     // every frame of a scroll, and read by nothing but the bar on the right,
     // so a scroll redraws a thumb rather than a plan.
     let mut down = use_signal(|| (0.0f64, 0.0f64));
+    // How tall the panes are, which nothing here was working out.
+    //
+    // The pair is (how far down, how much is on screen), and the second half
+    // stayed at zero for the whole life of the split: only the single pane
+    // view ever filled it in. Everything downstream then behaved as though the
+    // panes had no height. `RowWindow` was handed a viewport of nothing and
+    // returned a fixed twenty eight lines however tall the window was, which
+    // is a screenful of rows and then blank paper; the wheel clamped against
+    // `content - 0` and so scrolled a whole screenful past the last row; and
+    // the bar down the right refused every drag, because its handler gives up
+    // on a viewport of zero. One unwritten number, three faults.
+    //
+    // Worked out here and passed down, never stored. The pair `down` holds is
+    // (how far down, how much is on screen) and only the first half is ever
+    // written: putting the second half in it means writing a signal that the
+    // row window depends on, the window then grows from the twenty eight lines
+    // a viewport of zero produces to a paneful, and this renderer answers that
+    // mutation with `invalid key` out of `blitz-dom`'s mutator and takes the
+    // process with it. Read only, so there is no mutation to mishandle.
+    //
+    // Leaving it unwritten was three faults on its own: `RowWindow` was handed
+    // a viewport of nothing and returned a fixed twenty eight lines however
+    // tall the window was, so the pane ran out of rows and showed blank paper;
+    // the wheel clamped against `content - 0` and scrolled a screenful past
+    // the last row; and the bar down the right refused every drag, because its
+    // handler gives up on a viewport of zero.
+    let port = {
+        let (_, tall) = use_context::<Signal<crate::state::Viewport>>()();
+        (tall - CHROME_H).max(120.0)
+    };
     // A sideways bar being dragged: which one, where the pointer started, and
     // what the offset was then. Tracked from where it started rather than from
     // the thumb, so a pointer moving faster than the thumb cannot drop it.
@@ -842,7 +1122,7 @@ fn SplitPanes(
 
     let (grid_width, focus, rows_len) = {
         let s = state.read();
-        (s.table_view_width(), s.pane_focus, s.layout_rows().len())
+        (s.table_view_width(), s.pane_focus, s.layout_row_count())
     };
     // A zoom changes what a pixel of the chart means.
     //
@@ -1045,7 +1325,7 @@ fn SplitPanes(
                         }
                         div {
                             class: "pane-body",
-                            onwheel: move |event| wheel(event, &mut down, rows_len, panes),
+                            onwheel: move |event| wheel(event, &mut down, port, rows_len, panes),
                             div {
                                 class: "shift",
                                 style: "margin: -{down().0}px 0 0 -{shift.table}px;",
@@ -1072,7 +1352,7 @@ fn SplitPanes(
                         }
                         div {
                             class: "pane-body",
-                            onwheel: move |event| wheel(event, &mut down, rows_len, panes),
+                            onwheel: move |event| wheel(event, &mut down, port, rows_len, panes),
                             div {
                                 // Both ways, and by the same number the
                                 // timescale above is slid by, which is the
@@ -1099,7 +1379,7 @@ fn SplitPanes(
                     // The bar down the right, over both panes, because they
                     // fill the split and there is no column left to give it.
                     div { class: "vbar",
-                        {thumb(true, down().0, down().1, rows_len as f64 * gantt::ROW_H,
+                        {thumb(true, down().0, port, rows_len as f64 * gantt::ROW_H,
                                Some(EventHandler::new(move |y| {
                                    down_drag.set(Some((y, down().0)));
                                })))}
@@ -1185,7 +1465,6 @@ fn SplitPanes(
                                 let Some((from_y, from_at)) = down_drag() else {
                                     return;
                                 };
-                                let (_, port) = down();
                                 let content = rows_len as f64 * gantt::ROW_H;
                                 if port <= 1.0 || content <= port {
                                     return;
@@ -1239,7 +1518,7 @@ fn SoloGrid() -> Element {
     let grid_scroll = use_context::<GridScroll>().0;
     let mut column_drag = use_context::<Signal<ColumnDrag>>();
     let mut state = use_context::<Signal<AppState>>();
-    let rows_len = state.read().layout_rows().len();
+    let rows_len = state.read().layout_row_count();
     let shift = shifted();
     let mut rail_drag = use_signal(|| RailDrag::None);
     let mut down_drag = use_signal(|| None::<(f64, f64)>);
@@ -1270,7 +1549,7 @@ fn SoloGrid() -> Element {
                 }
                 div {
                     class: "pane-body",
-                    onwheel: move |event| wheel(event, &mut down, rows_len, panes),
+                    onwheel: move |event| wheel(event, &mut down, port, rows_len, panes),
                     div {
                         class: "shift",
                         style: "margin: -{down().0}px 0 0 -{shift.table}px;",
@@ -1366,17 +1645,28 @@ const FRAME_W: f64 = 16.0;
 fn wheel(
     event: Event<WheelData>,
     down: &mut Signal<(f64, f64)>,
+    port: f64,
     rows: usize,
     panes: (GridScroll, ChartScroll),
 ) {
     // A wheel reports in pixels on some devices and in lines on others, and a
     // line is not a pixel.
-    let (at, port) = down();
+    let (at, _) = down();
     let step = match event.data().delta() {
         dioxus::html::geometry::WheelDelta::Pixels(v) => v.y,
         dioxus::html::geometry::WheelDelta::Lines(v) => v.y * 20.0,
         dioxus::html::geometry::WheelDelta::Pages(v) => v.y * port,
     };
+    // The two builds disagree about which way a wheel turns.
+    //
+    // A DOM `deltaY` is positive scrolling *down*, which is what the addition
+    // below expects. Winit's is positive scrolling *up*, and `blitz-shell`
+    // hands winit's number straight through wearing a `WheelData`, so on the
+    // webview-free build the sign arrives backwards and the plan scrolls away
+    // from the wheel. Corrected here rather than at the call sites, because
+    // there are two of those and one of this.
+    #[cfg(all(feature = "native", not(feature = "desktop")))]
+    let step = -step;
     // A plan is a long list, and one notch moving three rows makes getting
     // down it feel like work.
     const SPEED: f64 = 1.8;
@@ -1573,7 +1863,7 @@ fn Workspace(view: ViewKind) -> Element {
     // here is only what the single window views need.
     let (rows, filter) = {
         let s = state.read();
-        (s.visible_rows().len(), s.filter)
+        (s.visible_row_count(), s.filter)
     };
     let filter_note = if filter == crate::state::TaskFilter::All {
         format!("{rows} rows")
@@ -1759,7 +2049,24 @@ fn StatusBar() -> Element {
 /// The key press is rendered in the same form a binding is written in and
 /// looked up in the map, rather than matched against a fixed list here. That is
 /// what lets the same table be listed in the settings, rebound, and saved.
+#[cfg(feature = "desktop")]
 fn handle_shortcut(state: &mut Signal<AppState>, event: Event<KeyboardData>) {
+    // Every key that gets this far, and what became of it.
+    //
+    // Written under `AOP_LOG_VERBOSE=1` rather than always: this fires on
+    // every keystroke. It is here because "the shortcuts do nothing" has three
+    // quite different causes on the webview-free build, and they are told
+    // apart only by which of these lines appears. No line at all means the key
+    // never reached the handler, which is a focus problem and not a keymap
+    // one; a line saying it was swallowed means something modal is up; a line
+    // with no binding means the key arrived under a name the map does not use.
+    crate::applog::applog_verbose!(
+        "key: {:?} modifiers {:?} -> {:?}",
+        event.key(),
+        event.modifiers(),
+        keymap::shortcut_for(&event.key(), event.modifiers()),
+    );
+
     // Never steal keys while a cell editor, a dialog or a menu has focus, or
     // while a start up page is waiting to be answered: nothing behind one of
     // those is meant to be reachable, and a shortcut would reach it.
@@ -1771,6 +2078,14 @@ fn handle_shortcut(state: &mut Signal<AppState>, event: Event<KeyboardData>) {
             || s.context_menu.is_some()
             || !s.greetings.is_empty()
         {
+            crate::applog::applog_verbose!(
+                "key: swallowed (editing {}, dialog {}, backstage {}, menu {}, greetings {})",
+                s.editing.is_some(),
+                s.dialog.is_some(),
+                s.backstage.is_some(),
+                s.context_menu.is_some(),
+                !s.greetings.is_empty(),
+            );
             return;
         }
     }

@@ -4869,11 +4869,19 @@ impl AppState {
 
     // ---- task commands --------------------------------------------------
 
-    /// Insert a blank task above the selection, the behaviour of the Task button.
+    /// Insert a blank task below the selection, the behaviour of the Task button.
+    ///
+    /// Below, not above. Project inserts above the selected row, and this did
+    /// too; a planner reads a plan downwards and adds the next piece of work
+    /// after the one they are looking at, not before it. Appending to the end
+    /// of the list is the one case with nothing selected.
     pub fn insert_task(&mut self) {
         self.record(Cmd::InsertTask {});
         self.checkpoint();
-        let at = self.primary().unwrap_or(self.project.tasks.len());
+        let at = self
+            .primary()
+            .map(|row| (row + 1).min(self.project.tasks.len()))
+            .unwrap_or(self.project.tasks.len());
         let id = self.project.insert_task(at, "");
         let mode = self.new_tasks_mode;
         if let Some(task) = self.project.task_mut(id) {
@@ -4900,10 +4908,15 @@ impl AppState {
         at
     }
 
+    /// Insert a milestone below the selection, for the reason `insert_task`
+    /// gives.
     pub fn insert_milestone(&mut self) {
         self.record(Cmd::InsertMilestone {});
         self.checkpoint();
-        let at = self.primary().unwrap_or(self.project.tasks.len());
+        let at = self
+            .primary()
+            .map(|row| (row + 1).min(self.project.tasks.len()))
+            .unwrap_or(self.project.tasks.len());
         let id = self.project.insert_task(at, "New milestone");
         if let Some(task) = self.project.task_mut(id) {
             task.duration_minutes = 0;
@@ -5977,6 +5990,32 @@ impl AppState {
             .collect()
     }
 
+    /// How many lines the chart and the table draw between them.
+    ///
+    /// The count, and only the count. Callers that want a scrollbar's travel
+    /// or a row window's bounds were building the whole list to read `len` off
+    /// it, which on a plan of a hundred and fifty thousand tasks is a hundred
+    /// and fifty thousand element allocation per render, and with a grouping
+    /// on it is a regrouping of the plan besides.
+    ///
+    /// Ungrouped the answer is the visible-row count and needs no list at all.
+    /// Grouped it still does: the bands come out of the grouping and there is
+    /// no counting them without running it.
+    pub fn layout_row_count(&self) -> usize {
+        match &self.group_by {
+            None => self.visible_row_count(),
+            Some(_) => self.layout_rows().len(),
+        }
+    }
+
+    /// How many rows survive the outline and the filter, without listing them.
+    pub fn visible_row_count(&self) -> usize {
+        if self.filter == TaskFilter::All {
+            return self.project.visible_count();
+        }
+        self.visible_rows().len()
+    }
+
     /// Every row the two panes should draw, bands included.
     ///
     /// The grid and the Gantt both read this one list, so a band can never
@@ -6880,22 +6919,39 @@ pub fn from_command_line() -> AppState {
     //
     // No question about unsaved work here, and none is needed: this runs
     // before there is anything on screen to lose.
-    match std::env::args()
+    state
+}
+
+/// The plan the command line asked for, if it asked for one.
+///
+/// Kept back rather than opened where the state is built.
+///
+/// Opening it here means opening it inside the first render, before anything
+/// has been painted: the window is mapped in a quarter of a second and then
+/// sits blank for as long as the parse and the schedule take, which on a plan
+/// of a hundred and fifty thousand tasks is the better part of ten seconds of
+/// nothing. Worse, a plan on the command line used to switch the splash off,
+/// so the one thing that would have said the application was alive was the
+/// thing being skipped.
+///
+/// So the argument comes back unopened. `App` paints the splash first and
+/// opens it after, which is the order somebody watching would expect.
+pub fn asked_for_on_the_command_line() -> Option<crate::handoff::Handed> {
+    std::env::args()
         .nth(1)
         .as_deref()
         .and_then(crate::handoff::Handed::from_argument)
-    {
-        Some(crate::handoff::Handed::Link(link)) => {
-            state.splash = false;
-            state.open_link_asked(&link);
+}
+
+impl AppState {
+    /// Open what the command line asked for, once there is something on screen.
+    pub fn open_what_was_asked(&mut self, asked: crate::handoff::Handed) {
+        match asked {
+            crate::handoff::Handed::Link(link) => self.open_link_asked(&link),
+            crate::handoff::Handed::Path(path) => self.open_any(path),
         }
-        Some(crate::handoff::Handed::Path(path)) => {
-            state.splash = false;
-            state.open_any(path);
-        }
-        None => {}
+        self.splash = false;
     }
-    state
 }
 
 /// Sort the sibling blocks that start at `level` within `start..end`, sorting

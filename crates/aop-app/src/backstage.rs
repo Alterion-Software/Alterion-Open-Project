@@ -10,6 +10,8 @@ use aop_core::{format_work, persist, templates, Project, APP_NAME};
 use chrono::Datelike;
 
 use crate::icons::icon;
+use std::sync::OnceLock;
+
 use crate::preview::{mini_gantt, DARK};
 use crate::controls::{Choice, Dropdown};
 use crate::state::{
@@ -298,9 +300,9 @@ fn HomePage() -> Element {
     let cards = previews.read();
 
     // Blank first, then a few starters, the way the Office home screen leads.
-    let featured = use_signal(build_previews);
-    let built = featured.read();
     let show_critical = state.read().show_critical;
+    // Drawn once for the life of the process; see `gallery`.
+    let built = gallery(show_critical);
 
     rsx! {
         h1 { class: "bs-title", style: "margin-bottom: 6px;", "Home" }
@@ -312,8 +314,9 @@ fn HomePage() -> Element {
             }
         }
         div { class: "tpl-grid",
-            for (spec, project) in built.iter() {
+            for Preview { spec, project, thumbnail } in built.iter() {
                 {
+                    let _ = project;
                     let id = spec.id;
                     let count = spec.task_count();
                     rsx! {
@@ -326,7 +329,7 @@ fn HomePage() -> Element {
                                 }
                             },
                             div { class: "tpl-thumb",
-                                {mini_gantt(project, 300.0, 128.0, 24, &DARK, show_critical)}
+                                div { class: "mini-gantt", dangerous_inner_html: "{thumbnail}" }
                             }
                             div { class: "tpl-meta",
                                 div { class: "tpl-name", "{spec.name}" }
@@ -366,13 +369,19 @@ fn HomePage() -> Element {
                             .unwrap_or_default();
                         let tasks = project.tasks.len();
                         let finish = project.finish_date;
+                        // A recent plan is the planner's own and changes when
+                        // they save it, so its thumbnail is drawn here rather
+                        // than taken from the gallery's cache.
+                        let thumbnail = crate::preview::mini_gantt_markup(
+                            project, 300.0, 128.0, 24, &DARK, show_critical,
+                        );
                         rsx! {
                             button { key: "{path.display()}", class: "tpl-card",
                                 onclick: move |_| {
                                     state.write().guard(PendingAction::Open(target.clone()));
                                 },
                                 div { class: "tpl-thumb",
-                                    {mini_gantt(project, 300.0, 128.0, 24, &DARK, show_critical)}
+                                    div { class: "mini-gantt", dangerous_inner_html: "{thumbnail}" }
                                 }
                                 div { class: "tpl-meta",
                                     div { class: "tpl-name", "{name}" }
@@ -407,14 +416,52 @@ fn build_previews() -> Vec<(&'static templates::TemplateSpec, Project)> {
         .collect()
 }
 
+/// The gallery's thumbnails, drawn once for the life of the process.
+///
+/// Every visit to Home or New used to build all eight starter plans, schedule
+/// each of them and draw each one again, and then hand the eight drawings to
+/// the renderer to be parsed. None of that can come out differently the second
+/// time: the plans are built from constants and a start date that is settled
+/// when the process begins, so the drawing for a template is the same drawing
+/// every time it is asked for. The wait was for an answer already known.
+///
+/// Held as finished markup rather than as plans, because the drawing is what
+/// the gallery actually wants. A plan is kept beside it for the pages that
+/// need to read one, and it costs nothing to keep what has already been built.
+static GALLERY: OnceLock<Vec<Preview>> = OnceLock::new();
+
+/// One template, ready to show: what it is, the plan it makes, and the
+/// thumbnail already drawn.
+struct Preview {
+    spec: &'static templates::TemplateSpec,
+    project: Project,
+    /// The mini chart as markup, at the size the gallery cards draw it.
+    thumbnail: String,
+}
+
+/// The gallery, building it the first time it is asked for.
+fn gallery(show_critical: bool) -> &'static [Preview] {
+    // The critical path colouring is a view option, and it is part of the
+    // drawing. It is read once, with the rest: a planner who turns it off is
+    // asking about their own plan and not about the pictures on the New page.
+    GALLERY.get_or_init(|| {
+        build_previews()
+            .into_iter()
+            .map(|(spec, project)| {
+                let thumbnail =
+                    crate::preview::mini_gantt_markup(&project, 300.0, 128.0, 24, &DARK, show_critical);
+                Preview { spec, project, thumbnail }
+            })
+            .collect()
+    })
+}
+
 #[component]
 fn NewPage() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let mut search = use_signal(String::new);
-    let previews = use_signal(build_previews);
-
     let needle = search().to_lowercase();
-    let built = previews.read();
+    let built = gallery(state.read().show_critical);
 
     rsx! {
         h1 { class: "bs-title", "New" }
@@ -429,7 +476,7 @@ fn NewPage() -> Element {
         }
 
         div { class: "tpl-grid",
-            for (spec, project) in built.iter() {
+            for Preview { spec, project, thumbnail } in built.iter() {
                 {
                     let matches = needle.is_empty()
                         || spec.name.to_lowercase().contains(&needle)
@@ -440,7 +487,6 @@ fn NewPage() -> Element {
                         let id = spec.id;
                         let count = spec.task_count();
                         let finish = project.finish_date;
-                        let show_critical = state.read().show_critical;
                         rsx! {
                             button { key: "{id}", class: "tpl-card",
                                 onclick: move |_| {
@@ -451,7 +497,7 @@ fn NewPage() -> Element {
                                     }
                                 },
                                 div { class: "tpl-thumb",
-                                    {mini_gantt(project, 300.0, 128.0, 24, &DARK, show_critical)}
+                                    div { class: "mini-gantt", dangerous_inner_html: "{thumbnail}" }
                                 }
                                 div { class: "tpl-meta",
                                     div { class: "tpl-name", "{spec.name}" }

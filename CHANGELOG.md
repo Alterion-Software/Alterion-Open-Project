@@ -2,6 +2,55 @@
 
 Notable changes, newest first. Dates are the day a version was tagged.
 
+## 1.0.6-beta
+
+**The webview-free build is the one that ships.** Every packaging script built
+the webview and would have shipped it whatever was done to the other one;
+`install.sh`, the AUR `PKGBUILD` and the macOS and Windows scripts now build
+`--no-default-features --features native`. Blitz paints it with wgpu, so there
+is no webkit2gtk to have installed.
+
+**Start up takes a second instead of ten.** The splash was drawn inside the
+same frame as the whole application, so it waited for the very thing it exists
+to cover and the window was black until both were ready. It is its own frame
+now: one box reaches the screen straight away, and the application is built
+behind it. A plan named on the command line is opened after the first paint as
+well, rather than during it.
+
+**A plan of a hundred and fifty thousand tasks is usable.** Between three
+frames a second and twenty-eight, by way of four things. The chart walked the
+whole plan six times over to draw a screenful; it now takes a range of it, and
+dependency arrows come out of an index rather than a pass over every link.
+Bar geometry was two hash maps keyed by a task id that is already an index, so
+it is two flat tables. Gridlines and shaded days ran the height of the whole
+canvas, three and a third million pixels of box for forty rows of chart, and
+are now cut to the rows on screen. The timeline strip drew a band and a label
+for every phase in the plan, which on a plan this size was nine tenths of the
+time the window took to paint; phases that land within two pixels of each other
+are now one mark.
+
+**Shortcuts work.** They were read from the document, and on this renderer
+nothing dependably holds the focus: they worked while the backstage was open,
+because it had the focus, and stopped the moment it closed. They are read from
+the window now, where the focus does not matter. Separately, `Cmd` was never
+read as a modifier at all, so on macOS every shortcut with one was dead.
+
+**The wheel turns the right way.** Winit counts a scroll up as positive and the
+DOM counts it as down; the number was taken as it came, so the plan scrolled
+away from the wheel.
+
+**The panes know how tall they are.** The split never worked out its own
+viewport height, which left the row window a fixed twenty-eight lines however
+tall the window was, let the wheel scroll a screenful past the last row, and
+stopped the scrollbar on the right from being dragged at all.
+
+**Smaller things.** The lag on a predecessor can be typed into again: it
+committed on a change event, which this renderer does not have. A task or
+milestone is inserted below the selection rather than above it. Template
+thumbnails are drawn once rather than on every visit to Home. The timescale
+heading reads as a heading rather than as a grid, and the timeline band has
+room to breathe under its own dates. Cards in the gallery are all one size.
+
 ## 1.0.5-beta
 
 **Print preview shows the whole document.** It paged one sheet at a time

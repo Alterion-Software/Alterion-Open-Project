@@ -54,7 +54,7 @@ for target in "${targets[@]}"; do
     rustup target add "$target"
   fi
   echo "  building $target"
-  ( cd "$root" && cargo build --release --target "$target" --package aop-app )
+  ( cd "$root" && cargo build --release --target "$target" --package aop-app --no-default-features --features native )
   built+=("$root/target/$target/release/$bin_name")
 done
 

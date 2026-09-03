@@ -42,7 +42,7 @@ fi
 
 step "Building aop-app $version for $target"
 cd "$root"
-cargo build --release --target "$target" --package aop-app
+cargo build --release --target "$target" --package aop-app --no-default-features --features native
 
 step "Staging"
 rm -rf "$staging"

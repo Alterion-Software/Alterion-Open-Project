@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/aop-core", "crates/aop-app", "crates/aop-procname", "crates/aop-collaborate"]
 
 [workspace.package]
-version = "1.0.5-beta"
+version = "1.0.6-beta"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -13,3 +13,29 @@ alterion-mpp-parser = { version = "0.1.0" }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# A development build of this application is not a development build of the
+# renderer it runs on. Stylo lays the document out, blitz paints it and wgpu
+# submits the result, every frame, and none of that is our code: it is
+# dependency code on the hot path, and at `opt-level = 0` it is the reason the
+# native build feels like a slideshow while the same binary in release does
+# not. So dependencies are optimised and our own crates are not, which keeps
+# the edit-build-run loop honest: a change to `aop-app` still compiles at
+# debug speed, because `aop-app` is not what this section is about.
+#
+# Paid once. Dependencies are rebuilt only when their versions change, so the
+# long build this causes is the next one and not the ones after it.
+[profile.dev.package."*"]
+opt-level = 3
+# Nobody steps through stylo. Debug info for the whole dependency tree is the
+# largest single input to link time and to the size of the binary on disk, and
+# a backtrace still names the frames without it.
+debug = false
+
+[profile.dev]
+# Ours, so this stays where it was.
+opt-level = 0
+# Line tables rather than full debug info: enough for a backtrace that names
+# a file and a line, which is what the applog and a panic actually want, and
+# a good deal less for the linker to chew through than the default of 2.
+debug = 1

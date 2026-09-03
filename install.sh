@@ -13,7 +13,7 @@
 set -euo pipefail
 
 repo="Alterion-Software/Alterion-Open-Project"
-version="v1.0.5-beta"
+version="v1.0.6-beta"
 name="alterion-open-project"
 pretty="Alterion Open Project"
 
@@ -146,7 +146,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "$from_source" -eq 1 ]; then
   step "Building from source"
   command -v cargo >/dev/null || die "cargo not found; install Rust from https://rustup.rs"
-  ( cd "$here" && cargo build --release --package aop-app )
+  # The webview-free build. `--no-default-features` turns off `desktop`,
+  # which is wry and webkit2gtk; `native` is Blitz, which paints with wgpu and
+  # needs no webview on the machine it runs on.
+  ( cd "$here" && cargo build --release --package aop-app --no-default-features --features native )
   place 755 "$here/target/release/$name" "$bindir/$name"
 else
   step "Downloading"

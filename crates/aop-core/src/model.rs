@@ -1106,6 +1106,27 @@ impl Project {
         visible
     }
 
+    /// How many rows the outline leaves visible, without listing them.
+    ///
+    /// The same walk as `visible_indices`, counting instead of collecting. A
+    /// scrollbar wants the number and nothing else, and asking for the list to
+    /// read its length off is an allocation the size of the plan on every
+    /// render that draws one.
+    pub fn visible_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut skip_until = 0usize;
+        for index in 0..self.tasks.len() {
+            if index < skip_until {
+                continue;
+            }
+            count += 1;
+            if self.tasks[index].collapsed && self.is_summary(index) {
+                skip_until = self.descendants(index).end;
+            }
+        }
+        count
+    }
+
     // ---- editing --------------------------------------------------------
 
     /// Insert a new task above `index`, inheriting that row's outline level.
