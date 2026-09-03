@@ -76,13 +76,20 @@ if [ "$do_build" = 1 ]; then
   # the tag is the only thing anyone downloading it will have.
   [ -z "$(git -C "$root" status --porcelain)" ] || die "uncommitted changes; commit them first"
 
-  cargo test --workspace --manifest-path "$root/Cargo.toml"
-  cargo clippy --workspace --all-targets --manifest-path "$root/Cargo.toml" -- -D warnings
+  cargo test --workspace --manifest-path "$root/Cargo.toml" \
+        --no-default-features --features aop-app/native
+  cargo clippy --workspace --all-targets --manifest-path "$root/Cargo.toml" \
+        --no-default-features --features aop-app/native -- -D warnings
 
   mkdir -p "$dist"
 
   step "Linux binary"
-  cargo build --release -p aop-app --manifest-path "$root/Cargo.toml"
+  # The webview-free build, the same one every other packaging script builds.
+  # This is the script that produces what a release actually contains, so
+  # building the default here would have shipped the webview whatever the
+  # others did.
+  cargo build --release -p aop-app --manifest-path "$root/Cargo.toml" \
+        --no-default-features --features native
   linux="$dist/alterion-open-project-$version-x86_64-linux.tar.gz"
   tar -czf "$linux" \
       -C "$root/target/release" alterion-open-project \
