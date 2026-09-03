@@ -199,9 +199,35 @@ const SYSTEM_PREFIXES: [&str; 7] = [
     "/app/",
 ];
 
+/// Where this program's file is, as a path that can be opened.
+///
+/// `current_exe` reads `/proc/self/exe` on Linux, and when the file behind a
+/// running process has been replaced, the kernel answers with the old path and
+/// `" (deleted)"` on the end of it. That is a description, not a filename:
+/// anything that tries to open it gets `No such file or directory`, which is
+/// what an update did while reporting that the current version could not be
+/// set aside. It happens whenever a package manager upgrades the application
+/// while it is open, which is exactly when somebody might then press update.
+///
+/// So the suffix is taken off, but only when doing so names a file that is
+/// really there. A binary genuinely called `something (deleted)` keeps its
+/// name, and a path that has been replaced with nothing at all still fails, as
+/// it should: there is no file to copy aside and pretending otherwise would
+/// lose the version somebody is running.
+fn running_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    if exe.exists() {
+        return Some(exe);
+    }
+    let text = exe.to_string_lossy();
+    let trimmed = text.strip_suffix(" (deleted)")?;
+    let candidate = PathBuf::from(trimmed);
+    candidate.exists().then_some(candidate)
+}
+
 /// Work out how this copy was installed rather than assuming.
 pub fn detect() -> Install {
-    let Ok(exe) = std::env::current_exe() else {
+    let Some(exe) = running_exe() else {
         return Install::Unknown;
     };
     // Through any symlink first: `/usr/bin/name` pointing into `/opt` is one
@@ -894,7 +920,7 @@ fn previous_beside(exe: &Path) -> Option<PathBuf> {
 /// is somehow still running, which is not a fault and not news anybody wants:
 /// the start after this one clears it instead.
 pub fn sweep_previous() {
-    let Ok(exe) = std::env::current_exe() else {
+    let Some(exe) = running_exe() else {
         return;
     };
     sweep_beside(&exe);
@@ -932,8 +958,12 @@ fn sweep_beside(exe: &Path) {
 /// artefact a platform is offered; this decides what to do with a binary once
 /// something has handed one over.
 fn swap_in(binary: &[u8]) -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|_| "Where this program is installed could not be read.".to_string())?;
+    let exe = running_exe().ok_or_else(|| {
+        "This program's own file is not where it was started from, so there is nothing to \
+         replace. It has most likely been updated by something else while it was running. \
+         Restart it and the update will go ahead."
+            .to_string()
+    })?;
     if cfg!(windows) {
         rename_aside_then_write(&exe, binary, |path, bytes| std::fs::write(path, bytes))
     } else {
@@ -1592,8 +1622,16 @@ e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4 *AlterionOpenPr
 
     /// A directory of this test's own, emptied first so that what a previous
     /// run left cannot be read as what this one did.
+    /// A directory of this test's own.
+    ///
+    /// Named for the process as well as the test, because the suite is built
+    /// as more than one test binary and they run at the same time. Sharing a
+    /// fixed path meant two copies of the same test wiping each other's files
+    /// half way through, which fails whichever one is slower and passes when
+    /// either is run alone.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aop-update-{name}"));
+        let dir = std::env::temp_dir()
+            .join(format!("aop-update-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a directory to work in");
         dir
@@ -1688,6 +1726,43 @@ e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4 *AlterionOpenPr
     }
 
     #[test]
+    /// A path the kernel describes rather than names.
+    ///
+    /// When a running program's file is replaced, Linux answers
+    /// `current_exe` with the old path and `" (deleted)"` on the end. Opening
+    /// that fails, which is how an update came to report that it could not set
+    /// the current version aside: the file it was told about does not exist
+    /// under that name.
+    #[test]
+    fn a_replaced_binary_is_found_under_its_real_name() {
+        let dir = scratch("deleted");
+        let real = dir.join("alterion-open-project");
+        std::fs::write(&real, b"binary").expect("write");
+
+        // What the suffix means, taken off only when it names something.
+        let described = PathBuf::from(format!("{} (deleted)", real.display()));
+        assert!(!described.exists(), "the described path is not a file");
+        let trimmed = described
+            .to_string_lossy()
+            .strip_suffix(" (deleted)")
+            .map(PathBuf::from)
+            .expect("the suffix is there to take off");
+        assert_eq!(trimmed, real);
+        assert!(trimmed.exists(), "and taking it off names the file that is there");
+
+        // A binary really called that keeps its name: nothing is stripped
+        // unless what is left is a file.
+        let odd = dir.join("plan (deleted)");
+        std::fs::write(&odd, b"binary").expect("write");
+        assert!(odd.exists());
+        let stripped = odd
+            .to_string_lossy()
+            .strip_suffix(" (deleted)")
+            .map(PathBuf::from)
+            .expect("the suffix is there");
+        assert!(!stripped.exists(), "so the name is kept as it is");
+    }
+
     fn the_other_platforms_still_write_beside_and_rename_over() {
         // Unchanged on purpose: a rename over the name is genuinely atomic
         // here, and there is no reason to give that up for an order Windows

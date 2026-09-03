@@ -151,7 +151,19 @@ fn main() {
         vec![Box::new(
             dioxus_native::Config::new()
                 .with_window_attributes(
-                    dioxus_native::WindowAttributes::default().with_title(APP_NAME),
+                    // The same size and floor the webview build asks for.
+                    // Asking for neither left the window at whatever the
+                    // compositor felt like handing over, which on this machine
+                    // has been eight hundred by six hundred, four hundred and
+                    // twenty six by five hundred, and a full screen, on
+                    // different launches of the same binary. An application
+                    // laid out for a plan and a chart side by side is not
+                    // usable in the small ones, and nothing in it was asking
+                    // to be.
+                    dioxus_native::WindowAttributes::default()
+                        .with_title(APP_NAME)
+                        .with_surface_size(dioxus_native::LogicalSize::new(1560.0, 980.0))
+                        .with_min_surface_size(dioxus_native::LogicalSize::new(1024.0, 640.0)),
                 )
                 // Carried rather than hoped for, and beside what the machine
                 // already has rather than instead of it. See `fonts`.

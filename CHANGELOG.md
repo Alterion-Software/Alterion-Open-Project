@@ -2,6 +2,37 @@
 
 Notable changes, newest first. Dates are the day a version was tagged.
 
+## 1.0.8-beta
+
+**Ko-fi, beside Buy Me a Coffee.** Either one, or neither: the page still says
+plainly that nothing changes either way.
+
+**An update installs after something else has replaced the application.** When
+a running program's file is replaced underneath it, Linux answers "where am I
+installed" with the old path and `(deleted)` on the end of it. That is a
+description rather than a filename, so the update could not set the current
+version aside and refused to go on, which is right but reads as `No such file
+or directory` and explains nothing. The name is understood now, and where it
+cannot be, the message says to restart and try again. It happens whenever a
+package manager upgrades the application while it is open.
+
+**Text stops being broken for a window that has since been resized.** The
+renderer breaks a paragraph into lines once and throws that answer away only
+when the display's scale changes, never when the window's size does. A window
+widened after a page was drawn kept the old line breaks in a box only tall
+enough for the lines it used to need, so the last lines of a paragraph fell
+behind whatever came after them: the support page cut off mid-sentence with a
+card over the rest of it. The pages made of wrapped prose are built again when
+the width changes.
+
+**The window opens at a size it was designed for.** The webview-free build
+asked for no size at all and took whatever the desktop offered, which on one
+machine was eight hundred by six hundred, four hundred and twenty six by five
+hundred, and full screen, on three launches of the same binary. It asks for the
+same fifteen hundred and sixty by nine hundred and eighty the webview build
+does, and will not be made smaller than a thousand and twenty four by six
+hundred and forty.
+
 ## 1.0.7-beta
 
 **Reordering the Quick Access Toolbar no longer takes the application with

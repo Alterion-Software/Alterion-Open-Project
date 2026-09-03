@@ -54,6 +54,9 @@ const UNSET: &str = "UNSET";
 /// The Buy Me a Coffee page, opened in the system browser.
 pub const COFFEE_URL: &str = "https://buymeacoffee.com/ChaceBerry";
 
+/// The Ko-fi page, opened the same way.
+pub const KOFI_URL: &str = "https://ko-fi.com/chaceberry";
+
 /// Bank transfer details, in the order they are drawn.
 pub const BANK_DETAILS: [(&str, &str); 5] = [
     ("Account name", UNSET),
@@ -80,6 +83,12 @@ fn is_set(value: &str) -> bool {
 /// web address should not be the thing that finds out what it does with it.
 pub fn coffee_offered() -> bool {
     is_set(COFFEE_URL) && COFFEE_URL.starts_with("https://")
+}
+
+/// Whether there is a Ko-fi page to send anybody to. Judged the same way the
+/// other link is: an address that is not a real one is not offered.
+pub fn kofi_offered() -> bool {
+    is_set(KOFI_URL) && KOFI_URL.starts_with("https://")
 }
 
 /// Whether there are enough bank details to pay into.
@@ -263,11 +272,33 @@ pub fn read(section: &str) -> Vec<Line> {
 /// reachable until it has been answered.
 #[component]
 pub fn Welcome(greeting: Greeting) -> Element {
+    // How wide the window is, used only as a key. See below.
+    let (across, _) = use_context::<Signal<crate::state::Viewport>>()();
+
     rsx! {
         div {
             class: "welcome-scrim",
             oncontextmenu: move |event| event.prevent_default(),
-            div { class: "welcome",
+            // Keyed by the width of the window, so that changing the width
+            // builds this again rather than stretching what is already here.
+            //
+            // The renderer breaks a paragraph into lines once and keeps the
+            // answer, and it only throws that answer away when the display's
+            // *scale* changes, never when the window's *size* does. A window
+            // that has been widened since is then drawing text broken for the
+            // width it used to be, in a box only tall enough for the lines it
+            // used to need, so the last lines of a paragraph fall behind
+            // whatever comes after it. Which is what this page looked like:
+            // the lead sentence cut off at "help it keep", with a card sitting
+            // over the rest of it.
+            //
+            // A key that moves with the width forces the subtree to be built
+            // again, and a fresh subtree gets fresh line breaking. It is a
+            // heavier answer than the fault deserves, and it is here rather
+            // than at the root because this is a page of wrapped prose, which
+            // is where the fault can be seen; a row of buttons and labels does
+            // not wrap and never showed it.
+            div { key: "w{across:.0}", class: "welcome",
                 match greeting {
                     Greeting::Licence => rsx! { LicencePage {} },
                     Greeting::PatchNotes => rsx! { NotesPage {} },
@@ -403,6 +434,7 @@ fn SupportPage(after_update: bool) -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let quiet = !state.read().support_page;
     let coffee = coffee_offered();
+    let kofi = kofi_offered();
     let bank = bank_offered();
 
     rsx! {
@@ -414,8 +446,8 @@ fn SupportPage(after_update: bool) -> Element {
             p { class: "welcome-lead",
                 "Alterion Open Project is free, and every part of it stays free. Nothing is locked \
                  behind a payment, nothing is limited or slowed down, and there is nothing to buy. \
-                 If it has been useful and you would like to help it keep being built, there are \
-                 two ways to do that."
+                 If it has been useful and you would like to help it keep being built, the ways to \
+                 do that are below."
             }
 
             if coffee {
@@ -436,6 +468,27 @@ fn SupportPage(after_update: bool) -> Element {
                             let _ = crate::cloud::oauth::open_in_browser(COFFEE_URL);
                         },
                         "Open {COFFEE_URL}"
+                    }
+                }
+            }
+
+            if kofi {
+                div { class: "give",
+                    div { class: "give-head",
+                        {icon("report-costs", 16)}
+                        span { "Ko-fi" }
+                    }
+                    p { class: "give-note",
+                        "Also opens in your browser. One off, or monthly if you would rather."
+                    }
+                    button {
+                        class: "btn",
+                        onclick: move |_| {
+                            // Quiet on failure, for the reason the button
+                            // above gives.
+                            let _ = crate::cloud::oauth::open_in_browser(KOFI_URL);
+                        },
+                        "Open {KOFI_URL}"
                     }
                 }
             }
