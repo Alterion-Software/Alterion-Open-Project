@@ -2,6 +2,20 @@
 
 Notable changes, newest first. Dates are the day a version was tagged.
 
+## 1.0.7-beta
+
+**Reordering the Quick Access Toolbar no longer takes the application with
+it.** Both the customise dialog's list and the toolbar itself were keyed by
+which command each row held, so moving one up swapped two keys and the renderer
+was asked to move the nodes. It cannot do that, and the process ended. They are
+keyed by position now, which turns the same swap into two rows whose contents
+changed.
+
+**The update dialog stops cutting off the things worth reading.** A release
+page address, a tarball's name and the path an installer was written to are
+single words with nowhere to break, and the row holding them would not shrink
+below its own width, so they ran past the edge of the dialog. They wrap.
+
 ## 1.0.6-beta
 
 **The webview-free build is the one that ships.** Every packaging script built

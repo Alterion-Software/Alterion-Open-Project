@@ -13,7 +13,7 @@
 set -euo pipefail
 
 repo="Alterion-Software/Alterion-Open-Project"
-version="v1.0.6-beta"
+version="v1.0.7-beta"
 name="alterion-open-project"
 pretty="Alterion Open Project"
 

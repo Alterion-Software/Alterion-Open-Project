@@ -4231,7 +4231,19 @@ button { font: inherit; color: inherit; }
 }
 .sync-row:last-of-type { border-bottom: none; }
 .sync-key { width: 168px; flex: none; color: var(--ink-soft); }
-.sync-value { flex: 1; color: var(--ink); line-height: 1.55; }
+/* A flex item will not shrink below the width of its own contents unless it
+   is told it may, and the values in these rows are a release page URL, a
+   tarball's filename and the path an installer was written to: single words
+   with nowhere to break. Without this they ran past the end of the dialog and
+   were cut off, which on the update dialog means the one thing somebody wants
+   to read is the part they cannot. */
+.sync-value {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  line-height: 1.55;
+}
 .sync-value.mono { font-family: var(--mono); font-size: 11px; color: var(--accent); }
 .sync-value.good { color: var(--accent-bright); }
 .sync-value.warn { color: var(--warn); }

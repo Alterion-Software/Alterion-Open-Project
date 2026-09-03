@@ -147,7 +147,10 @@ pub fn TitleBar() -> Element {
     rsx! {
         div { class: "titlebar",
             div { class: "qat",
-                for command in qat.iter().copied() {
+                // Keyed by position below, for the reason the customise
+                // dialog gives: reordering the toolbar moves keyed nodes, and
+                // a keyed move is the mutation this renderer cannot apply.
+                for (slot, command) in qat.iter().copied().enumerate() {
                     {
                         let enabled = match command {
                             QatCommand::Undo => can_undo,
@@ -179,7 +182,7 @@ pub fn TitleBar() -> Element {
                         };
                         rsx! {
                             button {
-                                key: "{command:?}",
+                                key: "{slot}",
                                 class: "qat-btn",
                                 title: "{title}",
                                 disabled: !enabled,

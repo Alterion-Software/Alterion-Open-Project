@@ -2726,8 +2726,21 @@ fn CustomizeQat() -> Element {
                         if current.is_empty() {
                             div { class: "hint", style: "padding: 12px;", "The toolbar is empty." }
                         } else {
+                            // Keyed by where it sits, not by what it is.
+                            //
+                            // Keyed by the command, moving one up swaps two
+                            // keys, and dioxus answers that by telling the
+                            // renderer to move the nodes. This renderer
+                            // mishandles a keyed move and takes the process
+                            // with it, which is why reordering the toolbar
+                            // crashed. Keyed by position, the same swap is two
+                            // rows whose contents changed, which is a kind of
+                            // mutation it applies correctly. Nothing is lost:
+                            // these rows hold no focus and no state of their
+                            // own, so there is no identity worth preserving
+                            // across the move.
                             for (index, command) in current.iter().copied().enumerate() {
-                                div { key: "on{command:?}", class: "qat-item",
+                                div { key: "on{index}", class: "qat-item",
                                     span { class: "qat-glyph", {icon(command.glyph(), 15)} }
                                     span { class: "qat-name", "{command.label()}" }
                                     div { class: "btn-group",
